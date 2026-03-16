@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+portable/build/
+portable/dist/
+portable/*.spec
+exports/
+*.db
+*.json
+!package.json
+.claude/
+*.log
+*.txt
+tools/OpenHardwareMonitor/
