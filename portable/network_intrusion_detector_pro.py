@@ -359,6 +359,215 @@ def classify_connection(ip: str, port: int, org: str, country: str, trusted_ips:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# IP Reputation Checker  (VirusTotal + AbuseIPDB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_API_KEYS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nid_api_keys.json")
+
+# Reputation indicators used in the connections table REP column
+REP_CLEAN      = "✓"
+REP_SUSPICIOUS = "⚠"
+REP_DANGEROUS  = "✗"
+REP_UNCHECKED  = "—"
+REP_PENDING    = "…"
+
+REP_COLORS = {
+    REP_CLEAN:      "#90EE90",
+    REP_SUSPICIOUS: "#FFA500",
+    REP_DANGEROUS:  "#FF4444",
+    REP_UNCHECKED:  "#888888",
+    REP_PENDING:    "#888888",
+}
+
+
+class IPReputationChecker:
+    """Wraps VirusTotal v3 + AbuseIPDB v2 behind a single check_ip() call."""
+
+    # Rate-limit tracking
+    VT_MAX_PER_MIN = 4
+    ABUSE_MAX_PER_DAY = 1000
+
+    def __init__(self):
+        self._cache: Dict[str, Dict] = {}
+        self._vt_key: str = ""
+        self._abuse_key: str = ""
+        self._vt_timestamps: List[float] = []
+        self._abuse_day_count: int = 0
+        self._abuse_day_start: float = time.time()
+        self._lock = threading.Lock()
+        self._load_keys()
+
+    # ── Key management ──────────────────────────────────────────────────────
+
+    def _load_keys(self):
+        try:
+            with open(_API_KEYS_PATH, "r") as f:
+                data = json.load(f)
+            self._vt_key = data.get("virustotal_key", "").strip()
+            self._abuse_key = data.get("abuseipdb_key", "").strip()
+        except Exception:
+            pass
+
+    def save_keys(self, vt_key: str, abuse_key: str):
+        self._vt_key = vt_key.strip()
+        self._abuse_key = abuse_key.strip()
+        try:
+            with open(_API_KEYS_PATH, "w") as f:
+                json.dump({"virustotal_key": self._vt_key, "abuseipdb_key": self._abuse_key}, f, indent=2)
+        except Exception:
+            pass
+
+    @property
+    def has_keys(self) -> bool:
+        return bool(self._vt_key or self._abuse_key)
+
+    # ── Rate limiting ───────────────────────────────────────────────────────
+
+    def _vt_rate_ok(self) -> bool:
+        now = time.time()
+        self._vt_timestamps = [t for t in self._vt_timestamps if now - t < 60]
+        return len(self._vt_timestamps) < self.VT_MAX_PER_MIN
+
+    def _abuse_rate_ok(self) -> bool:
+        now = time.time()
+        if now - self._abuse_day_start > 86400:
+            self._abuse_day_count = 0
+            self._abuse_day_start = now
+        return self._abuse_day_count < self.ABUSE_MAX_PER_DAY
+
+    # ── API calls ───────────────────────────────────────────────────────────
+
+    def _query_virustotal(self, ip: str) -> Dict:
+        if not self._vt_key or not self._vt_rate_ok():
+            return {}
+        try:
+            resp = requests.get(
+                f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+                headers={"x-apikey": self._vt_key},
+                timeout=8,
+            )
+            self._vt_timestamps.append(time.time())
+            if resp.status_code == 200:
+                attrs = resp.json().get("data", {}).get("attributes", {})
+                stats = attrs.get("last_analysis_stats", {})
+                return {
+                    "vt_malicious":  int(stats.get("malicious", 0)),
+                    "vt_suspicious": int(stats.get("suspicious", 0)),
+                    "vt_harmless":   int(stats.get("harmless", 0)),
+                    "vt_undetected": int(stats.get("undetected", 0)),
+                    "vt_reputation": int(attrs.get("reputation", 0)),
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _query_abuseipdb(self, ip: str) -> Dict:
+        if not self._abuse_key or not self._abuse_rate_ok():
+            return {}
+        try:
+            resp = requests.get(
+                "https://api.abuseipdb.com/api/v2/check",
+                headers={"Key": self._abuse_key, "Accept": "application/json"},
+                params={"ipAddress": ip, "maxAgeInDays": "90"},
+                timeout=8,
+            )
+            self._abuse_day_count += 1
+            if resp.status_code == 200:
+                d = resp.json().get("data", {})
+                return {
+                    "abuse_score":   int(d.get("abuseConfidenceScore", 0)),
+                    "abuse_reports": int(d.get("totalReports", 0)),
+                    "abuse_is_tor":  bool(d.get("isTor", False)),
+                    "abuse_usage":   str(d.get("usageType", "")),
+                    "abuse_domain":  str(d.get("domain", "")),
+                    "abuse_country": str(d.get("countryCode", "")),
+                }
+        except Exception:
+            pass
+        return {}
+
+    # ── Main check ──────────────────────────────────────────────────────────
+
+    def check_ip(self, ip: str, force: bool = False) -> Dict:
+        """
+        Check an IP against VT + AbuseIPDB.  Returns a combined dict.
+        Results are cached for the session (unless force=True).
+        """
+        if is_private_ip(ip):
+            return {"rep": REP_CLEAN, "source": "private"}
+
+        with self._lock:
+            if not force and ip in self._cache:
+                return self._cache[ip]
+
+        vt = self._query_virustotal(ip)
+        ab = self._query_abuseipdb(ip)
+
+        result = {**vt, **ab}
+        result["source"] = "+".join(filter(None, ["vt" if vt else "", "abuse" if ab else ""]))
+        result["checked_at"] = now_ts()
+
+        # Derive reputation indicator
+        vt_mal = result.get("vt_malicious", 0)
+        abuse  = result.get("abuse_score", 0)
+
+        if vt_mal >= 3 or abuse >= 50:
+            result["rep"] = REP_DANGEROUS
+        elif vt_mal >= 1 or abuse >= 15:
+            result["rep"] = REP_SUSPICIOUS
+        else:
+            result["rep"] = REP_CLEAN
+
+        with self._lock:
+            self._cache[ip] = result
+        return result
+
+    def get_cached(self, ip: str) -> Optional[Dict]:
+        """Return cached result or None."""
+        with self._lock:
+            return self._cache.get(ip)
+
+    def reputation_upgrades_trust(self, ip: str, current_trust: str) -> str:
+        """
+        Given an IP's reputation data, return the same or higher severity trust.
+        Never downgrades (e.g. safe → safe, unknown → dangerous).
+        """
+        cached = self.get_cached(ip)
+        if not cached:
+            return current_trust
+
+        trust_order = {"safe": 0, "known": 1, "unknown": 2, "suspicious": 3, "dangerous": 4}
+        current_level = trust_order.get(current_trust, 2)
+
+        rep = cached.get("rep", REP_UNCHECKED)
+        if rep == REP_DANGEROUS:
+            new_level = max(current_level, 4)
+        elif rep == REP_SUSPICIOUS:
+            new_level = max(current_level, 3)
+        else:
+            # Clean reputation: optionally upgrade unknown → known
+            vt_harmless = cached.get("vt_harmless", 0)
+            if current_trust == "unknown" and vt_harmless >= 30:
+                new_level = max(current_level, 1)  # → known
+            else:
+                new_level = current_level
+
+        reverse = {v: k for k, v in trust_order.items()}
+        return reverse.get(new_level, current_trust)
+
+
+# Global instance (created once, used by App and NetworkMonitor)
+_reputation_checker: Optional[IPReputationChecker] = None
+
+
+def get_reputation_checker() -> IPReputationChecker:
+    global _reputation_checker
+    if _reputation_checker is None:
+        _reputation_checker = IPReputationChecker()
+    return _reputation_checker
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Firewall helper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -917,6 +1126,14 @@ class NetworkMonitor:
                 if svc_name in ("Ephemeral", "Registered") and local_port in PORT_SERVICES:
                     svc_name, svc_desc = port_service(local_port)
 
+                # Reputation check (hybrid: only for unknown/suspicious/dangerous)
+                rep_checker = get_reputation_checker()
+                rep_indicator = REP_UNCHECKED
+                cached_rep = rep_checker.get_cached(remote_ip)
+                if cached_rep:
+                    rep_indicator = cached_rep.get("rep", REP_UNCHECKED)
+                    trust_level = rep_checker.reputation_upgrades_trust(remote_ip, trust_level)
+
                 conns_out.append({
                     "pid": pid,
                     "process": pname,
@@ -931,6 +1148,7 @@ class NetworkMonitor:
                     "city": geo.get("city", ""),
                     "org": geo.get("org", ""),
                     "trust": trust_level,
+                    "rep": rep_indicator,
                     "service": svc_name,
                     "service_desc": svc_desc,
                 })
@@ -942,6 +1160,44 @@ class NetworkMonitor:
             key=lambda x: (-(trust_order.get(x["trust"], 2)), x.get("process", "")),
         )
         return conns_out
+
+    # ── Background reputation checks (hybrid auto-check) ─────────────────────
+
+    def check_reputations_background(self, conns: List[Dict]):
+        """
+        Auto-check IPs classified as unknown/suspicious/dangerous.
+        Runs in a background thread to avoid blocking the UI.
+        Max 3 checks per cycle to stay within rate limits.
+        """
+        rep = get_reputation_checker()
+        if not rep.has_keys:
+            return
+
+        to_check = []
+        for c in conns:
+            ip = c.get("remote_ip", "")
+            trust = c.get("trust", "")
+            if trust in ("unknown", "suspicious", "dangerous") and ip and not is_private_ip(ip):
+                if rep.get_cached(ip) is None:
+                    to_check.append(ip)
+            if len(to_check) >= 3:
+                break
+
+        if not to_check:
+            return
+
+        def _bg():
+            for ip in to_check:
+                result = rep.check_ip(ip)
+                if result.get("rep") in (REP_DANGEROUS, REP_SUSPICIOUS):
+                    self.log("WARN", "REPUTATION",
+                             f"IP {ip} flagged by reputation services",
+                             {"ip": ip, "rep": result.get("rep", ""),
+                              "vt_malicious": result.get("vt_malicious", 0),
+                              "abuse_score": result.get("abuse_score", 0),
+                              "source": result.get("source", "")})
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     # ── Advanced threat detection ─────────────────────────────────────────────
 
@@ -1364,8 +1620,9 @@ class ConnectionDetailPopup:
 
         self.win = ctk.CTkToplevel(parent)
         self.win.title("Connection Detail")
-        self.win.geometry("560x520")
-        self.win.resizable(False, False)
+        self.win.geometry("580x720")
+        self.win.resizable(True, True)
+        self.win.minsize(520, 500)
         self.win.grab_set()
 
         self._build()
@@ -1375,7 +1632,11 @@ class ConnectionDetailPopup:
         trust = c.get("trust", "unknown")
         color = TRUST_COLORS.get(trust, "white")
 
-        header = ctk.CTkFrame(self.win, fg_color=("#1e1e2e", "#1e1e2e"), corner_radius=8)
+        # Scrollable container for all content
+        scroll = ctk.CTkScrollableFrame(self.win, corner_radius=0)
+        scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
+        header = ctk.CTkFrame(scroll, fg_color=("#1e1e2e", "#1e1e2e"), corner_radius=8)
         header.pack(fill="x", padx=12, pady=(12, 4))
         ctk.CTkLabel(header, text=f"  {c.get('process', '?')}",
                      font=ctk.CTkFont(size=15, weight="bold")).pack(side="left", pady=8, padx=4)
@@ -1385,7 +1646,7 @@ class ConnectionDetailPopup:
                      text_color=color,
                      font=ctk.CTkFont(weight="bold")).pack(side="right", pady=8, padx=12)
 
-        info = ctk.CTkFrame(self.win, corner_radius=8)
+        info = ctk.CTkFrame(scroll, corner_radius=8)
         info.pack(fill="x", padx=12, pady=4)
 
         def row(lbl, val):
@@ -1434,8 +1695,45 @@ class ConnectionDetailPopup:
         }
         row("Trust reason:", trust_explanations.get(trust, ""))
 
+        # ── Reputation section ──────────────────────────────────────────────
+        rep_frame = ctk.CTkFrame(scroll, corner_radius=8)
+        rep_frame.pack(fill="x", padx=12, pady=4)
+
+        rep_header = ctk.CTkFrame(rep_frame, fg_color="transparent")
+        rep_header.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(rep_header, text="🛡️  IP Reputation",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+
+        self._rep_content = ctk.CTkFrame(rep_frame, fg_color="transparent")
+        self._rep_content.pack(fill="x", padx=8, pady=(0, 6))
+
+        remote_ip = c.get("remote_ip", "")
+        rep_checker = get_reputation_checker()
+        cached = rep_checker.get_cached(remote_ip)
+        if cached:
+            self._show_rep_results(cached)
+        else:
+            ctk.CTkLabel(self._rep_content, text="Not checked yet",
+                         text_color="gray").pack(anchor="w")
+
+        rep_btn_row = ctk.CTkFrame(rep_frame, fg_color="transparent")
+        rep_btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        self._check_rep_btn = ctk.CTkButton(
+            rep_btn_row, text="Check Reputation",
+            command=lambda: self._check_reputation(remote_ip),
+            fg_color="#5865F2", hover_color="#4752C4", width=150,
+        )
+        self._check_rep_btn.pack(side="left", padx=4)
+        self._rep_status_lbl = ctk.CTkLabel(rep_btn_row, text="", text_color="gray")
+        self._rep_status_lbl.pack(side="left", padx=8)
+
+        if not rep_checker.has_keys:
+            self._check_rep_btn.configure(state="disabled")
+            self._rep_status_lbl.configure(text="No API keys configured")
+
+        # ────────────────────────────────────────────────────────────────────
         exe_path = c.get("exe", "")
-        btn_frame = ctk.CTkFrame(self.win, fg_color="transparent")
+        btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         btn_frame.pack(fill="x", padx=12, pady=8)
 
         if exe_path and os.path.exists(exe_path):
@@ -1464,7 +1762,7 @@ class ConnectionDetailPopup:
         ).pack(side="left", padx=4)
 
         ctk.CTkButton(
-            self.win, text="Close",
+            scroll, text="Close",
             command=self.win.destroy, width=80,
         ).pack(pady=(4, 12))
 
@@ -1523,10 +1821,155 @@ class ConnectionDetailPopup:
             except Exception as e:
                 messagebox.showerror("Kill Process", str(e), parent=self.win)
 
+    def _show_rep_results(self, rep: Dict):
+        """Display reputation results in the popup."""
+        for w in self._rep_content.winfo_children():
+            w.destroy()
+
+        indicator = rep.get("rep", REP_UNCHECKED)
+        ind_color = REP_COLORS.get(indicator, "#888888")
+
+        # Indicator badge
+        badge_frame = ctk.CTkFrame(self._rep_content, fg_color="#1a2a3a", corner_radius=6)
+        badge_frame.pack(fill="x", pady=(2, 4))
+        ctk.CTkLabel(badge_frame, text=f"  {indicator}  ",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=ind_color).pack(side="left", padx=6, pady=4)
+        label_map = {REP_CLEAN: "Clean", REP_SUSPICIOUS: "Suspicious", REP_DANGEROUS: "Dangerous"}
+        ctk.CTkLabel(badge_frame, text=label_map.get(indicator, "Unknown"),
+                     text_color=ind_color,
+                     font=ctk.CTkFont(weight="bold")).pack(side="left", pady=4)
+        ctk.CTkLabel(badge_frame, text=f"  (via {rep.get('source', '?')})",
+                     text_color="gray").pack(side="left", pady=4, padx=4)
+
+        def detail_row(lbl, val, val_color="white"):
+            r = ctk.CTkFrame(self._rep_content, fg_color="transparent")
+            r.pack(fill="x", pady=1)
+            ctk.CTkLabel(r, text=lbl, width=140, anchor="w",
+                         text_color="gray").pack(side="left")
+            ctk.CTkLabel(r, text=str(val), anchor="w",
+                         text_color=val_color).pack(side="left", padx=4)
+
+        # VirusTotal results
+        if "vt_malicious" in rep:
+            vt_mal = rep["vt_malicious"]
+            vt_susp = rep.get("vt_suspicious", 0)
+            vt_harm = rep.get("vt_harmless", 0)
+            mal_col = "#FF4444" if vt_mal > 0 else "#90EE90"
+            detail_row("VT Malicious:", f"{vt_mal}  (suspicious: {vt_susp}, harmless: {vt_harm})", mal_col)
+            detail_row("VT Reputation:", rep.get("vt_reputation", "?"))
+
+        # AbuseIPDB results
+        if "abuse_score" in rep:
+            score = rep["abuse_score"]
+            score_col = "#FF4444" if score >= 50 else "#FFA500" if score >= 15 else "#90EE90"
+            detail_row("Abuse Score:", f"{score}%  ({rep.get('abuse_reports', 0)} reports)", score_col)
+            if rep.get("abuse_is_tor"):
+                detail_row("Tor Node:", "YES", "#FF4444")
+            if rep.get("abuse_usage"):
+                detail_row("Usage Type:", rep.get("abuse_usage", ""))
+            if rep.get("abuse_domain"):
+                detail_row("Domain:", rep.get("abuse_domain", ""))
+
+        if rep.get("checked_at"):
+            detail_row("Checked at:", rep["checked_at"])
+
+    def _check_reputation(self, ip: str):
+        """Manual reputation check (runs in background thread, updates UI)."""
+        if not ip or is_private_ip(ip):
+            self._rep_status_lbl.configure(text="Private IP — no check needed")
+            return
+
+        self._check_rep_btn.configure(state="disabled")
+        self._rep_status_lbl.configure(text="Checking...")
+
+        def _bg():
+            rep = get_reputation_checker()
+            result = rep.check_ip(ip, force=True)
+
+            def _update_ui():
+                try:
+                    if not self.win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                self._show_rep_results(result)
+                self._check_rep_btn.configure(state="normal")
+                self._rep_status_lbl.configure(text="")
+
+            try:
+                self.win.after(0, _update_ui)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main App
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API Keys Settings dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class APIKeySettingsDialog:
+    def __init__(self, parent):
+        self.win = ctk.CTkToplevel(parent)
+        self.win.title("API Key Settings")
+        self.win.geometry("520x280")
+        self.win.resizable(False, False)
+        self.win.grab_set()
+
+        rep = get_reputation_checker()
+
+        ctk.CTkLabel(self.win, text="🔑  API Keys for IP Reputation",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(16, 4))
+        ctk.CTkLabel(self.win, text="Keys are stored locally in tools/nid_api_keys.json",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(pady=(0, 12))
+
+        form = ctk.CTkFrame(self.win)
+        form.pack(fill="x", padx=20, pady=4)
+
+        # VirusTotal key
+        r1 = ctk.CTkFrame(form, fg_color="transparent")
+        r1.pack(fill="x", padx=10, pady=6)
+        ctk.CTkLabel(r1, text="VirusTotal:", width=100, anchor="w",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.vt_var = tk.StringVar(value=rep._vt_key)
+        ctk.CTkEntry(r1, textvariable=self.vt_var, width=340, show="*").pack(side="left", padx=4)
+
+        # AbuseIPDB key
+        r2 = ctk.CTkFrame(form, fg_color="transparent")
+        r2.pack(fill="x", padx=10, pady=6)
+        ctk.CTkLabel(r2, text="AbuseIPDB:", width=100, anchor="w",
+                     font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.abuse_var = tk.StringVar(value=rep._abuse_key)
+        ctk.CTkEntry(r2, textvariable=self.abuse_var, width=340, show="*").pack(side="left", padx=4)
+
+        # Status
+        self.status_lbl = ctk.CTkLabel(self.win, text="", text_color="gray")
+        self.status_lbl.pack(pady=4)
+
+        # Buttons
+        btns = ctk.CTkFrame(self.win, fg_color="transparent")
+        btns.pack(pady=8)
+        ctk.CTkButton(btns, text="Save", command=self._save,
+                      fg_color="#3abf6d", hover_color="#2b944e", width=100).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", command=self.win.destroy, width=100).pack(side="left", padx=6)
+
+        # Show current status
+        has_vt = "✓" if rep._vt_key else "✗"
+        has_ab = "✓" if rep._abuse_key else "✗"
+        self.status_lbl.configure(text=f"VT key: {has_vt}  |  AbuseIPDB key: {has_ab}")
+
+    def _save(self):
+        rep = get_reputation_checker()
+        rep.save_keys(self.vt_var.get(), self.abuse_var.get())
+        has_vt = "✓" if rep._vt_key else "✗"
+        has_ab = "✓" if rep._abuse_key else "✗"
+        self.status_lbl.configure(text=f"Saved!  VT: {has_vt}  |  AbuseIPDB: {has_ab}", text_color="#90EE90")
+
 
 class App(ctk.CTkFrame):
     def __init__(self, parent):
@@ -1556,6 +1999,11 @@ class App(ctk.CTkFrame):
 
         self._last_conns: List[Dict] = []
         self._last_scan_ts: str = ""
+
+        # Connection history — accumulates all unknown/suspicious/dangerous IPs
+        self._history_path = self.state_path.replace("nid_state.json", "nid_conn_history.json")
+        self._conn_history: Dict[str, Dict] = {}   # keyed by remote_ip
+        self._load_history()
 
         self._build_ui()
 
@@ -1608,6 +2056,8 @@ class App(ctk.CTkFrame):
         ctk.CTkButton(top, text="Export report", command=self.export_report).pack(side="left", padx=6)
         ctk.CTkButton(top, text="Force stop", command=self.force_stop,
                       fg_color="#bf3a3a", hover_color="#942b2b").pack(side="left", padx=6)
+        ctk.CTkButton(top, text="⚙ API Keys", command=lambda: APIKeySettingsDialog(self.parent),
+                      fg_color="#565b5e", hover_color="#6e7377", width=90).pack(side="left", padx=6)
 
         nb = ctk.CTkTabview(self)
         nb.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -1615,6 +2065,7 @@ class App(ctk.CTkFrame):
         self.tab_dashboard = nb.add("Summary")
         self.tab_devices = nb.add("Devices")
         self.tab_connections = nb.add("Connections")
+        self.tab_history = nb.add("History")
         self.tab_alerts = nb.add("Alerts")
         self.tab_trust = nb.add("Trust list")
         self.tab_threats = nb.add("Threats")
@@ -1622,6 +2073,7 @@ class App(ctk.CTkFrame):
         self._build_dashboard()
         self._build_devices()
         self._build_connections()
+        self._build_history()
         self._build_alerts()
         self._build_trust()
         self._build_threats()
@@ -1666,6 +2118,11 @@ class App(ctk.CTkFrame):
             f"  scapy={'YES' if HAS_SCAPY else 'NO'} | watchdog={'YES' if HAS_WATCHDOG else 'NO'} | admin={'YES' if is_admin_windows() else 'NO'}",
             f"  active={'ON' if self.active_scan.get() else 'OFF'} | passive={'ON' if self.passive_scan.get() else 'OFF'}",
             f"  Gateway baseline: {self.mon.baseline_gateway_ip or '(not set)'} / {self.mon.baseline_gateway_mac or '(not set)'}",
+            "",
+            "IP Reputation:",
+            f"  VirusTotal: {'configured' if get_reputation_checker()._vt_key else 'no key'}"
+            f"  |  AbuseIPDB: {'configured' if get_reputation_checker()._abuse_key else 'no key'}",
+            f"  IPs checked this session: {len(get_reputation_checker()._cache)}",
         ]
         self.live_text.configure(state="normal")
         self.live_text.delete("1.0", "end")
@@ -1707,17 +2164,17 @@ class App(ctk.CTkFrame):
 
     def _build_connections(self):
         f = self.tab_connections
-        cols = ("trust", "process", "service", "laddr", "raddr", "country", "org", "status")
+        cols = ("trust", "rep", "process", "service", "laddr", "raddr", "country", "org", "status")
         self.conn_tree = ttk.Treeview(f, columns=cols, show="headings", height=26)
         headings = {
-            "trust": "TRUST", "process": "PROCESS", "service": "SERVICE",
+            "trust": "TRUST", "rep": "REP", "process": "PROCESS", "service": "SERVICE",
             "laddr": "LOCAL", "raddr": "REMOTE",
             "country": "COUNTRY", "org": "ORGANIZATION", "status": "STATUS",
         }
         widths = {
-            "trust": 90, "process": 140, "service": 110,
+            "trust": 90, "rep": 40, "process": 140, "service": 110,
             "laddr": 130, "raddr": 130,
-            "country": 90, "org": 180, "status": 90,
+            "country": 90, "org": 170, "status": 90,
         }
         for c in cols:
             self.conn_tree.heading(c, text=headings[c])
@@ -1770,6 +2227,79 @@ class App(ctk.CTkFrame):
             result.append(c)
         return result
 
+    # ── History tab ───────────────────────────────────────────────────────────
+
+    def _build_history(self):
+        f = self.tab_history
+
+        info = ctk.CTkLabel(
+            f, text="All unknown / suspicious / dangerous connections ever seen (persisted across sessions)",
+            text_color="gray", font=ctk.CTkFont(size=12))
+        info.pack(anchor="w", padx=10, pady=(8, 2))
+
+        cols = ("trust", "rep", "remote_ip", "process", "service", "raddr",
+                "country", "org", "first_seen", "last_seen", "times_seen")
+        self.hist_tree = ttk.Treeview(f, columns=cols, show="headings", height=24)
+        headings = {
+            "trust": "TRUST", "rep": "REP", "remote_ip": "REMOTE IP",
+            "process": "PROCESS", "service": "SERVICE", "raddr": "REMOTE ADDR",
+            "country": "COUNTRY", "org": "ORGANIZATION",
+            "first_seen": "FIRST SEEN", "last_seen": "LAST SEEN", "times_seen": "#",
+        }
+        widths = {
+            "trust": 90, "rep": 40, "remote_ip": 130, "process": 120,
+            "service": 90, "raddr": 140, "country": 80, "org": 160,
+            "first_seen": 140, "last_seen": 140, "times_seen": 40,
+        }
+        for c in cols:
+            self.hist_tree.heading(c, text=headings[c])
+            self.hist_tree.column(c, width=widths[c], stretch=(c in ("org", "process")))
+        self.hist_tree.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+
+        self.hist_tree.bind("<Double-1>", self._on_hist_double_click)
+
+        # Filter + buttons
+        bar = ctk.CTkFrame(f)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(bar, text="Filter:").pack(side="left", padx=(0, 6))
+        self.hist_filter = tk.StringVar(value="ALL")
+        ttk.Combobox(
+            bar, textvariable=self.hist_filter, width=18,
+            values=("ALL", "UNKNOWN", "SUSPICIOUS", "DANGEROUS"),
+            state="readonly",
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="Refresh", command=self.refresh_history, width=80).pack(side="left", padx=6)
+        ctk.CTkButton(bar, text="Clear All", command=self._clear_history, width=80,
+                      fg_color="#bf3a3a", hover_color="#942b2b").pack(side="right", padx=6)
+
+    def _on_hist_double_click(self, event):
+        sel = self.hist_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        ip = self.hist_tree.set(iid, "remote_ip")
+        # Find matching entry in history and build a fake conn dict for the detail popup
+        entry = self._conn_history.get(ip)
+        if not entry:
+            return
+        conn_data = {
+            "remote_ip": ip,
+            "remote_port": entry.get("remote_port", 0),
+            "trust": entry.get("trust", "unknown"),
+            "rep": entry.get("rep", ""),
+            "process": entry.get("process", "?"),
+            "exe": entry.get("exe", ""),
+            "service": entry.get("service", ""),
+            "service_desc": entry.get("service_desc", ""),
+            "laddr": entry.get("laddr", ""),
+            "raddr": entry.get("raddr", ""),
+            "country": entry.get("country", ""),
+            "org": entry.get("org", ""),
+            "status": entry.get("status", ""),
+            "pid": 0,
+        }
+        ConnectionDetailPopup(self.parent, conn_data, self.mon)
+
     # ── Alerts tab ────────────────────────────────────────────────────────────
 
     def _build_alerts(self):
@@ -1816,17 +2346,37 @@ class App(ctk.CTkFrame):
 
     def _build_trust(self):
         f = self.tab_trust
+
+        # ── Trusted Devices (MAC) ──
+        ctk.CTkLabel(f, text="Trusted Devices (MAC)",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=10, pady=(8, 2))
         cols = ("mac", "label", "first_seen")
-        self.trust_tree = ttk.Treeview(f, columns=cols, show="headings", height=24)
+        self.trust_tree = ttk.Treeview(f, columns=cols, show="headings", height=10)
         for c in cols:
             self.trust_tree.heading(c, text=c.upper())
             w = 280 if c == "label" else 220
             self.trust_tree.column(c, width=w, stretch=True)
-        self.trust_tree.pack(fill="both", expand=True, padx=8, pady=8)
+        self.trust_tree.pack(fill="both", expand=True, padx=8, pady=(2, 4))
 
         row = ctk.CTkFrame(f)
-        row.pack(fill="x", padx=8, pady=(0, 8))
+        row.pack(fill="x", padx=8, pady=(0, 6))
         ctk.CTkButton(row, text="Remove selected", command=self.remove_trust_selected).pack(side="left", padx=6)
+
+        # ── Trusted IPs (connections) ──
+        ctk.CTkLabel(f, text="Trusted IPs (Connections)",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=10, pady=(6, 2))
+        ip_cols = ("ip", "label", "first_seen", "notes")
+        self.trust_ip_tree = ttk.Treeview(f, columns=ip_cols, show="headings", height=10)
+        for c in ip_cols:
+            self.trust_ip_tree.heading(c, text=c.upper())
+            w = 300 if c == "notes" else 200 if c == "label" else 160
+            self.trust_ip_tree.column(c, width=w, stretch=(c == "notes"))
+        self.trust_ip_tree.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+
+        row2 = ctk.CTkFrame(f)
+        row2.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkButton(row2, text="Remove selected IP", command=self._remove_trust_ip_selected).pack(side="left", padx=6)
+        ctk.CTkButton(row2, text="Refresh", command=self.refresh_trust).pack(side="right", padx=6)
 
     # ── Threats tab ───────────────────────────────────────────────────────────
 
@@ -1925,6 +2475,83 @@ class App(ctk.CTkFrame):
         except Exception as e:
             messagebox.showerror("Export failed", str(e))
 
+    # ── Connection History persistence ──────────────────────────────────────
+
+    def _load_history(self):
+        try:
+            if os.path.exists(self._history_path):
+                with open(self._history_path, "r", encoding="utf-8") as f:
+                    self._conn_history = json.load(f)
+        except Exception:
+            self._conn_history = {}
+
+    def _save_history(self):
+        try:
+            with open(self._history_path, "w", encoding="utf-8") as f:
+                json.dump(self._conn_history, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _update_history(self, conns: List[Dict]):
+        """Add unknown/suspicious/dangerous connections to persistent history."""
+        dominated = {"unknown", "suspicious", "dangerous"}
+        changed = False
+        for c in conns:
+            trust = c.get("trust", "unknown")
+            if trust not in dominated:
+                continue
+            ip = c.get("remote_ip", "")
+            if not ip:
+                continue
+            if ip in self._conn_history:
+                entry = self._conn_history[ip]
+                entry["last_seen"] = now_ts()
+                entry["times_seen"] = entry.get("times_seen", 1) + 1
+                # upgrade severity level if worse
+                order = {"unknown": 0, "suspicious": 1, "dangerous": 2}
+                if order.get(trust, 0) > order.get(entry.get("trust", "unknown"), 0):
+                    entry["trust"] = trust
+                # update other fields
+                entry["process"] = c.get("process", entry.get("process", "?"))
+                entry["service"] = c.get("service", entry.get("service", ""))
+                entry["country"] = c.get("country", entry.get("country", ""))
+                entry["org"] = c.get("org", entry.get("org", ""))
+                entry["rep"] = c.get("rep", entry.get("rep", ""))
+                entry["raddr"] = c.get("raddr", entry.get("raddr", ""))
+                entry["laddr"] = c.get("laddr", entry.get("laddr", ""))
+                entry["status"] = c.get("status", entry.get("status", ""))
+                changed = True
+            else:
+                self._conn_history[ip] = {
+                    "remote_ip": ip,
+                    "trust": trust,
+                    "process": c.get("process", "?"),
+                    "service": c.get("service", ""),
+                    "laddr": c.get("laddr", ""),
+                    "raddr": c.get("raddr", ""),
+                    "country": c.get("country", ""),
+                    "org": c.get("org", ""),
+                    "rep": c.get("rep", ""),
+                    "status": c.get("status", ""),
+                    "first_seen": now_ts(),
+                    "last_seen": now_ts(),
+                    "times_seen": 1,
+                    "remote_port": c.get("remote_port", 0),
+                    "exe": c.get("exe", ""),
+                }
+                changed = True
+        if changed:
+            self._save_history()
+
+    def _clear_history(self):
+        if not messagebox.askyesno("Clear History",
+                                   "Delete all connection history entries?",
+                                   parent=self.parent):
+            return
+        self._conn_history.clear()
+        self._save_history()
+        self.refresh_history()
+
     def set_gateway_baseline(self):
         gw = self.gateway.get().strip()
         if not gw:
@@ -1983,6 +2610,16 @@ class App(ctk.CTkFrame):
         self.mon.untrust_mac(mac)
         self.mon.log("INFO", "DEVICE", "Trust entry removed", {"mac": mac})
         self.refresh_all()
+
+    def _remove_trust_ip_selected(self):
+        sel = self.trust_ip_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        ip = self.trust_ip_tree.set(iid, "ip")
+        self.mon.conn_trust.untrust_ip(ip)
+        self.mon.log("INFO", "CONNECTION", "Trusted IP removed", {"ip": ip})
+        self.refresh_trust()
 
     def clear_alerts(self):
         self.mon.alerts.clear()
@@ -2162,12 +2799,18 @@ class App(ctk.CTkFrame):
                     self._last_conns = conns
                     self._last_scan_ts = now_ts()
 
+                    # Accumulate unknown/suspicious/dangerous to persistent history
+                    self._update_history(conns)
+
                     if len(conns) > 80:
                         self.mon.log("INFO", "OUTBOUND", "High number of active connections",
                                      {"count": len(conns)})
 
                     # Advanced threat scans (rate-limited internally)
                     self.mon._detect_advanced_threats(conns)
+
+                    # Background reputation checks (hybrid: unknown/suspicious/dangerous)
+                    self.mon.check_reputations_background(conns)
 
                 except Exception as e:
                     self.mon.log("WARN", "SYSTEM", "Scan error", {"error": str(e)})
@@ -2190,6 +2833,7 @@ class App(ctk.CTkFrame):
     def refresh_all(self):
         self.refresh_devices()
         self.refresh_connections()
+        self.refresh_history()
         self.refresh_alerts()
         self.refresh_trust()
         self.refresh_threats()
@@ -2227,10 +2871,12 @@ class App(ctk.CTkFrame):
             if len(org) > 35:
                 org = org[:32] + "..."
             iid = f"c-{idx}"
+            rep = c.get("rep", REP_UNCHECKED)
             self.conn_tree.insert(
                 "", "end", iid=iid,
                 values=(
                     trust.upper(),
+                    rep,
                     c.get("process", "?"),
                     c.get("service", ""),
                     c.get("laddr", ""),
@@ -2278,12 +2924,57 @@ class App(ctk.CTkFrame):
         self.alert_details.insert("1.0", text)
         self.alert_details.configure(state="disabled")
 
+    def refresh_history(self):
+        for i in self.hist_tree.get_children():
+            self.hist_tree.delete(i)
+        filt = self.hist_filter.get().lower()
+        trust_order = {"dangerous": 0, "suspicious": 1, "unknown": 2}
+        entries = sorted(
+            self._conn_history.values(),
+            key=lambda e: (trust_order.get(e.get("trust", "unknown"), 2), e.get("last_seen", "")),
+        )
+        for idx, e in enumerate(entries):
+            trust = e.get("trust", "unknown")
+            if filt != "all" and trust != filt:
+                continue
+            org = e.get("org", "")
+            if len(org) > 35:
+                org = org[:32] + "..."
+            iid = f"h-{idx}"
+            self.hist_tree.insert(
+                "", "end", iid=iid,
+                values=(
+                    trust.upper(),
+                    e.get("rep", ""),
+                    e.get("remote_ip", ""),
+                    e.get("process", "?"),
+                    e.get("service", ""),
+                    e.get("raddr", ""),
+                    e.get("country", ""),
+                    org,
+                    e.get("first_seen", ""),
+                    e.get("last_seen", ""),
+                    e.get("times_seen", 1),
+                ),
+                tags=(trust,),
+            )
+            self.hist_tree.tag_configure(trust, foreground=TRUST_COLORS.get(trust, "white"))
+
     def refresh_trust(self):
+        # Device trust (MAC)
         for i in self.trust_tree.get_children():
             self.trust_tree.delete(i)
         for mac, info in sorted(self.mon.trusted.items()):
             self.trust_tree.insert("", "end", iid=f"t-{mac}",
                                    values=(mac, info.get("label", ""), info.get("first_seen", "")))
+        # Connection trust (IP)
+        for i in self.trust_ip_tree.get_children():
+            self.trust_ip_tree.delete(i)
+        for ip, info in sorted(self.mon.conn_trust.trusted_ips.items()):
+            self.trust_ip_tree.insert("", "end", iid=f"tip-{ip}",
+                                      values=(ip, info.get("label", ""),
+                                              info.get("first_seen", ""),
+                                              info.get("notes", "")))
 
     def refresh_threats(self):
         for i in self.threat_tree.get_children():

@@ -18,6 +18,7 @@ import tkinter as tk
 import customtkinter as ctk
 import random
 import math
+from datetime import datetime
 
 try:
     import keyboard as _kb
@@ -455,9 +456,35 @@ class ScreenLockApp:
                            font=("Segoe UI", 9),
                            fill="#3a3a3a", tags="hud")
 
+        # Clock — top right
+        canvas.create_text(sw - 20, 20, text="", anchor="ne",
+                           font=("Segoe UI", 32, "bold"),
+                           fill="#ffffff", tags="hud_clock")
+        canvas.create_text(sw - 20, 60, text="", anchor="ne",
+                           font=("Segoe UI", 13),
+                           fill="#888888", tags="hud_date")
+
         self._overlay = ov
         self._canvas  = canvas
         self._peers   = []
+        self._tick_clock()
+
+    def _tick_clock(self):
+        canvas = self._canvas
+        if canvas is None or not self.locked:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+        except Exception:
+            return
+        now = datetime.now()
+        canvas.itemconfigure("hud_clock", text=now.strftime("%H:%M:%S"))
+        canvas.itemconfigure("hud_date",  text=now.strftime("%A, %d %B %Y"))
+        canvas.tag_raise("hud"); canvas.tag_raise("hud_clock"); canvas.tag_raise("hud_date")
+        canvas.tag_raise("hud_clock")
+        canvas.tag_raise("hud_date")
+        canvas.after(1000, self._tick_clock)
 
     def _hide_overlay(self):
         self._canvas  = None
@@ -515,7 +542,7 @@ class ScreenLockApp:
         self._peers.append(card)
 
         # Keep HUD on top
-        canvas.tag_raise("hud")
+        canvas.tag_raise("hud"); canvas.tag_raise("hud_clock"); canvas.tag_raise("hud_date")
 
     def _on_click(self, event):
         canvas = self._canvas
@@ -530,7 +557,7 @@ class ScreenLockApp:
         burst = ClickBurst(canvas, event.x, event.y,
                            random.choice(_CLICK_EMOJIS))
         self._peers.append(burst)
-        canvas.tag_raise("hud")
+        canvas.tag_raise("hud"); canvas.tag_raise("hud_clock"); canvas.tag_raise("hud_date")
 
     # ── Keyboard hook ────────────────────────────
 
