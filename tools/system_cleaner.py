@@ -95,7 +95,7 @@ def _delete_dir_contents(path: str, log_cb) -> int:
             try:
                 size = _dir_size(full) if os.path.isdir(full) else os.path.getsize(full)
                 if os.path.isdir(full):
-                    shutil.rmtree(full, ignore_errors=False)
+                    shutil.rmtree(full, ignore_errors=True)
                 else:
                     os.remove(full)
                 freed += size
@@ -1109,8 +1109,24 @@ class App(ctk.CTkFrame):
                 ["explorer.exe"],
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
             )
-            self._log("  Explorer restarted")
             time.sleep(2)
+
+            # Verify explorer.exe is actually running
+            explorer_running = any(
+                p.info["name"] and p.info["name"].lower() == "explorer.exe"
+                for p in psutil.process_iter(["name"])
+            )
+            if not explorer_running:
+                time.sleep(3)
+                explorer_running = any(
+                    p.info["name"] and p.info["name"].lower() == "explorer.exe"
+                    for p in psutil.process_iter(["name"])
+                )
+
+            if explorer_running:
+                self._log("  Explorer restarted successfully")
+            else:
+                self._log("  WARNING: Explorer may not have restarted -- check your taskbar")
 
             # Check new memory
             new_mem = 0

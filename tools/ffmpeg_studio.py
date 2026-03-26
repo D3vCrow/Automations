@@ -397,13 +397,13 @@ def run_tool():
     crf_var.trace_add("write", _refresh_crf_label)
 
     def _tick_timer():
-        nonlocal timer_running
-        while timer_running:
-            elapsed = int(time.time() - record_start_time)
-            m, s = divmod(elapsed, 60)
-            h, m = divmod(m, 60)
-            win.after(0, lambda t=f"{h:02d}:{m:02d}:{s:02d}": timer_label.configure(text=t))
-            time.sleep(1)
+        if not timer_running:
+            return
+        elapsed = int(time.time() - record_start_time)
+        m, s = divmod(elapsed, 60)
+        h, m = divmod(m, 60)
+        timer_label.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+        win.after(1000, _tick_timer)
 
     def _resolved_gpu_key():
         """Use the probed label→key map; fall back to pattern matching."""
@@ -443,7 +443,7 @@ def run_tool():
         if scale:
             vf = f"scale={scale}:{color_args}:flags=lanczos"
         else:
-            vf = f"scale={color_args}"
+            vf = f"scale=iw:ih:{color_args}"
 
         cmd += ["-vf", vf]
 
@@ -473,6 +473,12 @@ def run_tool():
                 content = f.read()
         except Exception:
             content = "(could not read log file)"
+
+        # Clean up the temp log file now that we have read it
+        try:
+            os.remove(log_path)
+        except Exception:
+            pass
 
         log_win = ctk.CTkToplevel(win)
         log_win.title(title)
@@ -540,6 +546,7 @@ def run_tool():
         log_fd, log_path = tempfile.mkstemp(suffix="_ffmpeg.log", prefix="ffstudio_")
         os.close(log_fd)
 
+        log_file = None
         try:
             log_file = open(log_path, "w", encoding="utf-8")
             recording_proc = subprocess.Popen(
@@ -556,6 +563,13 @@ def run_tool():
         except Exception as e:
             messagebox.showerror("Error", str(e), parent=win)
             return
+        finally:
+            # If Popen failed, close the log file handle immediately
+            if log_file and recording_proc is None:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
 
         # Disable controls immediately while we verify startup
         start_rec_btn.configure(state="disabled", text="Starting…")
@@ -594,7 +608,7 @@ def run_tool():
                 nonlocal record_start_time, timer_running
                 record_start_time = time.time()
                 timer_running = True
-                threading.Thread(target=_tick_timer, daemon=True).start()
+                win.after(0, _tick_timer)
 
                 def _on_success():
                     start_rec_btn.configure(text="▶  Start Recording")
@@ -604,8 +618,9 @@ def run_tool():
 
                 win.after(0, _on_success)
 
-                # Store log_file ref so stop_recording can close it
+                # Store log_file ref so stop_recording can close and clean up
                 recording_proc._log_file = log_file
+                recording_proc._log_path = log_path
 
         threading.Thread(target=_verify_startup, daemon=True).start()
 
@@ -621,11 +636,17 @@ def run_tool():
             recording_proc.wait(timeout=15)
         except Exception:
             recording_proc.kill()
-        # Close the log file handle if it exists
+        # Close the log file handle and clean up temp log
         lf = getattr(recording_proc, "_log_file", None)
         if lf:
             try:
                 lf.close()
+            except Exception:
+                pass
+        lp = getattr(recording_proc, "_log_path", None)
+        if lp:
+            try:
+                os.remove(lp)
             except Exception:
                 pass
         recording_proc = None
@@ -1172,7 +1193,10 @@ def run_tool():
             if not state["active"]:
                 return
             ex, ey = _apply_snap(state["sx"], state["sy"], e.x, e.y, bool(e.state & 0x1))
-            ov.destroy()
+            try:
+                ov.destroy()
+            except Exception:
+                pass
             win.deiconify()
             win.lift()
             x, y = min(state["sx"], ex), min(state["sy"], ey)
@@ -1186,7 +1210,10 @@ def run_tool():
                 pass
 
         def on_escape(e):
-            ov.destroy()
+            try:
+                ov.destroy()
+            except Exception:
+                pass
             win.deiconify()
             try:
                 os.remove(bg_path)
@@ -1272,7 +1299,7 @@ def run_tool():
         if scale:
             vf = f"scale={scale}:{color_args}:flags=lanczos"
         else:
-            vf = f"scale={color_args}"
+            vf = f"scale=iw:ih:{color_args}"
 
         cmd = ["ffmpeg", "-y", "-f", "gdigrab"]
 
@@ -1458,12 +1485,12 @@ def run_tool():
         if scale:
             vf = f"scale={scale}:{color_args}:flags=lanczos"
         else:
-            vf = f"scale={color_args}"
+            vf = f"scale=iw:ih:{color_args}"
         cmd += ["-vf", vf]
 
         # Video codec
         if codec in ("libx264", "libx265"):
-            cmd += ["-vcodec", codec, "-crf", str(crf), "-preset", "slow",
+            cmd += ["-vcodec", codec, "-crf", str(crf), "-preset", "medium",
                     "-pix_fmt", "yuv420p"]
         elif codec == "libvpx-vp9":
             cmd += ["-vcodec", "libvpx-vp9", "-crf", str(crf), "-b:v", "0",
@@ -1507,8 +1534,6 @@ def run_tool():
         p = filedialog.askdirectory(title="Select Output Folder")
         if p:
             conv_out_var.set(p)
-
-    conv_proc_ref = [None]
 
     def start_conversion():
         in_f  = input_file_var.get().strip()

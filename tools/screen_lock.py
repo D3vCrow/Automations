@@ -464,10 +464,19 @@ class ScreenLockApp:
                            font=("Segoe UI", 13),
                            fill="#888888", tags="hud_date")
 
+        # Release grab if overlay is destroyed externally
+        ov.bind("<Destroy>", lambda e: self.unlock() if self.locked else None)
+
         self._overlay = ov
         self._canvas  = canvas
         self._peers   = []
         self._tick_clock()
+
+    def _raise_hud(self):
+        """Raise all HUD elements above card/burst layers."""
+        self._canvas.tag_raise("hud")
+        self._canvas.tag_raise("hud_clock")
+        self._canvas.tag_raise("hud_date")
 
     def _tick_clock(self):
         canvas = self._canvas
@@ -481,9 +490,7 @@ class ScreenLockApp:
         now = datetime.now()
         canvas.itemconfigure("hud_clock", text=now.strftime("%H:%M:%S"))
         canvas.itemconfigure("hud_date",  text=now.strftime("%A, %d %B %Y"))
-        canvas.tag_raise("hud"); canvas.tag_raise("hud_clock"); canvas.tag_raise("hud_date")
-        canvas.tag_raise("hud_clock")
-        canvas.tag_raise("hud_date")
+        self._raise_hud()
         canvas.after(1000, self._tick_clock)
 
     def _hide_overlay(self):
@@ -542,7 +549,7 @@ class ScreenLockApp:
         self._peers.append(card)
 
         # Keep HUD on top
-        canvas.tag_raise("hud"); canvas.tag_raise("hud_clock"); canvas.tag_raise("hud_date")
+        self._raise_hud()
 
     def _on_click(self, event):
         canvas = self._canvas
@@ -554,10 +561,13 @@ class ScreenLockApp:
         except Exception:
             return
 
+        # Prune dead peers to prevent memory leak
+        self._peers = [p for p in self._peers if p.alive]
+
         burst = ClickBurst(canvas, event.x, event.y,
                            random.choice(_CLICK_EMOJIS))
         self._peers.append(burst)
-        canvas.tag_raise("hud"); canvas.tag_raise("hud_clock"); canvas.tag_raise("hud_date")
+        self._raise_hud()
 
     # ── Keyboard hook ────────────────────────────
 
@@ -661,6 +671,7 @@ def run_tool():
     except Exception as e:
         from tkinter import messagebox
         messagebox.showerror("Screen Lock", f"Startup error:\n{e}")
+        root.destroy()
 
 
 if __name__ == "__main__":

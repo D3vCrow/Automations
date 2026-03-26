@@ -11,8 +11,6 @@ import traceback
 import customtkinter as ctk
 from tkinter import messagebox
 import psutil
-import threading
-import time
 
 # -------------------- Global Configuration --------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,12 +48,9 @@ class ToolboxApp(ctk.CTk):
 
         self.title("Automations Toolbox Pro")
         self.geometry("900x700")
-        
-        # Set theme
-        ctk.set_appearance_mode("Dark")
-        ctk.set_default_color_theme("blue")
 
         self.all_tools = []  # list of dicts: {"module", "name", "description", "filename", "favorite"}
+        self.failed_tools = []
         self.filtered_tools = []
         self.favorites = self._load_favorites()
 
@@ -273,6 +268,7 @@ class ToolboxApp(ctk.CTk):
         Load toolbox-compatible modules from TOOL_FOLDER.
         Each tool is represented as a dict: {"module", "name", "description", "filename", "favorite"}.
         """
+        self.failed_tools = []
         tools = []
         if not os.path.exists(TOOL_FOLDER):
             return tools
@@ -291,13 +287,10 @@ class ToolboxApp(ctk.CTk):
             except Exception as e:
                 # Skip broken tools but keep the launcher responsive
                 print(f"❌ Tool {filename} failed to load: {str(e)}")
-                # Add to troubleshooting list
-                if not hasattr(self, 'failed_tools'):
-                    self.failed_tools = []
                 self.failed_tools.append({
                     'filename': filename,
                     'error': str(e),
-                    'traceback': str(e.__class__.__name__)
+                    'traceback': traceback.format_exc()
                 })
                 continue
 
@@ -385,7 +378,7 @@ class ToolboxApp(ctk.CTk):
             # Also try to activate the window
             try:
                 win.state("normal")
-            except:
+            except Exception:
                 pass
                 
             return True
@@ -543,21 +536,26 @@ class ToolboxApp(ctk.CTk):
                                    hover_color="#3a7ebf")
             run_btn.pack(side="bottom", pady=(4, 8))
 
-            # Hover effects
-            card.bind("<Enter>", lambda e, c=card: c.configure(fg_color="#333333"))
-            card.bind("<Leave>", lambda e, c=card: c.configure(fg_color="#2b2b2b"))
+            # Hover effects — bind on the card and all its children to avoid flicker
+            def _bind_hover(widget, card_ref):
+                widget.bind("<Enter>", lambda e, c=card_ref: c.configure(fg_color="#333333"))
+                widget.bind("<Leave>", lambda e, c=card_ref: c.configure(fg_color="#2b2b2b"))
+                for child_widget in widget.winfo_children():
+                    _bind_hover(child_widget, card_ref)
+
+            _bind_hover(card, card)
 
     def _start_stats_loop(self):
-        def update():
-            while True:
-                try:
-                    cpu = psutil.cpu_percent()
-                    ram = psutil.virtual_memory().percent
-                    self.cpu_label.configure(text=f"CPU: {cpu}%")
-                    self.ram_label.configure(text=f"RAM: {ram}%")
-                except: pass
-                time.sleep(2)
-        threading.Thread(target=update, daemon=True).start()
+        def poll():
+            try:
+                cpu = psutil.cpu_percent()
+                ram = psutil.virtual_memory().percent
+                self.cpu_label.configure(text=f"CPU: {cpu}%")
+                self.ram_label.configure(text=f"RAM: {ram}%")
+            except Exception:
+                pass
+            self.after(2000, poll)
+        poll()
 
     def show_troubleshooting(self):
         """Show troubleshooting information for failed tools"""
@@ -594,7 +592,7 @@ class ToolboxApp(ctk.CTk):
             ctk.CTkLabel(info_frame, text=f"• {info}", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=2)
         
         # Failed tools
-        if hasattr(self, 'failed_tools') and self.failed_tools:
+        if self.failed_tools:
             failed_frame = ctk.CTkFrame(scroll_frame)
             failed_frame.pack(fill="x", pady=(0, 10))
             
@@ -606,7 +604,8 @@ class ToolboxApp(ctk.CTk):
                 
                 ctk.CTkLabel(tool_info, text=f"📁 {tool['filename']}", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(5, 2))
                 ctk.CTkLabel(tool_info, text=f"⚠️ Error: {tool['error']}", font=ctk.CTkFont(size=10), text_color="red").pack(anchor="w", padx=20, pady=2)
-                ctk.CTkLabel(tool_info, text=f"🔍 Type: {tool['traceback']}", font=ctk.CTkFont(size=10), text_color="orange").pack(anchor="w", padx=20, pady=(2, 5))
+                tb_label = ctk.CTkLabel(tool_info, text=tool['traceback'], font=ctk.CTkFont(size=9, family="Consolas"), text_color="orange", justify="left", wraplength=500)
+                tb_label.pack(anchor="w", padx=20, pady=(2, 5))
         else:
             success_frame = ctk.CTkFrame(scroll_frame)
             success_frame.pack(fill="x", pady=(0, 10))
@@ -624,12 +623,14 @@ class ToolboxApp(ctk.CTk):
         ctk.CTkLabel(stats_frame, text="📈 Loading Statistics", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
         ctk.CTkLabel(stats_frame, text=f"• Total Python files: {total_files}", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=2)
         ctk.CTkLabel(stats_frame, text=f"• Successfully loaded: {success_count}", font=ctk.CTkFont(size=11), text_color="green").pack(anchor="w", padx=20, pady=2)
-        ctk.CTkLabel(stats_frame, text=f"• Failed to load: {len(self.failed_tools) if hasattr(self, 'failed_tools') else 0}", font=ctk.CTkFont(size=11), text_color="red").pack(anchor="w", padx=20, pady=(2, 10))
+        ctk.CTkLabel(stats_frame, text=f"• Failed to load: {len(self.failed_tools)}", font=ctk.CTkFont(size=11), text_color="red").pack(anchor="w", padx=20, pady=(2, 10))
         
         # Close button
         close_btn = ctk.CTkButton(main_frame, text="Close", command=troubleshoot_window.destroy, fg_color="#3a7ebf", hover_color="#2b6194")
         close_btn.pack(pady=(20, 0))
 
 if __name__ == "__main__":
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
     app = ToolboxApp()
     app.mainloop()

@@ -248,6 +248,8 @@ def get_ip_geolocation(ip: str) -> Dict[str, str]:
         return {"country": "Local", "region": "LAN", "city": "Private", "org": "", "trust": "safe"}
     if ip in _ip_geo_cache:
         return _ip_geo_cache[ip]
+    if len(_ip_geo_cache) > 2000:
+        _ip_geo_cache.clear()
     try:
         resp = requests.get(
             f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,isp,org,as,query",
@@ -728,11 +730,9 @@ def scapy_arp_scan(cidr: str, timeout_s: int = 2) -> Dict[str, str]:
 
 def local_ipv4() -> Optional[str]:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         return None
 
@@ -888,6 +888,7 @@ class NetworkMonitor:
         self._alert_index: Dict[str, int] = {}
         self._alert_last_seen: Dict[str, float] = {}
         self._rate_limit: Dict[str, float] = {}
+        self._alert_lock = threading.Lock()
 
         self.sniff_thread: Optional[threading.Thread] = None
         self.sniff_stop = threading.Event()
@@ -958,34 +959,35 @@ class NetworkMonitor:
         if cooldown > 0:
             self._rate_limit[key] = now + cooldown
 
-        last = self._alert_last_seen.get(key)
-        if last is not None and (now - last) <= 45:
-            idx = self._alert_index.get(key)
-            if idx is not None and 0 <= idx < len(self.alerts):
-                a = self.alerts[idx]
-                d = a.get("details", {})
-                d["_count"] = int(d.get("_count", 1)) + 1
-                d["_last_seen_ts"] = now_ts()
-                d["_last_details"] = details
-                a["details"] = d
-                self._alert_last_seen[key] = now
-            return
+        with self._alert_lock:
+            last = self._alert_last_seen.get(key)
+            if last is not None and (now - last) <= 45:
+                idx = self._alert_index.get(key)
+                if idx is not None and 0 <= idx < len(self.alerts):
+                    a = self.alerts[idx]
+                    d = a.get("details", {})
+                    d["_count"] = int(d.get("_count", 1)) + 1
+                    d["_last_seen_ts"] = now_ts()
+                    d["_last_details"] = details
+                    a["details"] = d
+                    self._alert_last_seen[key] = now
+                return
 
-        a = make_alert(severity, category, title, details)
-        a["details"]["_count"] = 1
-        a["details"]["_first_seen_ts"] = a["timestamp"]
-        self.alerts.append(a)
-        self._alert_index[key] = len(self.alerts) - 1
-        self._alert_last_seen[key] = now
+            a = make_alert(severity, category, title, details)
+            a["details"]["_count"] = 1
+            a["details"]["_first_seen_ts"] = a["timestamp"]
+            self.alerts.append(a)
+            self._alert_index[key] = len(self.alerts) - 1
+            self._alert_last_seen[key] = now
 
-        if len(self.alerts) > 1500:
-            self.alerts = self.alerts[-1200:]
-            self._alert_index.clear()
-            self._alert_last_seen.clear()
-            for i, aa in enumerate(self.alerts):
-                k = compact_alert_key(aa["category"], aa["title"], aa.get("details", {}))
-                self._alert_index[k] = i
-                self._alert_last_seen[k] = now
+            if len(self.alerts) > 1500:
+                self.alerts = self.alerts[-1200:]
+                self._alert_index.clear()
+                self._alert_last_seen.clear()
+                for i, aa in enumerate(self.alerts):
+                    k = compact_alert_key(aa["category"], aa["title"], aa.get("details", {}))
+                    self._alert_index[k] = i
+                    self._alert_last_seen[k] = now
 
     # ── Trust management ──────────────────────────────────────────────────────
 
@@ -1327,7 +1329,7 @@ class NetworkMonitor:
                                 self.log("HIGH", "DNS",
                                          "Query to suspicious domain detected",
                                          {"domain": domain, "pattern": pattern})
-                        break
+                                break
         except Exception as e:
             self.log("WARN", "SYSTEM", "DNS monitoring error", {"error": str(e)})
 
@@ -2059,7 +2061,8 @@ class App(ctk.CTkFrame):
         ctk.CTkButton(top, text="⚙ API Keys", command=lambda: APIKeySettingsDialog(self.parent),
                       fg_color="#565b5e", hover_color="#6e7377", width=90).pack(side="left", padx=6)
 
-        nb = ctk.CTkTabview(self)
+        self.nb = ctk.CTkTabview(self)
+        nb = self.nb
         nb.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self.tab_dashboard = nb.add("Summary")
@@ -2188,11 +2191,13 @@ class App(ctk.CTkFrame):
         filter_frame.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(filter_frame, text="Filter:").pack(side="left", padx=(0, 6))
         self.conn_filter = tk.StringVar(value="ALL")
-        ttk.Combobox(
+        conn_combo = ttk.Combobox(
             filter_frame, textvariable=self.conn_filter, width=18,
             values=("ALL", "SAFE", "KNOWN", "UNKNOWN", "SUSPICIOUS", "DANGEROUS"),
             state="readonly",
-        ).pack(side="left", padx=6)
+        )
+        conn_combo.pack(side="left", padx=6)
+        conn_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_connections())
         ctk.CTkButton(filter_frame, text="Apply", command=self.refresh_connections).pack(side="left", padx=6)
         ctk.CTkButton(filter_frame, text="Trust IP", command=self.trust_connection_ip).pack(side="left", padx=6)
         ctk.CTkButton(filter_frame, text="Untrust IP", command=self.untrust_connection_ip).pack(side="left", padx=6)
@@ -2263,11 +2268,13 @@ class App(ctk.CTkFrame):
         bar.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkLabel(bar, text="Filter:").pack(side="left", padx=(0, 6))
         self.hist_filter = tk.StringVar(value="ALL")
-        ttk.Combobox(
+        hist_combo = ttk.Combobox(
             bar, textvariable=self.hist_filter, width=18,
             values=("ALL", "UNKNOWN", "SUSPICIOUS", "DANGEROUS"),
             state="readonly",
-        ).pack(side="left", padx=6)
+        )
+        hist_combo.pack(side="left", padx=6)
+        hist_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_history())
         ctk.CTkButton(bar, text="Refresh", command=self.refresh_history, width=80).pack(side="left", padx=6)
         ctk.CTkButton(bar, text="Clear All", command=self._clear_history, width=80,
                       fg_color="#bf3a3a", hover_color="#942b2b").pack(side="right", padx=6)
@@ -2298,7 +2305,7 @@ class App(ctk.CTkFrame):
             "status": entry.get("status", ""),
             "pid": 0,
         }
-        ConnectionDetailPopup(self.parent, conn_data, self.mon)
+        ConnectionDetailPopup(self.parent, conn_data, self.mon, self.refresh_connections)
 
     # ── Alerts tab ────────────────────────────────────────────────────────────
 
@@ -2824,19 +2831,43 @@ class App(ctk.CTkFrame):
             self.scan_now()
         self.refresh_all()
         self._update_live_text()
-        self.after(max(1000, int(self.refresh_ms.get())), self._ui_tick)
+        try:
+            interval = max(1000, int(self.refresh_ms.get()))
+        except ValueError:
+            interval = 3500
+        self.after(interval, self._ui_tick)
 
     # ─────────────────────────────────────────────────────────────────────────
     # View refresh
     # ─────────────────────────────────────────────────────────────────────────
 
-    def refresh_all(self):
-        self.refresh_devices()
-        self.refresh_connections()
-        self.refresh_history()
-        self.refresh_alerts()
-        self.refresh_trust()
-        self.refresh_threats()
+    def refresh_all(self, force: bool = False):
+        # Always refresh the summary dashboard
+        self._update_live_text()
+
+        if force:
+            self.refresh_devices()
+            self.refresh_connections()
+            self.refresh_history()
+            self.refresh_alerts()
+            self.refresh_trust()
+            self.refresh_threats()
+            return
+
+        # Only refresh the currently visible tab for performance
+        active = self.nb.get()
+        if active == "Devices":
+            self.refresh_devices()
+        elif active == "Connections":
+            self.refresh_connections()
+        elif active == "History":
+            self.refresh_history()
+        elif active == "Alerts":
+            self.refresh_alerts()
+        elif active == "Trust list":
+            self.refresh_trust()
+        elif active == "Threats":
+            self.refresh_threats()
 
     def refresh_devices(self):
         for i in self.dev_tree.get_children():

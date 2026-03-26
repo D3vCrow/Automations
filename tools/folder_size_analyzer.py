@@ -60,7 +60,7 @@ def format_date(timestamp: float) -> str:
 
 def get_folder_size(folder_path: str, progress_callback=None) -> Tuple[int, int, float, float, float]:
     """
-    Calculate folder size and statistics
+    Calculate folder size and statistics using iterative os.walk.
     Returns: (total_size, file_count, created_time, modified_time, accessed_time)
     """
     total_size = 0
@@ -68,43 +68,31 @@ def get_folder_size(folder_path: str, progress_callback=None) -> Tuple[int, int,
     created_time = float('inf')
     modified_time = 0
     accessed_time = 0
-    
-    try:
-        for entry in os.scandir(folder_path):
-            if entry.is_file():
-                try:
-                    stat = entry.stat()
-                    file_size = stat.st_size
-                    total_size += file_size
-                    file_count += 1
-                    
-                    created_time = min(created_time, stat.st_ctime)
-                    modified_time = max(modified_time, stat.st_mtime)
-                    accessed_time = max(accessed_time, stat.st_atime)
-                    
-                    if progress_callback and file_count % 100 == 0:
-                        progress_callback(file_count)
-                        
-                except (OSError, PermissionError):
-                    continue
-                    
-            elif entry.is_dir() and not entry.name.startswith('.'):
-                try:
-                    sub_size, sub_files, sub_created, sub_modified, sub_accessed = get_folder_size(entry.path, progress_callback)
-                    total_size += sub_size
-                    file_count += sub_files
-                    created_time = min(created_time, sub_created)
-                    modified_time = max(modified_time, sub_modified)
-                    accessed_time = max(accessed_time, sub_accessed)
-                except (OSError, PermissionError):
-                    continue
-                    
-    except (OSError, PermissionError):
-        pass
-    
+
+    for dirpath, dirnames, filenames in os.walk(folder_path):
+        # Skip hidden directories
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+
+        for filename in filenames:
+            filepath = os.path.join(dirpath, filename)
+            try:
+                stat = os.stat(filepath)
+                total_size += stat.st_size
+                file_count += 1
+
+                created_time = min(created_time, stat.st_ctime)
+                modified_time = max(modified_time, stat.st_mtime)
+                accessed_time = max(accessed_time, stat.st_atime)
+
+                if progress_callback and file_count % 100 == 0:
+                    progress_callback(file_count)
+
+            except (OSError, PermissionError):
+                continue
+
     if created_time == float('inf'):
         created_time = 0
-        
+
     return total_size, file_count, created_time, modified_time, accessed_time
 
 def get_drive_info(path: str) -> Dict[str, int]:
@@ -338,7 +326,7 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
                     if os.path.isdir(full_path) and not entry.startswith('.'):
                         folder_paths.append(full_path)
             except PermissionError:
-                self._after_scan([])
+                self.after(0, lambda: self._after_scan([]))
                 return
                 
             # Calculate total size for percentage calculations
@@ -357,10 +345,11 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
                     folder_data.append(folder_info)
                     total_size += size
                     
-                    # Update progress
+                    # Update progress on the main thread
                     progress = (i + 1) / len(folder_paths)
-                    self.progress_bar.set(progress)
-                    self.progress_label.configure(text=f"Scanning... {i+1}/{len(folder_paths)} folders")
+                    label_text = f"Scanning... {i+1}/{len(folder_paths)} folders"
+                    self.after(0, lambda p=progress: self.progress_bar.set(p))
+                    self.after(0, lambda t=label_text: self.progress_label.configure(text=t))
                     
                 except (OSError, PermissionError):
                     continue
@@ -370,11 +359,11 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
                 if total_size > 0:
                     folder.size_percentage = (folder.size / total_size) * 100
                     
-            self._after_scan(folder_data)
-            
+            self.after(0, lambda data=folder_data: self._after_scan(data))
+
         except Exception as e:
-            self._after_scan([])
-            messagebox.showerror("Scan Error", f"Error scanning directory:\n{str(e)}")
+            self.after(0, lambda: self._after_scan([]))
+            self.after(0, lambda err=e: messagebox.showerror("Scan Error", f"Error scanning directory:\n{str(err)}"))
             
     def _after_scan(self, folders: List[FolderInfo]):
         """Called after scan completes"""
@@ -586,7 +575,7 @@ def run_tool():
     """Tool entry point"""
     try:
         if tk._default_root is None:
-            root = ctk.CTkToplevel()
+            root = ctk.CTk()
         else:
             root = ctk.CTkToplevel()
             
