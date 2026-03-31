@@ -53,6 +53,7 @@ class ToolboxApp(ctk.CTk):
         self.failed_tools = []
         self.filtered_tools = []
         self.favorites = self._load_favorites()
+        self._open_tools = {}  # filename -> window reference (for single-instance enforcement)
 
         self._build_sidebar()
         self._build_main_content()
@@ -388,8 +389,28 @@ class ToolboxApp(ctk.CTk):
     def _launch_tool(self, tool_dict):
         module = tool_dict.get("module")
         name = tool_dict.get("name", "Tool")
+        filename = tool_dict.get("filename", "")
 
-        # If an instance already exists, just focus it instead of launching another
+        # Single-instance check: if tool is already open, focus it
+        if filename in self._open_tools:
+            win = self._open_tools[filename]
+            try:
+                # Check if window still exists
+                if win.winfo_exists():
+                    win.lift()
+                    win.focus_force()
+                    try:
+                        win.state("normal")
+                    except Exception:
+                        pass
+                    return
+                else:
+                    # Window was closed, remove from tracking
+                    del self._open_tools[filename]
+            except Exception:
+                del self._open_tools[filename]
+
+        # Fallback: check by window title (CTkToplevel children)
         if self._focus_tool_window(tool_dict):
             return
 
@@ -398,17 +419,60 @@ class ToolboxApp(ctk.CTk):
             return
 
         try:
+            # Snapshot windows before launch
+            before = set()
+            for child in self.winfo_children():
+                try:
+                    before.add(id(child))
+                except Exception:
+                    pass
+            # Also check all toplevels
+            before_toplevels = set()
+            try:
+                for w in self.winfo_toplevel().winfo_children():
+                    before_toplevels.add(id(w))
+            except Exception:
+                pass
+
             # Launch the tool
             module.run_tool()
-            
-            # After launch, try to focus the newly created window and bring it to front
-            self.after(500, lambda: self._focus_tool_window(tool_dict))
-            
+
+            # Find the new window and track it
+            self.after(300, lambda: self._track_new_window(tool_dict, before, before_toplevels))
+
         except Exception as e:
             messagebox.showerror(
                 "Tool launch failed",
                 f"An error occurred while launching '{name}':\n\n{e}",
             )
+
+    def _track_new_window(self, tool_dict, before_ids, before_toplevels):
+        """Find and track the newly opened tool window for single-instance enforcement."""
+        filename = tool_dict.get("filename", "")
+        if not filename:
+            return
+
+        # Check CTkToplevel children of main window
+        for child in self.winfo_children():
+            try:
+                if id(child) not in before_ids and isinstance(child, (ctk.CTkToplevel, tk.Toplevel)):
+                    self._open_tools[filename] = child
+                    return
+            except Exception:
+                continue
+
+        # Check all toplevels (for tools that create CTk() roots)
+        try:
+            for w in self.tk.call('winfo', 'children', '.'):
+                pass
+        except Exception:
+            pass
+
+        # Fallback: match by window title
+        titles = self._tool_window_titles(tool_dict)
+        wins = self._find_tool_windows(tool_dict)
+        if wins:
+            self._open_tools[filename] = wins[0]
 
     def _render_tools(self, filter_query=""):
         # Clear current grid

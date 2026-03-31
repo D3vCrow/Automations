@@ -77,7 +77,8 @@ def now_ts() -> str:
 
 def safe_run(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
     try:
-        cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, shell=False)
+        cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, shell=False,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
         return cp.returncode, cp.stdout, cp.stderr
     except Exception as e:
         return 1, "", str(e)
@@ -446,7 +447,12 @@ class NetworkStabilityEngine:
             return "DOWN", "Wi-Fi disconnected (link down)", "HIGH", "LINK"
 
         if not local_ip:
-            return "DOWN", "No local IPv4 on default route (adapter/DHCP issue)", "HIGH", "LINK"
+            # Only report as DOWN if pings also fail — avoids false positives
+            # during DHCP renewal or when IPv6 is the primary route
+            any_ping = gw_ok or inet_ok or inet2_ok
+            if not any_ping:
+                return "DOWN", "No local IPv4 on default route (adapter/DHCP issue)", "HIGH", "LINK"
+            # else: route table glitch but connectivity works — log as INFO, not DOWN
 
         if gw and (not gw_ok) and (not inet_ok) and (not inet2_ok):
             return "DOWN", f"Gateway unreachable and internet down (router/Wi-Fi issue){sig_hint}", "HIGH", "GATEWAY"
@@ -983,6 +989,7 @@ class App(AppBase):
         self.parent = parent
         parent.title("Network Stability Monitor Pro")
         parent.geometry("1280x780")
+        parent.minsize(800, 500)
         
         # Remove aggressive focus management to prevent ghost trails
         # Just set window normally without topmost tricks
@@ -1057,34 +1064,26 @@ class App(AppBase):
         self.after(100, self.tick)
 
     def _build_ui(self):
+        # --- Top bar: single compact row with essential info ---
         top = ctk.CTkFrame(self)
-        top.pack(fill="x", padx=10, pady=8)
+        top.pack(fill="x", padx=6, pady=(4, 2))
 
-        ctk.CTkLabel(top, text="Local IP (default route)").pack(side="left")
-        ctk.CTkEntry(top, textvariable=self.localip, width=110).pack(side="left", padx=6)
-        ctk.CTkLabel(top, text="Iface").pack(side="left")
-        ctk.CTkEntry(top, textvariable=self.iface, width=120).pack(side="left", padx=6)
+        # Left side: key network info as compact labels
+        info = ctk.CTkFrame(top, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True)
+        for lbl, var in [("IP", self.localip), ("GW", self.gateway), ("DNS", self.dns_text)]:
+            ctk.CTkLabel(info, text=lbl, font=("Segoe UI", 9), text_color="#888").pack(side="left", padx=(6,1))
+            ctk.CTkEntry(info, textvariable=var, width=100, height=24, font=("Segoe UI", 9)).pack(side="left", padx=(0,4))
+        ctk.CTkLabel(info, text="Targets", font=("Segoe UI", 9), text_color="#888").pack(side="left", padx=(6,1))
+        ctk.CTkEntry(info, textvariable=self.target1, width=70, height=24, font=("Segoe UI", 9)).pack(side="left", padx=(0,2))
+        ctk.CTkEntry(info, textvariable=self.target2, width=70, height=24, font=("Segoe UI", 9)).pack(side="left", padx=(0,4))
 
-        ctk.CTkLabel(top, text="Gateway").pack(side="left")
-        ctk.CTkEntry(top, textvariable=self.gateway, width=110).pack(side="left", padx=6)
-
-        ctk.CTkLabel(top, text="DNS").pack(side="left")
-        ctk.CTkEntry(top, textvariable=self.dns_text, width=220).pack(side="left", padx=6)
-
-        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10)
-
-        ctk.CTkLabel(top, text="Ping targets").pack(side="left")
-        ctk.CTkEntry(top, textvariable=self.target1, width=90).pack(side="left", padx=4)
-        ctk.CTkEntry(top, textvariable=self.target2, width=90).pack(side="left", padx=4)
-
-        ctk.CTkLabel(top, text="DNS domain").pack(side="left")
-        ctk.CTkEntry(top, textvariable=self.dns_domain, width=120).pack(side="left", padx=6)
-
-        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10)
-
-        ctk.CTkButton(top, text="Settings", command=self.show_settings).pack(side="left", padx=6)
-        ctk.CTkButton(top, text="AI Export", command=self.ai_export).pack(side="left", padx=6)
-        ctk.CTkButton(top, text="Export report", command=self.export_report).pack(side="left", padx=6)
+        # Right side: buttons always visible
+        btn_frame = ctk.CTkFrame(top, fg_color="transparent")
+        btn_frame.pack(side="right")
+        ctk.CTkButton(btn_frame, text="Settings", command=self.show_settings, width=70, height=26).pack(side="left", padx=2)
+        ctk.CTkButton(btn_frame, text="AI Export", command=self.ai_export, width=70, height=26).pack(side="left", padx=2)
+        ctk.CTkButton(btn_frame, text="Export", command=self.export_report, width=60, height=26).pack(side="left", padx=2)
 
         nb = ctk.CTkTabview(self)
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1164,6 +1163,8 @@ class App(AppBase):
 
         grid = ctk.CTkFrame(info_frame)
         grid.pack(fill="x", padx=10, pady=6)
+        grid.columnconfigure(1, weight=1)
+        grid.columnconfigure(3, weight=1)
 
         self.kv = {}
         # Two-column layout for compact display
@@ -1209,7 +1210,7 @@ class App(AppBase):
             on_change()
 
         for c in cats:
-            ctk.CTkButton(bar, text=c, command=lambda cc=c: set_cat(cc)).pack(side="left", padx=4)
+            ctk.CTkButton(bar, text=c, width=70, command=lambda cc=c: set_cat(cc)).pack(side="left", padx=2)
 
         ctk.CTkLabel(bar, text="(Click a category to filter)").pack(side="left", padx=10)
 
@@ -1426,7 +1427,7 @@ class App(AppBase):
         self.diag_dns_frame.pack(fill="x", padx=10, pady=(0, 8))
         self.diag_dns_status = ctk.CTkLabel(self.diag_dns_frame, text="--", font=("Segoe UI", 10))
         self.diag_dns_status.pack(anchor="w", padx=6, pady=2)
-        self.diag_dns_summary = ctk.CTkLabel(self.diag_dns_frame, text="", font=("Segoe UI", 9), wraplength=600, justify="left")
+        self.diag_dns_summary = ctk.CTkLabel(self.diag_dns_frame, text="", font=("Segoe UI", 9), wraplength=0, justify="left")
         self.diag_dns_summary.pack(anchor="w", padx=6, pady=2)
 
     # ---------------------
@@ -1456,127 +1457,85 @@ class App(AppBase):
         """Show settings popup window"""
         settings_window = ctk.CTkToplevel(self.parent)
         settings_window.title("Network Monitor Settings")
-        settings_window.geometry("560x750")
+        settings_window.geometry("520x600")
+        settings_window.minsize(400, 350)
         settings_window.transient(self.parent)
         settings_window.grab_set()
-        
-        # Main container
-        main_frame = ctk.CTkFrame(settings_window)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Title
-        ctk.CTkLabel(main_frame, text="⚙️ Settings", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=10)
-        
-        # Monitoring Settings
-        monitor_frame = ctk.CTkFrame(main_frame)
-        monitor_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(monitor_frame, text="📡 Monitoring Settings", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
-        
-        # Interval
-        interval_row = ctk.CTkFrame(monitor_frame)
-        interval_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(interval_row, text="Interval (ms):").pack(side="left", padx=(0, 10))
-        ttk.Spinbox(interval_row, from_=800, to=30000, increment=200, textvariable=self.interval_ms, width=10).pack(side="left")
-        
-        # Ping timeout
-        timeout_row = ctk.CTkFrame(monitor_frame)
-        timeout_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(timeout_row, text="Ping timeout (ms):").pack(side="left", padx=(0, 10))
-        ttk.Spinbox(timeout_row, from_=300, to=5000, increment=100, textvariable=self.ping_timeout_ms, width=10).pack(side="left")
-        
-        # Network Configuration
-        network_frame = ctk.CTkFrame(main_frame)
-        network_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(network_frame, text="🌐 Network Configuration", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
-        
-        # Gateway
-        gw_row = ctk.CTkFrame(network_frame)
-        gw_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(gw_row, text="Gateway:").pack(side="left", padx=(0, 10))
-        ctk.CTkEntry(gw_row, textvariable=self.gateway, width=150).pack(side="left")
-        
-        # DNS
-        dns_row = ctk.CTkFrame(network_frame)
-        dns_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(dns_row, text="DNS servers:").pack(side="left", padx=(0, 10))
-        ctk.CTkEntry(dns_row, textvariable=self.dns_text, width=200).pack(side="left")
-        
-        # Ping targets
-        targets_frame = ctk.CTkFrame(network_frame)
-        targets_frame.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(targets_frame, text="Ping targets:").pack(side="left", padx=(0, 10))
-        ctk.CTkEntry(targets_frame, textvariable=self.target1, width=80).pack(side="left", padx=2)
-        ctk.CTkEntry(targets_frame, textvariable=self.target2, width=80).pack(side="left", padx=2)
-        
-        # DNS domain
-        domain_row = ctk.CTkFrame(network_frame)
-        domain_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(domain_row, text="DNS domain:").pack(side="left", padx=(0, 10))
-        ctk.CTkEntry(domain_row, textvariable=self.dns_domain, width=150).pack(side="left")
-        
-        # Sensitivity / Latency Threshold Presets
-        sens_frame = ctk.CTkFrame(main_frame)
-        sens_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(sens_frame, text="Sensitivity (Latency Thresholds)", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
 
-        preset_row = ctk.CTkFrame(sens_frame)
-        preset_row.pack(fill="x", padx=10, pady=5)
-        presets = [
-            ("Strict", 80, 150),
-            ("Normal", 120, 250),
-            ("Relaxed", 200, 400),
-            ("Wi-Fi tolerant", 300, 600),
+        # Scrollable main container
+        main_frame = ctk.CTkScrollableFrame(settings_window)
+        main_frame.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+
+        # --- Monitoring ---
+        ctk.CTkLabel(main_frame, text="Monitoring", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(4, 2))
+        mon_grid = ctk.CTkFrame(main_frame)
+        mon_grid.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(mon_grid, text="Interval (ms):").grid(row=0, column=0, sticky="w", padx=(4,4), pady=2)
+        ttk.Spinbox(mon_grid, from_=800, to=30000, increment=200, textvariable=self.interval_ms, width=8).grid(row=0, column=1, sticky="w", pady=2)
+        ctk.CTkLabel(mon_grid, text="Ping timeout (ms):").grid(row=0, column=2, sticky="w", padx=(16,4), pady=2)
+        ttk.Spinbox(mon_grid, from_=300, to=5000, increment=100, textvariable=self.ping_timeout_ms, width=8).grid(row=0, column=3, sticky="w", pady=2)
+
+        # --- Network ---
+        ctk.CTkLabel(main_frame, text="Network", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(8, 2))
+        net_grid = ctk.CTkFrame(main_frame)
+        net_grid.pack(fill="x", padx=4, pady=2)
+        net_grid.columnconfigure(1, weight=1)
+        fields = [
+            (0, "Gateway:", self.gateway),
+            (1, "DNS servers:", self.dns_text),
+            (2, "DNS domain:", self.dns_domain),
         ]
+        for r, lbl, var in fields:
+            ctk.CTkLabel(net_grid, text=lbl).grid(row=r, column=0, sticky="w", padx=(4,4), pady=2)
+            ctk.CTkEntry(net_grid, textvariable=var).grid(row=r, column=1, sticky="ew", padx=(0,4), pady=2)
+        # Ping targets on same grid
+        ctk.CTkLabel(net_grid, text="Ping targets:").grid(row=3, column=0, sticky="w", padx=(4,4), pady=2)
+        tgt_frame = ctk.CTkFrame(net_grid, fg_color="transparent")
+        tgt_frame.grid(row=3, column=1, sticky="w", pady=2)
+        ctk.CTkEntry(tgt_frame, textvariable=self.target1, width=90).pack(side="left", padx=(0,4))
+        ctk.CTkEntry(tgt_frame, textvariable=self.target2, width=90).pack(side="left")
+
+        # --- Sensitivity ---
+        ctk.CTkLabel(main_frame, text="Sensitivity", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(8, 2))
+        preset_row = ctk.CTkFrame(main_frame, fg_color="transparent")
+        preset_row.pack(fill="x", padx=4, pady=2)
+        presets = [("Strict", 80, 150), ("Normal", 120, 250), ("Relaxed", 200, 400), ("Wi-Fi tolerant", 300, 600)]
         def apply_preset(elev, high):
             self.thresh_elevated.set(elev)
             self.thresh_high.set(high)
         for name, elev, high in presets:
-            ctk.CTkButton(preset_row, text=name, width=100,
-                          command=lambda e=elev, h=high: apply_preset(e, h)).pack(side="left", padx=4)
+            ctk.CTkButton(preset_row, text=name, width=90, height=26,
+                          command=lambda e=elev, h=high: apply_preset(e, h)).pack(side="left", padx=2)
+        thresh_row = ctk.CTkFrame(main_frame, fg_color="transparent")
+        thresh_row.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(thresh_row, text="Elevated (ms):").pack(side="left", padx=(0, 2))
+        ttk.Spinbox(thresh_row, from_=20, to=1000, increment=10, textvariable=self.thresh_elevated, width=5).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(thresh_row, text="High (ms):").pack(side="left", padx=(0, 2))
+        ttk.Spinbox(thresh_row, from_=50, to=2000, increment=10, textvariable=self.thresh_high, width=5).pack(side="left")
 
-        thresh_row = ctk.CTkFrame(sens_frame)
-        thresh_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(thresh_row, text="Elevated (ms):").pack(side="left", padx=(0, 4))
-        ttk.Spinbox(thresh_row, from_=20, to=1000, increment=10, textvariable=self.thresh_elevated, width=6).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(thresh_row, text="High (ms):").pack(side="left", padx=(0, 4))
-        ttk.Spinbox(thresh_row, from_=50, to=2000, increment=10, textvariable=self.thresh_high, width=6).pack(side="left")
+        # --- Auto Export ---
+        ctk.CTkLabel(main_frame, text="Auto Export", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(8, 2))
+        ctk.CTkCheckBox(main_frame, text="Enable auto export", variable=self.auto_export_enabled).pack(anchor="w", padx=4, pady=2)
+        exp_row = ctk.CTkFrame(main_frame, fg_color="transparent")
+        exp_row.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(exp_row, text="Time:").pack(side="left", padx=(0, 4))
+        ttk.Spinbox(exp_row, from_=0, to=23, increment=1, textvariable=self.auto_export_hour, width=3, wrap=True).pack(side="left")
+        ctk.CTkLabel(exp_row, text=":").pack(side="left")
+        ttk.Spinbox(exp_row, from_=0, to=59, increment=1, textvariable=self.auto_export_minute, width=3, wrap=True).pack(side="left", padx=(0,6))
+        for label, h, m in [("06:00", 6, 0), ("12:00", 12, 0), ("18:00", 18, 0), ("23:30", 23, 30)]:
+            ctk.CTkButton(exp_row, text=label, width=48, height=24,
+                          command=lambda hh=h, mm=m: (self.auto_export_hour.set(hh), self.auto_export_minute.set(mm))).pack(side="left", padx=2)
+        folder_row = ctk.CTkFrame(main_frame, fg_color="transparent")
+        folder_row.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(folder_row, text="Folder:").pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(folder_row, textvariable=self.export_folder).pack(side="left", fill="x", expand=True)
 
-        # Auto Export Settings
-        export_frame = ctk.CTkFrame(main_frame)
-        export_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(export_frame, text="Auto Export Settings", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
-
-        # Enable checkbox
-        enable_row = ctk.CTkFrame(export_frame)
-        enable_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkCheckBox(enable_row, text="Enable auto export", variable=self.auto_export_enabled).pack(side="left")
-
-        # Export time — spinboxes for hour and minute
-        hour_row = ctk.CTkFrame(export_frame)
-        hour_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(hour_row, text="Export time:").pack(side="left", padx=(0, 6))
-        ttk.Spinbox(hour_row, from_=0, to=23, increment=1, textvariable=self.auto_export_hour, width=4, wrap=True).pack(side="left")
-        ctk.CTkLabel(hour_row, text=":").pack(side="left")
-        ttk.Spinbox(hour_row, from_=0, to=59, increment=1, textvariable=self.auto_export_minute, width=4, wrap=True).pack(side="left")
-        # Preset buttons
-        time_presets = [("06:00", 6, 0), ("12:00", 12, 0), ("18:00", 18, 0), ("23:30", 23, 30)]
-        for label, h, m in time_presets:
-            ctk.CTkButton(hour_row, text=label, width=56,
-                          command=lambda hh=h, mm=m: (self.auto_export_hour.set(hh), self.auto_export_minute.set(mm))).pack(side="left", padx=3)
-
-        # Export folder
-        folder_row = ctk.CTkFrame(export_frame)
-        folder_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(folder_row, text="Export folder:").pack(side="left", padx=(0, 10))
-        ctk.CTkEntry(folder_row, textvariable=self.export_folder, width=200).pack(side="left")
-
-        # Buttons
-        button_frame = ctk.CTkFrame(main_frame)
-        button_frame.pack(fill="x", pady=20)
-        
-        ctk.CTkButton(button_frame, text="💾 Save & Close", command=lambda: self.save_settings(settings_window)).pack(side="left", padx=10)
-        ctk.CTkButton(button_frame, text="❌ Cancel", command=settings_window.destroy).pack(side="left", padx=10)
-        ctk.CTkButton(button_frame, text="📋 Set Baseline", command=self.set_baseline).pack(side="left", padx=10)
+        # --- Action buttons (outside scrollable, always visible at bottom) ---
+        button_frame = ctk.CTkFrame(settings_window)
+        button_frame.pack(fill="x", padx=8, pady=8)
+        ctk.CTkButton(button_frame, text="Save & Close", width=100, command=lambda: self.save_settings(settings_window)).pack(side="left", padx=4)
+        ctk.CTkButton(button_frame, text="Cancel", width=70, command=settings_window.destroy).pack(side="left", padx=4)
+        ctk.CTkButton(button_frame, text="Set Baseline", width=90, command=self.set_baseline).pack(side="left", padx=4)
         
     def save_settings(self, window):
         """Save settings and close window"""
