@@ -177,6 +177,8 @@ def _parse_session_file(filepath: str) -> dict:
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            pending_tools: dict[str, tuple[str, int, dict]] = {}
+            # maps tool_use_id -> (tool_name, out_tokens_estimate, pricing)
             for line in f:
                 line = line.strip()
                 if not line:
@@ -210,6 +212,25 @@ def _parse_session_file(filepath: str) -> dict:
                     if prompt:
                         session["session_name"] = prompt
 
+                    # Match tool_result blocks back to prior tool_use calls
+                    u_content = obj.get("message", {}).get("content", [])
+                    if isinstance(u_content, list):
+                        for block in u_content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") != "tool_result":
+                                continue
+                            tid = block.get("tool_use_id") or ""
+                            if tid not in pending_tools:
+                                continue
+                            name, _out_tok, pricing_for_turn = pending_tools.pop(tid)
+                            in_tok = _estimate_tool_tokens(block.get("content"))
+                            stats = session["tool_stats"].get(name)
+                            if stats is None:
+                                continue
+                            stats["est_tokens"] += in_tok
+                            stats["est_cost"] += _estimate_tool_cost(in_tok, 0, pricing_for_turn)
+
                 elif rec_type == "assistant":
                     session["assistant_turns"] += 1
                     msg = obj.get("message", {})
@@ -236,6 +257,27 @@ def _parse_session_file(filepath: str) -> dict:
                         session["total_cost"] += cost
 
                         session["turn_costs"].append((ts_str, cost, inp, out, cr, cw, model))
+
+                        # Scan tool_use content blocks
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            pricing_for_turn = _get_pricing(model)
+                            for block in content:
+                                if not isinstance(block, dict):
+                                    continue
+                                if block.get("type") != "tool_use":
+                                    continue
+                                name = block.get("name") or "unknown"
+                                tool_id = block.get("id") or ""
+                                out_tok = _estimate_tool_tokens(block.get("input"))
+                                pending_tools[tool_id] = (name, out_tok, pricing_for_turn)
+
+                                stats = session["tool_stats"].setdefault(
+                                    name, {"calls": 0, "est_tokens": 0, "est_cost": 0.0}
+                                )
+                                stats["calls"] += 1
+                                stats["est_tokens"] += out_tok
+                                stats["est_cost"] += _estimate_tool_cost(0, out_tok, pricing_for_turn)
 
     except Exception:
         pass
@@ -353,6 +395,32 @@ def _cold_turns_cluster_end(turn_costs: list) -> bool:
         return False
     last5 = turn_costs[-5:]
     return sum(1 for tc in last5 if _is_cold_turn(tc[2], tc[4])) >= 3
+
+
+def _estimate_tool_tokens(payload: dict | list | str | None) -> int:
+    """Approximate token count from a JSON-serializable payload.
+
+    Uses the standard ~4 chars-per-token heuristic. Returns 0 for None / empty.
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, str) and not payload:
+        return 0
+    try:
+        text = json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(payload)
+    if not text:
+        return 0
+    return max(1, len(text) // _TOOL_CHARS_PER_TOKEN)
+
+
+def _estimate_tool_cost(in_tokens: int, out_tokens: int, pricing: dict) -> float:
+    """Dollar cost for the estimated in/out token split of a tool invocation."""
+    return (
+        (in_tokens / 1_000_000) * pricing["input"]
+        + (out_tokens / 1_000_000) * pricing["output"]
+    )
 
 
 def _friendly_project(dirname: str, cwd: str | None = None) -> str:

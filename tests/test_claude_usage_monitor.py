@@ -101,3 +101,33 @@ def test_cold_turns_cluster_end_false_when_only_2_of_last_5_are_cold():
     cold = ("t", 0.0, 5000, 50, 100, 0, "m")
     turns = [warm, warm, warm, warm, cold, warm, cold]  # last 5: warm, warm, cold, warm, cold
     assert _cold_turns_cluster_end(turns) is False
+
+
+from tools.claude_usage_monitor import (  # noqa: E402
+    _estimate_tool_tokens,
+    _estimate_tool_cost,
+)
+
+
+def test_estimate_tool_tokens_none_and_empty():
+    assert _estimate_tool_tokens(None) == 0
+    assert _estimate_tool_tokens("") == 0
+    assert _estimate_tool_tokens({}) > 0  # "{}" -> 1 token min
+
+
+def test_estimate_tool_tokens_uses_4_chars_per_token_heuristic():
+    # A 40-char JSON string should be ~10 tokens
+    payload = {"x": "a" * 30}   # serialized as {"x": "aaaa...a"} -> 40-ish chars
+    tokens = _estimate_tool_tokens(payload)
+    assert 8 <= tokens <= 14
+
+
+def test_estimate_tool_cost_uses_pricing():
+    pricing = {"input": 3.0, "output": 15.0}
+    # 1M in tokens -> $3, 1M out tokens -> $15, combined $18
+    assert _estimate_tool_cost(1_000_000, 1_000_000, pricing) == 18.0
+
+
+def test_estimate_tool_cost_zero_tokens_zero_cost():
+    pricing = {"input": 3.0, "output": 15.0}
+    assert _estimate_tool_cost(0, 0, pricing) == 0.0
