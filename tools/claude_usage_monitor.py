@@ -72,6 +72,10 @@ CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 
+# Capture the local timezone once at import time so every comparison uses the
+# same wall-clock reference — avoids DST shift mid-run ambiguity.
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
 
 # ---------------------------------------------------------------------------
 # Data layer
@@ -84,8 +88,10 @@ def _get_pricing(model_name: str) -> dict:
     # Try exact match first, then prefix match
     if model_name in MODEL_PRICING:
         return MODEL_PRICING[model_name]
-    for key in MODEL_PRICING:
-        if model_name.startswith(key.rsplit("-", 1)[0]):
+    # Longest-key-first so "claude-opus-4-6" wins over "claude-opus-4" when
+    # matching a model like "claude-opus-4-6-something" (prevents cross-version bleed).
+    for key in sorted(MODEL_PRICING, key=len, reverse=True):
+        if model_name.startswith(key):
             return MODEL_PRICING[key]
     return _DEFAULT_PRICING
 
@@ -1090,6 +1096,8 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 last_ts = t
         if not first_ts or not last_ts:
             return 1.0
+        # Both timestamps are tz-aware (UTC from _parse_timestamp), so subtraction
+        # is unambiguous even across DST boundaries.
         days = max((last_ts - first_ts).days, 1)
         return max(days / 30.0, 1.0)
 
@@ -1234,15 +1242,17 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 ts = _parse_timestamp(ts_str)
                 if not ts:
                     continue
-                local_hour = ts.astimezone().hour
+                # ts is UTC-aware from _parse_timestamp; convert to LOCAL_TZ for
+                # wall-clock bucketing so non-UTC users see correct hour bars.
+                local_hour = ts.astimezone(LOCAL_TZ).hour
                 hour_costs[local_hour] += cost
 
         # Top 3 peak hours
         ranked = sorted(range(24), key=lambda h: hour_costs[h], reverse=True)
         peak_hours = {h for h in ranked[:3] if hour_costs[h] > 0}
 
-        # Update pill based on current local hour
-        now_hour = datetime.now().hour
+        # Both sides use the same LOCAL_TZ reference — avoids naive/aware mismatch.
+        now_hour = datetime.now().astimezone(LOCAL_TZ).hour
         if not peak_hours:
             self._peak_pill.configure(text="NO DATA", fg_color="#444444")
         elif now_hour in peak_hours:
@@ -1348,7 +1358,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             date_str = ""
             ts = _parse_timestamp(s["last_timestamp"])
             if ts:
-                local = ts.astimezone()
+                local = ts.astimezone(LOCAL_TZ)
                 date_str = local.strftime("%Y-%m-%d %H:%M")
 
             row_tags = []
@@ -1572,7 +1582,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             tokens = _turn_total_tokens(tc)
             cum_cost += cost
             ts = _parse_timestamp(ts_str)
-            time_str = ts.astimezone().strftime("%H:%M:%S") if ts else "—"
+            time_str = ts.astimezone(LOCAL_TZ).strftime("%H:%M:%S") if ts else "—"
             cold = _is_cold_turn(inp, cr)
             marker = "●"
             tag = "cold" if cold else "warm"

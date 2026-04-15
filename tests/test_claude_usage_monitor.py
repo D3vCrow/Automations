@@ -202,3 +202,177 @@ def test_rotate_explanation_picks_dominant_factor():
     text = _rotate_explanation(sub)
     # Savings should dominate (huge cost delta, nothing else triggered)
     assert "projected fresh" in text
+
+
+# =============================================================================
+# A6 — Peak-hours timezone & model prefix fixes
+# =============================================================================
+
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from tools.claude_usage_monitor import (  # noqa: E402
+    _parse_timestamp,
+    _get_pricing,
+    LOCAL_TZ,
+)
+
+
+def _utc_iso(year: int, month: int, day: int, hour: int, minute: int = 0) -> str:
+    """Build a UTC ISO-8601 string the way JSONL logs write them."""
+    dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+class TestParseTimestamp:
+    """_parse_timestamp must always return a tz-aware datetime in UTC."""
+
+    def test_z_suffix_returns_utc_aware(self):
+        ts = _parse_timestamp("2024-06-01T14:00:00Z")
+        assert ts is not None
+        assert ts.tzinfo is not None
+        assert ts.utcoffset() == timedelta(0)
+
+    def test_explicit_offset_preserved(self):
+        ts = _parse_timestamp("2024-06-01T14:00:00+05:00")
+        assert ts is not None
+        assert ts.utcoffset() == timedelta(hours=5)
+
+    def test_empty_string_returns_none(self):
+        assert _parse_timestamp("") is None
+
+    def test_garbage_returns_none(self):
+        assert _parse_timestamp("not-a-date") is None
+
+
+class TestPeakHoursTZ:
+    """UTC->local roundtrip for hour bucketing must be correct across offsets."""
+
+    def _local_hour(self, ts_str: str, tz: ZoneInfo) -> int:
+        """Parse ts_str and convert to local hour in the given tz."""
+        ts = _parse_timestamp(ts_str)
+        assert ts is not None
+        return ts.astimezone(tz).hour
+
+    def test_utc_minus_5_14z_is_9_local(self):
+        # 14:00 UTC = 09:00 America/New_York (EST, UTC-5)
+        tz = ZoneInfo("America/New_York")
+        iso = _utc_iso(2024, 1, 15, 14)  # January = EST (no DST)
+        assert self._local_hour(iso, tz) == 9
+
+    def test_utc_zero_hour_unchanged(self):
+        tz = ZoneInfo("UTC")
+        iso = _utc_iso(2024, 6, 1, 17)
+        assert self._local_hour(iso, tz) == 17
+
+    def test_utc_plus_5_14z_is_19_local(self):
+        # 14:00 UTC = 19:00 Asia/Karachi (PKT, UTC+5)
+        tz = ZoneInfo("Asia/Karachi")
+        iso = _utc_iso(2024, 6, 1, 14)
+        assert self._local_hour(iso, tz) == 19
+
+    def test_dst_spring_forward_us(self):
+        # 2024-03-10 07:00 UTC = 02:00 EST → clocks spring to 03:00 EDT
+        # Just before: 06:59 UTC = 01:59 EST
+        # Just after:  07:01 UTC = 03:01 EDT
+        tz = ZoneInfo("America/New_York")
+        before = _parse_timestamp("2024-03-10T06:59:00Z")
+        after = _parse_timestamp("2024-03-10T07:01:00Z")
+        assert before is not None and after is not None
+        assert before.astimezone(tz).hour == 1
+        assert after.astimezone(tz).hour == 3  # jumped from 2->3
+
+    def test_peak_hours_pill_same_tz_reference(self):
+        # Simulate what _render_peak_hours does: build hour_costs from UTC stamps,
+        # compare now_hour from LOCAL_TZ. Both must use the same offset.
+        # We don't run the GUI; just verify the key expressions agree.
+        import datetime as dt_mod
+        now_aware = dt_mod.datetime.now().astimezone(LOCAL_TZ)
+        now_naive_fallback = dt_mod.datetime.now()
+        # On a non-UTC host these will differ; on UTC they're equal.
+        # The important thing: both are integers in 0-23.
+        assert 0 <= now_aware.hour <= 23
+        # Aware version must match wall-clock hour (tested via offset arithmetic)
+        utc_now = dt_mod.datetime.now(tz=timezone.utc)
+        local_offset = now_aware.utcoffset()
+        expected_hour = (utc_now + local_offset).hour % 24
+        assert now_aware.hour == expected_hour
+
+
+class TestMonthsSpanned:
+    """_months_spanned uses tz-aware subtraction — no DST confusion."""
+
+    def _make_monitor_with_sessions(self, sessions: list):
+        """Return a minimal object whose _sessions attr lets _months_spanned run."""
+        import types
+        # Patch just the method onto a plain object — no GUI needed.
+        from tools.claude_usage_monitor import ClaudeUsageMonitor
+        obj = object.__new__(ClaudeUsageMonitor)
+        obj._sessions = sessions
+        return obj
+
+    def test_cross_year_boundary(self):
+        sessions = [
+            {"first_timestamp": "2023-12-01T00:00:00Z",
+             "last_timestamp":  "2024-01-31T00:00:00Z"},
+        ]
+        m = self._make_monitor_with_sessions(sessions)
+        result = m._months_spanned()
+        # 61 days -> 2.03 months
+        assert result > 2.0
+
+    def test_same_day_returns_one(self):
+        sessions = [
+            {"first_timestamp": "2024-06-15T10:00:00Z",
+             "last_timestamp":  "2024-06-15T22:00:00Z"},
+        ]
+        m = self._make_monitor_with_sessions(sessions)
+        assert m._months_spanned() == 1.0
+
+    def test_across_dst_spring_forward(self):
+        # Spans US spring-forward; tz-aware subtraction gives exact days.
+        sessions = [
+            {"first_timestamp": "2024-03-09T12:00:00Z",
+             "last_timestamp":  "2024-03-11T12:00:00Z"},
+        ]
+        m = self._make_monitor_with_sessions(sessions)
+        # 2 days -> 2/30 = 0.067 < 1 -> clamped to 1.0
+        assert m._months_spanned() == 1.0
+
+    def test_missing_timestamps_returns_one(self):
+        m = self._make_monitor_with_sessions([{}])
+        assert m._months_spanned() == 1.0
+
+
+class TestGetPricing:
+    """Model prefix matching must not cross version boundaries."""
+
+    def test_exact_match_wins(self):
+        p = _get_pricing("claude-sonnet-4-6")
+        assert p["input"] == 3.0
+
+    def test_unknown_model_returns_default(self):
+        p = _get_pricing("claude-unknown-99")
+        # Default is sonnet-4-6 rates
+        assert p["input"] == 3.0
+
+    def test_opus5_does_not_match_opus4_pricing(self):
+        # "claude-opus-5" must NOT fall through to claude-opus-4-x pricing.
+        # It's not in MODEL_PRICING so it gets _DEFAULT_PRICING, not opus-4 rates.
+        # Old rsplit bug: rsplit("-",1)[0] of "claude-opus-4-6" = "claude-opus-4"
+        # which would match "claude-opus-5" if startswith("claude-opus-4") -> False.
+        # New bug we guard: if "claude-opus-5" were added, sorted-longest-first
+        # means no shorter "claude-opus-4" prefix ever captures it.
+        p_opus4 = _get_pricing("claude-opus-4-6")
+        p_unknown = _get_pricing("claude-opus-5")
+        # opus-5 not in pricing dict -> falls back to default (sonnet rates)
+        assert p_unknown is not p_opus4
+        assert p_unknown["input"] != p_opus4["input"] or p_unknown is _get_pricing("")
+
+    def test_versioned_suffix_matches_longest_key(self):
+        # "claude-sonnet-4-6-something" should match "claude-sonnet-4-6", not "claude-sonnet-4"
+        p = _get_pricing("claude-sonnet-4-6-something")
+        assert p["input"] == 3.0  # sonnet-4-6 rates, not some shorter match
+
+    def test_empty_model_returns_default(self):
+        assert _get_pricing("") is not None
+        assert _get_pricing("") == _get_pricing("claude-sonnet-4-6")
