@@ -169,6 +169,10 @@ def _parse_session_file(filepath: str) -> dict:
         "total_cost": 0.0,
         "turn_costs": [],       # (timestamp, cost, input, output, cache_read, cache_write, model)
         "models_used": set(),
+        "tool_stats": {},            # {name: {"calls": int, "est_tokens": int, "est_cost": float}}
+        "cold_turn_count": 0,
+        "cold_turns_cluster_end": False,
+        "cache_trend": None,         # None until >= 10 turns
     }
 
     try:
@@ -236,6 +240,9 @@ def _parse_session_file(filepath: str) -> dict:
     except Exception:
         pass
 
+    session["cold_turn_count"] = _cold_turn_count(session["turn_costs"])
+    session["cold_turns_cluster_end"] = _cold_turns_cluster_end(session["turn_costs"])
+    session["cache_trend"] = _cache_trend(session["turn_costs"])
     session["models_used"] = list(session["models_used"])
     return session
 
