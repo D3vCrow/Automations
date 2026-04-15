@@ -896,6 +896,24 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         )
         self._detail_info.pack(pady=(0, 8))
 
+        # Rotate Now pill
+        self._rotate_frame = ctk.CTkFrame(parent, corner_radius=12, fg_color="#2b2b2b")
+        self._rotate_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        self._rotate_pill = ctk.CTkLabel(
+            self._rotate_frame, text="—", corner_radius=12,
+            fg_color="#444444", text_color="#ffffff",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            height=40,
+        )
+        self._rotate_pill.pack(fill="x", padx=12, pady=(10, 2))
+
+        self._rotate_explain = ctk.CTkLabel(
+            self._rotate_frame, text="",
+            text_color="gray", font=ctk.CTkFont(size=11),
+        )
+        self._rotate_explain.pack(pady=(0, 10))
+
         # Summary cards for selected session
         self._detail_cards_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self._detail_cards_frame.pack(fill="x", padx=8, pady=(0, 4))
@@ -1338,6 +1356,26 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             f"Duration: {_duration_str(s['first_timestamp'], s['last_timestamp'])}",
         ]
         self._detail_info.configure(text=f"\"{sess_name}\"\n{'  |  '.join(info_parts)}")
+
+        # Rotate Now pill (LIVE sessions only)
+        if is_active:
+            self._rotate_frame.pack(fill="x", padx=8, pady=(0, 8))
+            sub = _rotate_subscores(s)
+            if sub is None:
+                self._rotate_pill.configure(
+                    text="—  Too early to tell", fg_color="#444444",
+                )
+                self._rotate_explain.configure(
+                    text="Need at least 5 turns for a rotation signal."
+                )
+            else:
+                label, color = _rotate_pill_state(sub["total"])
+                self._rotate_pill.configure(
+                    text=f"{label}   ({sub['total']:.0f})", fg_color=color,
+                )
+                self._rotate_explain.configure(text=_rotate_explanation(sub))
+        else:
+            self._rotate_frame.pack_forget()
 
         # Cards
         self._detail_card_widgets["d_input"].configure(text=_format_tokens(s["total_input"]))
