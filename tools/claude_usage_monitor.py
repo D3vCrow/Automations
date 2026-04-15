@@ -149,7 +149,7 @@ def _parse_session_file(filepath: str) -> dict:
         "total_cache_read": 0,
         "total_cache_write": 0,
         "total_cost": 0.0,
-        "turn_costs": [],       # (timestamp, cost, total_tokens)
+        "turn_costs": [],       # (timestamp, cost, input, output, cache_read, cache_write, model)
         "models_used": set(),
     }
 
@@ -213,8 +213,7 @@ def _parse_session_file(filepath: str) -> dict:
                         cost = _calc_turn_cost(usage, pricing)
                         session["total_cost"] += cost
 
-                        total_tok = inp + out + cr + cw
-                        session["turn_costs"].append((ts_str, cost, total_tok))
+                        session["turn_costs"].append((ts_str, cost, inp, out, cr, cw, model))
 
     except Exception:
         pass
@@ -268,8 +267,8 @@ def _waste_factor(turn_costs: list) -> float | None:
     """Waste factor: average tokens/turn in last 5 turns vs first 5 turns."""
     if len(turn_costs) < 6:
         return None
-    first5 = [tc[2] for tc in turn_costs[:5]]
-    last5 = [tc[2] for tc in turn_costs[-5:]]
+    first5 = [tc[2] + tc[3] + tc[4] + tc[5] for tc in turn_costs[:5]]
+    last5 = [tc[2] + tc[3] + tc[4] + tc[5] for tc in turn_costs[-5:]]
     base = sum(first5) / len(first5)
     current = sum(last5) / len(last5)
     if base <= 0:
@@ -851,7 +850,8 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         # Aggregate cost per local hour across every turn
         hour_costs = [0.0] * 24
         for s in self._sessions:
-            for ts_str, cost, _ in s["turn_costs"]:
+            for tc in s["turn_costs"]:
+                ts_str, cost = tc[0], tc[1]
                 ts = _parse_timestamp(ts_str)
                 if not ts:
                     continue
@@ -950,7 +950,10 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             tok_cw = s["total_cache_write"]
             wf = _waste_factor(s["turn_costs"])
             waste_str = f"{wf:.1f}x" if wf is not None else "—"
-            init_tokens = s["turn_costs"][0][2] if s["turn_costs"] else 0
+            init_tokens = (
+                s["turn_costs"][0][2] + s["turn_costs"][0][3]
+                + s["turn_costs"][0][4] + s["turn_costs"][0][5]
+            ) if s["turn_costs"] else 0
             duration = _duration_str(s["first_timestamp"], s["last_timestamp"])
 
             cache_denom = tok_cr + tok_cw + tok_in
@@ -1088,7 +1091,8 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             self._turn_tree.delete(item)
 
         cum_cost = 0.0
-        for i, (ts_str, cost, tokens) in enumerate(s["turn_costs"]):
+        for i, (ts_str, cost, inp, out, cr, cw, _model) in enumerate(s["turn_costs"]):
+            tokens = inp + out + cr + cw
             cum_cost += cost
             ts = _parse_timestamp(ts_str)
             time_str = ts.astimezone().strftime("%H:%M:%S") if ts else "—"
@@ -1111,7 +1115,8 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         # Cumulative tokens
         cum = []
         total = 0
-        for _, _, tokens in turn_costs:
+        for tc in turn_costs:
+            tokens = tc[2] + tc[3] + tc[4] + tc[5]
             total += tokens
             cum.append(total)
 
