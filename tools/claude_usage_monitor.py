@@ -977,19 +977,24 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         self._tools_body_frame.pack(fill="x", padx=12, pady=(0, 10))
 
         # Turn-by-turn table
-        turn_cols = ("turn", "timestamp", "cost", "tokens", "cumulative")
+        turn_cols = ("turn", "cw", "timestamp", "cost", "tokens", "cumulative")
         self._turn_tree = ttk.Treeview(
             parent, columns=turn_cols, show="headings",
             style="Dark.Treeview", height=10,
         )
         for col, text, w in [
-            ("turn", "#", 50), ("timestamp", "Time", 180),
-            ("cost", "Cost", 90), ("tokens", "Tokens", 100),
+            ("turn", "#", 50),
+            ("cw", "C/W", 40),
+            ("timestamp", "Time", 160),
+            ("cost", "Cost", 90),
+            ("tokens", "Tokens", 100),
             ("cumulative", "Cumulative $", 100),
         ]:
             self._turn_tree.heading(col, text=text)
-            anchor = "e" if col in ("cost", "tokens", "cumulative") else "w"
+            anchor = "e" if col in ("cost", "tokens", "cumulative") else "center" if col == "cw" else "w"
             self._turn_tree.column(col, width=w, anchor=anchor)
+        self._turn_tree.tag_configure("cold", foreground="#ff6666")
+        self._turn_tree.tag_configure("warm", foreground="#888888")
         self._turn_tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
     # ------------------------------------------------------------------ Data loading
@@ -1496,14 +1501,18 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         cum_cost = 0.0
         for i, tc in enumerate(s["turn_costs"]):
             ts_str, cost = tc[0], tc[1]
+            inp, cr = tc[2], tc[4]
             tokens = _turn_total_tokens(tc)
             cum_cost += cost
             ts = _parse_timestamp(ts_str)
             time_str = ts.astimezone().strftime("%H:%M:%S") if ts else "—"
+            cold = _is_cold_turn(inp, cr)
+            marker = "●"
+            tag = "cold" if cold else "warm"
             self._turn_tree.insert("", "end", values=(
-                i + 1, time_str, _format_cost(cost),
+                i + 1, marker, time_str, _format_cost(cost),
                 _format_tokens(tokens), _format_cost(cum_cost),
-            ))
+            ), tags=(tag,))
 
     def _draw_chart(self, turn_costs: list):
         c = self._chart_canvas
