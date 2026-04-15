@@ -27,6 +27,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
+from tools._common.threadsafe import BoundedDeque
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -441,9 +443,9 @@ class Incident:
 class NetworkStabilityEngine:
     def __init__(self, state_path: str):
         self.state_path = state_path
-        self.samples: List[Sample] = []
-        self.events: List[Event] = []
-        self.incidents: List[Incident] = []
+        self.samples: BoundedDeque = BoundedDeque(maxlen=3000)
+        self.events: BoundedDeque = BoundedDeque(maxlen=2000)
+        self.incidents: BoundedDeque = BoundedDeque(maxlen=1000)
 
         self.baseline_gateway: str = ""
         self.baseline_dns: List[str] = []
@@ -618,14 +620,12 @@ class NetworkStabilityEngine:
             return []
 
     def log_event(self, severity: str, category: str, title: str, details: Dict):
+        # BoundedDeque enforces maxlen=2000 automatically.
         self.events.append(Event(now_ts(), severity, category, title, details))
-        if len(self.events) > 2000:
-            self.events = self.events[-1600:]
 
     def add_sample(self, s: Sample):
+        # BoundedDeque enforces maxlen=3000 automatically.
         self.samples.append(s)
-        if len(self.samples) > 3000:
-            self.samples = self.samples[-2400:]
 
     def set_baseline(self, gateway: str, dns_servers: List[str], local_ip: str = ""):
         self.baseline_gateway = gateway
@@ -927,7 +927,7 @@ class NetworkStabilityEngine:
                 del self.active_incidents[(cat, rsn)]
 
     def _find_incident(self, incident_id: int) -> Optional[Incident]:
-        for inc in reversed(self.incidents):
+        for inc in reversed(self.incidents.snapshot()):
             if inc.id == incident_id:
                 return inc
         return None
@@ -988,26 +988,28 @@ class NetworkStabilityEngine:
     def _prepare_export_data(self, current_time: datetime) -> Dict[str, Any]:
         """Prepare data for export"""
         # Filter incidents since last export
+        incidents_snap = self.incidents.snapshot()
         incidents_to_export = []
         if self.last_export_timestamp:
             # Only include incidents after last export
-            for inc in self.incidents:
+            for inc in incidents_snap:
                 inc_start = parse_ts(inc.start_time)
                 if inc_start and inc_start >= self.last_export_timestamp:
                     incidents_to_export.append(asdict(inc))
         else:
             # Include all incidents if no previous export
-            incidents_to_export = [asdict(inc) for inc in self.incidents]
+            incidents_to_export = [asdict(inc) for inc in incidents_snap]
             
-        # Filter events since last export
+        # Filter events since last export — snapshot once, iterate the copy.
+        events_snap = self.events.snapshot()
         events_to_export = []
         if self.last_export_timestamp:
-            for event in self.events:
+            for event in events_snap:
                 event_time = parse_ts(event.timestamp)
                 if event_time and event_time >= self.last_export_timestamp:
                     events_to_export.append(asdict(event))
         else:
-            events_to_export = [asdict(event) for event in self.events]
+            events_to_export = [asdict(event) for event in events_snap]
             
         # Calculate statistics
         stats = self._calculate_export_statistics(incidents_to_export)
@@ -1088,7 +1090,7 @@ class NetworkStabilityEngine:
     
     def _get_dns_fail_rate(self) -> float:
         """Calculate DNS failure rate from recent samples"""
-        recent_samples = [s for s in self.samples[-30:] if s.dns_state in ['OK', 'FAIL', 'SLOW']]
+        recent_samples = [s for s in self.samples.snapshot()[-30:] if s.dns_state in ['OK', 'FAIL', 'SLOW']]
         if not recent_samples:
             return 0.0
         fails = sum(1 for s in recent_samples if s.dns_state == 'FAIL')
@@ -1149,13 +1151,14 @@ class NetworkStabilityEngine:
     
     def generate_ai_export(self) -> Dict[str, Any]:
         """Generate AI-friendly export data"""
-        if not self.samples:
+        samples_snap = self.samples.snapshot()
+        if not samples_snap:
             return {}
-        
-        current_sample = self.samples[-1]
+
+        current_sample = samples_snap[-1]
         rolling_stats = self.get_rolling_stats()
-        incidents_data = [asdict(inc) for inc in self.incidents]
-        
+        incidents_data = [asdict(inc) for inc in self.incidents.snapshot()]
+
         # Handle missing intelligence engine gracefully
         if self.intelligence:
             try:
@@ -2190,9 +2193,9 @@ class App(AppBase):
                     "dns_servers": self.engine.baseline_dns,
                 },
                 "last_sample": asdict(self._last_sample) if self._last_sample else None,
-                "incidents": [asdict(i) for i in self.engine.incidents],
-                "events": [asdict(e) for e in self.engine.events],
-                "samples_tail": [asdict(s) for s in self.engine.samples[-500:]],
+                "incidents": [asdict(i) for i in self.engine.incidents.snapshot()],
+                "events": [asdict(e) for e in self.engine.events.snapshot()],
+                "samples_tail": [asdict(s) for s in self.engine.samples.snapshot()[-500:]],
             }
 
             try:
@@ -2385,7 +2388,7 @@ class App(AppBase):
                 "Monitoring Status Update",
                 {
                     "samples_collected": sample_count,
-                    "active_incidents": len([i for i in self.engine.incidents if not i.end_time]),
+                    "active_incidents": len([i for i in self.engine.incidents.snapshot() if not i.end_time]),
                     "total_incidents": incident_count,
                     "total_events": event_count,
                     "current_status": status,
@@ -2595,7 +2598,7 @@ class App(AppBase):
 
         fc = self.filter_category.get()
         fs = self.filter_severity.get()
-        incidents = list(self.engine.incidents)
+        incidents = list(self.engine.incidents.snapshot())
 
         # newest first
         incidents.reverse()
@@ -2641,7 +2644,7 @@ class App(AppBase):
             return
 
         inc = None
-        for x in self.engine.incidents:
+        for x in self.engine.incidents.snapshot():
             if x.id == inc_id:
                 inc = x
                 break
@@ -2816,7 +2819,7 @@ Duration: {inc.duration or 'Still ongoing'}
 
         fc = self.filter_category.get()
         fs = self.filter_severity.get()
-        events = list(self.engine.events)
+        events = list(self.engine.events.snapshot())
         events.reverse()
 
         for idx, e in enumerate(events[:1200]):
@@ -2841,7 +2844,7 @@ Duration: {inc.duration or 'Still ongoing'}
             return
         iid = sel[0]
         idx = int(iid.split("-")[1])
-        recent = list(reversed(self.engine.events[-1600:]))
+        recent = list(reversed(self.engine.events.snapshot()[-1600:]))
         if idx < 0 or idx >= len(recent):
             return
         e = recent[idx]
@@ -3016,7 +3019,7 @@ Duration: {inc.duration or 'Still ongoing'}
             return
 
         cutoff = time.time() - 300
-        recent = self._samples_to_ts(self.engine.samples)
+        recent = self._samples_to_ts(self.engine.samples.snapshot())
         recent = [(t, s) for t, s in recent if t >= cutoff]
 
         series = [
@@ -3053,7 +3056,7 @@ Duration: {inc.duration or 'Still ongoing'}
         start_f = start_dt.timestamp() - 30
         end_f = end_dt.timestamp() + 30
 
-        all_ts = self._samples_to_ts(self.engine.samples)
+        all_ts = self._samples_to_ts(self.engine.samples.snapshot())
         incident_data = [(t, s) for t, s in all_ts if start_f <= t <= end_f]
 
         if not incident_data:

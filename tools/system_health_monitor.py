@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any
 
+from tools._common.threadsafe import BoundedDeque, SnapshotDict
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -163,9 +165,9 @@ class Alert:
 
 class SystemHealthEngine:
     def __init__(self):
-        self.samples: List[HealthSample] = []
-        self.alerts: List[Alert] = []
         self.max_samples = 1800  # 30 min at 1s
+        self.samples: BoundedDeque = BoundedDeque(maxlen=self.max_samples)
+        self.alerts: BoundedDeque = BoundedDeque(maxlen=500)
 
         # GPU state
         self._gpu_available = True
@@ -186,15 +188,16 @@ class SystemHealthEngine:
         self._cooldown_sec = 60
 
         # Thresholds
-        self.cpu_warn = 50
-        self.cpu_crit = 80
-        self.ram_warn = 70
-        self.ram_crit = 90
-        self.disk_warn_gb = 10
-        self.gpu_temp_warn = 85
-        self.gpu_temp_crit = 95
-        self.cpu_temp_warn = 80
-        self.cpu_temp_crit = 95
+        self.thresholds: SnapshotDict = SnapshotDict()
+        self.thresholds["cpu_warn"] = 50
+        self.thresholds["cpu_crit"] = 80
+        self.thresholds["ram_warn"] = 70
+        self.thresholds["ram_crit"] = 90
+        self.thresholds["disk_warn_gb"] = 10
+        self.thresholds["gpu_temp_warn"] = 85
+        self.thresholds["gpu_temp_crit"] = 95
+        self.thresholds["cpu_temp_warn"] = 80
+        self.thresholds["cpu_temp_crit"] = 95
 
     # ── Sampling ──
 
@@ -265,11 +268,7 @@ class SystemHealthEngine:
         except Exception:
             pass
 
-        # Store
         self.samples.append(s)
-        if len(self.samples) > self.max_samples:
-            self.samples = self.samples[-self.max_samples:]
-
         return s
 
     def _get_gpu_info(self) -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -361,44 +360,45 @@ class SystemHealthEngine:
     def check_alerts(self, s: HealthSample) -> List[Alert]:
         new_alerts = []
         now = time.time()
+        t = self.thresholds.get_snapshot()
 
         checks = []
         # CPU
-        if s.cpu_percent >= self.cpu_crit:
-            checks.append(("CPU", "CRITICAL", s.cpu_percent, self.cpu_crit,
-                           f"CPU at {s.cpu_percent:.0f}% (critical threshold: {self.cpu_crit}%)"))
-        elif s.cpu_percent >= self.cpu_warn:
-            checks.append(("CPU", "WARNING", s.cpu_percent, self.cpu_warn,
-                           f"CPU at {s.cpu_percent:.0f}% (warning threshold: {self.cpu_warn}%)"))
+        if s.cpu_percent >= t["cpu_crit"]:
+            checks.append(("CPU", "CRITICAL", s.cpu_percent, t["cpu_crit"],
+                           f"CPU at {s.cpu_percent:.0f}% (critical threshold: {t['cpu_crit']}%)"))
+        elif s.cpu_percent >= t["cpu_warn"]:
+            checks.append(("CPU", "WARNING", s.cpu_percent, t["cpu_warn"],
+                           f"CPU at {s.cpu_percent:.0f}% (warning threshold: {t['cpu_warn']}%)"))
         # RAM
-        if s.ram_percent >= self.ram_crit:
-            checks.append(("RAM", "CRITICAL", s.ram_percent, self.ram_crit,
+        if s.ram_percent >= t["ram_crit"]:
+            checks.append(("RAM", "CRITICAL", s.ram_percent, t["ram_crit"],
                            f"RAM at {s.ram_percent:.0f}% ({fmt_size(s.ram_used)} / {fmt_size(s.ram_total)})"))
-        elif s.ram_percent >= self.ram_warn:
-            checks.append(("RAM", "WARNING", s.ram_percent, self.ram_warn,
+        elif s.ram_percent >= t["ram_warn"]:
+            checks.append(("RAM", "WARNING", s.ram_percent, t["ram_warn"],
                            f"RAM at {s.ram_percent:.0f}% ({fmt_size(s.ram_used)} / {fmt_size(s.ram_total)})"))
         # Disk
         for drive, info in s.disk_usage.items():
             free_gb = info["free"] / (1024 ** 3)
-            if free_gb < self.disk_warn_gb:
-                checks.append((f"DISK_{drive}", "WARNING", free_gb, self.disk_warn_gb,
+            if free_gb < t["disk_warn_gb"]:
+                checks.append((f"DISK_{drive}", "WARNING", free_gb, t["disk_warn_gb"],
                                f"{drive} only {free_gb:.1f} GB free"))
         # GPU temp
         if s.gpu_temp is not None:
-            if s.gpu_temp >= self.gpu_temp_crit:
-                checks.append(("GPU_TEMP", "CRITICAL", s.gpu_temp, self.gpu_temp_crit,
-                               f"GPU temp {s.gpu_temp:.0f}°C (critical: {self.gpu_temp_crit}°C)"))
-            elif s.gpu_temp >= self.gpu_temp_warn:
-                checks.append(("GPU_TEMP", "WARNING", s.gpu_temp, self.gpu_temp_warn,
-                               f"GPU temp {s.gpu_temp:.0f}°C (warning: {self.gpu_temp_warn}°C)"))
+            if s.gpu_temp >= t["gpu_temp_crit"]:
+                checks.append(("GPU_TEMP", "CRITICAL", s.gpu_temp, t["gpu_temp_crit"],
+                               f"GPU temp {s.gpu_temp:.0f}°C (critical: {t['gpu_temp_crit']}°C)"))
+            elif s.gpu_temp >= t["gpu_temp_warn"]:
+                checks.append(("GPU_TEMP", "WARNING", s.gpu_temp, t["gpu_temp_warn"],
+                               f"GPU temp {s.gpu_temp:.0f}°C (warning: {t['gpu_temp_warn']}°C)"))
         # CPU temp
         if s.cpu_temp is not None:
-            if s.cpu_temp >= self.cpu_temp_crit:
-                checks.append(("CPU_TEMP", "CRITICAL", s.cpu_temp, self.cpu_temp_crit,
-                               f"CPU temp {s.cpu_temp:.0f}°C (critical: {self.cpu_temp_crit}°C)"))
-            elif s.cpu_temp >= self.cpu_temp_warn:
-                checks.append(("CPU_TEMP", "WARNING", s.cpu_temp, self.cpu_temp_warn,
-                               f"CPU temp {s.cpu_temp:.0f}°C (warning: {self.cpu_temp_warn}°C)"))
+            if s.cpu_temp >= t["cpu_temp_crit"]:
+                checks.append(("CPU_TEMP", "CRITICAL", s.cpu_temp, t["cpu_temp_crit"],
+                               f"CPU temp {s.cpu_temp:.0f}°C (critical: {t['cpu_temp_crit']}°C)"))
+            elif s.cpu_temp >= t["cpu_temp_warn"]:
+                checks.append(("CPU_TEMP", "WARNING", s.cpu_temp, t["cpu_temp_warn"],
+                               f"CPU temp {s.cpu_temp:.0f}°C (warning: {t['cpu_temp_warn']}°C)"))
 
         for metric, level, value, thresh, msg in checks:
             last = self._alert_cooldown.get(metric, 0)
@@ -1208,7 +1208,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
 
     def _apply_thresholds(self):
         for key, var in self._thresh_vars.items():
-            setattr(self.engine, key, var.get())
+            self.engine.thresholds[key] = var.get()
         messagebox.showinfo("Thresholds", "Alert thresholds updated.")
 
     def _clear_alerts(self):
@@ -1384,17 +1384,18 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
 
     def _update_active_alerts(self, s: HealthSample):
         """Update the active alerts panel based on current sample."""
+        t = self.engine.thresholds.get_snapshot()
         active = []
-        if s.cpu_percent >= self.engine.cpu_crit:
+        if s.cpu_percent >= t["cpu_crit"]:
             active.append(f"CPU: {s.cpu_percent:.0f}%")
-        if s.ram_percent >= self.engine.ram_crit:
+        if s.ram_percent >= t["ram_crit"]:
             active.append(f"RAM: {s.ram_percent:.0f}%")
-        if s.gpu_temp and s.gpu_temp >= self.engine.gpu_temp_warn:
+        if s.gpu_temp and s.gpu_temp >= t["gpu_temp_warn"]:
             active.append(f"GPU: {s.gpu_temp:.0f}°C")
-        if s.cpu_temp and s.cpu_temp >= self.engine.cpu_temp_warn:
+        if s.cpu_temp and s.cpu_temp >= t["cpu_temp_warn"]:
             active.append(f"CPU Temp: {s.cpu_temp:.0f}°C")
         for drive, info in s.disk_usage.items():
-            if info["free"] / (1024 ** 3) < self.engine.disk_warn_gb:
+            if info["free"] / (1024 ** 3) < t["disk_warn_gb"]:
                 active.append(f"{drive}: {info['free'] / (1024**3):.0f} GB free")
 
         if active:
@@ -1409,7 +1410,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
     # ── Chart ──
 
     def _update_chart(self):
-        samples = self.engine.samples
+        samples = self.engine.samples.snapshot()  # thread-safe snapshot
         now = time.time()
         cutoff = now - self._chart_window
         recent = [s for s in samples if s.timestamp >= cutoff]
