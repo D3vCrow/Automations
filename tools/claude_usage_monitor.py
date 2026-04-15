@@ -50,6 +50,24 @@ MODEL_PRICING = {
 # Fallback pricing (use Sonnet rates as conservative default)
 _DEFAULT_PRICING = MODEL_PRICING["claude-sonnet-4-6"]
 
+# Cold-turn detection
+_COLD_INPUT_MIN = 2000
+_COLD_CACHE_RATIO_MAX = 0.5
+
+# Rotate Now score weights (sum to 1.0)
+_ROTATE_W_SAVINGS = 0.50
+_ROTATE_W_WASTE = 0.20
+_ROTATE_W_CACHE_TREND = 0.15
+_ROTATE_W_TURN_COUNT = 0.10
+_ROTATE_W_COLD_CLUSTER = 0.05
+
+# Rotate pill thresholds
+_ROTATE_RED = 60
+_ROTATE_AMBER = 30
+
+# Tool-spend heuristic (chars per token, standard rule of thumb)
+_TOOL_CHARS_PER_TOKEN = 4
+
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -267,13 +285,67 @@ def _waste_factor(turn_costs: list) -> float | None:
     """Waste factor: average tokens/turn in last 5 turns vs first 5 turns."""
     if len(turn_costs) < 6:
         return None
-    first5 = [tc[2] + tc[3] + tc[4] + tc[5] for tc in turn_costs[:5]]
-    last5 = [tc[2] + tc[3] + tc[4] + tc[5] for tc in turn_costs[-5:]]
+    first5 = [_turn_total_tokens(tc) for tc in turn_costs[:5]]
+    last5 = [_turn_total_tokens(tc) for tc in turn_costs[-5:]]
     base = sum(first5) / len(first5)
     current = sum(last5) / len(last5)
     if base <= 0:
         return None
     return current / base
+
+
+def _turn_total_tokens(tc: tuple) -> int:
+    """Sum of input + output + cache_read + cache_write for a turn_costs entry."""
+    return tc[2] + tc[3] + tc[4] + tc[5]
+
+
+def _is_cold_turn(input_tokens: int, cache_read: int) -> bool:
+    """A turn is cold when its fresh input dominates and the turn is non-trivial."""
+    if input_tokens < _COLD_INPUT_MIN:
+        return False
+    denom = input_tokens + cache_read
+    if denom == 0:
+        return False
+    return (cache_read / denom) < _COLD_CACHE_RATIO_MAX
+
+
+def _cache_efficiency(input_tokens: int, cache_read: int, cache_write: int) -> float:
+    """Cache efficiency = cache_read / (input + cache_read + cache_write). Range 0..1."""
+    denom = input_tokens + cache_read + cache_write
+    if denom <= 0:
+        return 0.0
+    return cache_read / denom
+
+
+def _cache_trend(turn_costs: list) -> float | None:
+    """Difference in cache efficiency between last-5 and first-5 windows.
+
+    Returns None when fewer than 10 turns are available. Negative values
+    mean the cache is getting less effective over time.
+    """
+    if len(turn_costs) < 10:
+        return None
+
+    def window_eff(window: list) -> float:
+        inp = sum(tc[2] for tc in window)
+        cr = sum(tc[4] for tc in window)
+        cw = sum(tc[5] for tc in window)
+        return _cache_efficiency(inp, cr, cw)
+
+    return window_eff(turn_costs[-5:]) - window_eff(turn_costs[:5])
+
+
+def _cold_turn_count(turn_costs: list) -> int:
+    """Number of turns satisfying the cold rule."""
+    return sum(1 for tc in turn_costs if _is_cold_turn(tc[2], tc[4]))
+
+
+def _cold_turns_cluster_end(turn_costs: list) -> bool:
+    """True when at least 3 of the last 5 turns are cold (recent cache invalidation)."""
+    if len(turn_costs) < 5:
+        return False
+    last5 = turn_costs[-5:]
+    return sum(1 for tc in last5 if _is_cold_turn(tc[2], tc[4])) >= 3
 
 
 def _friendly_project(dirname: str, cwd: str | None = None) -> str:
@@ -950,10 +1022,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             tok_cw = s["total_cache_write"]
             wf = _waste_factor(s["turn_costs"])
             waste_str = f"{wf:.1f}x" if wf is not None else "—"
-            init_tokens = (
-                s["turn_costs"][0][2] + s["turn_costs"][0][3]
-                + s["turn_costs"][0][4] + s["turn_costs"][0][5]
-            ) if s["turn_costs"] else 0
+            init_tokens = _turn_total_tokens(s["turn_costs"][0]) if s["turn_costs"] else 0
             duration = _duration_str(s["first_timestamp"], s["last_timestamp"])
 
             cache_denom = tok_cr + tok_cw + tok_in
@@ -1091,8 +1160,9 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             self._turn_tree.delete(item)
 
         cum_cost = 0.0
-        for i, (ts_str, cost, inp, out, cr, cw, _model) in enumerate(s["turn_costs"]):
-            tokens = inp + out + cr + cw
+        for i, tc in enumerate(s["turn_costs"]):
+            ts_str, cost = tc[0], tc[1]
+            tokens = _turn_total_tokens(tc)
             cum_cost += cost
             ts = _parse_timestamp(ts_str)
             time_str = ts.astimezone().strftime("%H:%M:%S") if ts else "—"
@@ -1116,8 +1186,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         cum = []
         total = 0
         for tc in turn_costs:
-            tokens = tc[2] + tc[3] + tc[4] + tc[5]
-            total += tokens
+            total += _turn_total_tokens(tc)
             cum.append(total)
 
         max_val = max(cum) if cum else 1
