@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install runtime + test dependencies
+        # requirements.txt is intentionally minimal today (Plan B-B4 will pin
+        # the rest). Until then, list the deps the test suite needs to import
+        # tools/* without ImportError.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest customtkinter psutil pillow scapy requests pywin32-ctypes
+
+      - name: Run pytest
+        run: pytest -v
