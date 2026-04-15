@@ -965,6 +965,17 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         )
         self._chart_canvas.pack(fill="x", padx=12, pady=(0, 10))
 
+        # Top Tools panel
+        tools_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
+        tools_frame.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(
+            tools_frame, text="Top Tools Used (est.)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+
+        self._tools_body_frame = ctk.CTkFrame(tools_frame, fg_color="transparent")
+        self._tools_body_frame.pack(fill="x", padx=12, pady=(0, 10))
+
         # Turn-by-turn table
         turn_cols = ("turn", "timestamp", "cost", "tokens", "cumulative")
         self._turn_tree = ttk.Treeview(
@@ -1447,6 +1458,36 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         # Chart
         self._draw_chart(s["turn_costs"])
+
+        # Top tools (rebuild each time)
+        for w in self._tools_body_frame.winfo_children():
+            w.destroy()
+
+        stats = s.get("tool_stats") or {}
+        if not stats:
+            ctk.CTkLabel(
+                self._tools_body_frame, text="No tool usage recorded.",
+                font=ctk.CTkFont(size=11), text_color="gray",
+            ).pack(anchor="w", pady=4)
+        else:
+            ranked = sorted(stats.items(), key=lambda kv: -kv[1]["est_cost"])[:8]
+            max_cost = max((v["est_cost"] for _, v in ranked), default=1.0)
+            for name, st in ranked:
+                row = ctk.CTkFrame(self._tools_body_frame, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+
+                ctk.CTkLabel(
+                    row, text=name, font=ctk.CTkFont(size=11),
+                    width=220, anchor="w",
+                ).pack(side="left")
+
+                bar_width = max(4, int(220 * (st["est_cost"] / max_cost))) if max_cost > 0 else 4
+                bar = ctk.CTkFrame(row, width=bar_width, height=16, corner_radius=4, fg_color="#9e6a3a")
+                bar.pack(side="left", padx=(8, 4))
+                bar.pack_propagate(False)
+
+                info = f"{st['calls']} calls   ~{_format_tokens(st['est_tokens'])} tok   ~{_format_cost(st['est_cost'])}"
+                ctk.CTkLabel(row, text=info, font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
 
         # Turn table
         for item in self._turn_tree.get_children():
