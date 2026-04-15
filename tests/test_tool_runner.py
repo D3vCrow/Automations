@@ -250,3 +250,17 @@ def test_runner_accepts_dotted_module_name():
     # tools._common.logging exists and has no run_tool() — a safe import target.
     r = _run_runner("tools._common.logging", cwd=PROJECT_ROOT)
     assert r.returncode == 0, r.stderr
+
+
+def test_runner_returns_exit_code_3_on_import_failure(tmp_path):
+    """Runner must return exit code 3 when a tool fails to import (e.g., syntax error)."""
+    tool_file = tmp_path / "broken_import.py"
+    tool_file.write_text(
+        "raise ImportError('broken module')\n",
+        encoding="utf-8",
+    )
+
+    r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
+    assert r.returncode == 3
+    assert "ImportError" in r.stderr
+    assert "broken module" in r.stderr

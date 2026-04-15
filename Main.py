@@ -463,7 +463,7 @@ class ToolboxApp(ctk.CTk):
             proc = subprocess.Popen(
                 [sys.executable, "-m", "tools._runner", str(path)],
                 cwd=str(BASE_DIR),
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 creationflags=creation_flags,
             )
@@ -504,13 +504,20 @@ class ToolboxApp(ctk.CTk):
             if rc is None:
                 continue
             self._tool_procs.pop(tool_id, None)
+            self._reader_threads.pop(tool_id, None)
             if rc != 0:
                 self._notify_crash(tool_id, proc.pid, rc)
             else:
                 log.info("tool %s exited cleanly pid=%d", tool_id, proc.pid)
 
     def _notify_crash(self, tool_id: str, pid: int, rc: int) -> None:
-        """Surface a crash to the user and point at the log file."""
+        """Surface a crash to the user and point at the log file.
+
+        Exit codes:
+        - 1: Tool raised an exception at runtime
+        - 2: Invalid arguments to _runner
+        - 3: Tool failed to load (import/syntax error)
+        """
         log_file = self._log_path_for(tool_id, pid)
         display_name = tool_id
         for t in self.all_tools:
@@ -519,11 +526,18 @@ class ToolboxApp(ctk.CTk):
                 break
         log.warning("tool %s exited rc=%d pid=%d", tool_id, rc, pid)
 
-        message = (
-            f"'{display_name}' exited unexpectedly (code {rc}).\n\n"
-            f"Log: {log_file}\n\n"
-            f"Open log folder?"
-        )
+        if rc == 3:
+            message = (
+                f"'{display_name}' failed to load (import or syntax error).\n\n"
+                f"Log: {log_file}\n\n"
+                f"Open log folder?"
+            )
+        else:
+            message = (
+                f"'{display_name}' exited unexpectedly (code {rc}).\n\n"
+                f"Log: {log_file}\n\n"
+                f"Open log folder?"
+            )
         try:
             open_folder = messagebox.askyesno(
                 f"{display_name} exited unexpectedly",

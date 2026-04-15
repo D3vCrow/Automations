@@ -22,9 +22,11 @@ Behavior:
 Exit codes:
 
 * ``0`` — normal completion.
-* ``1`` — the tool raised an unhandled exception. The traceback is
+* ``1`` — the tool raised an unhandled exception at runtime. The traceback is
   written to stderr so the launcher's reader thread captures it.
 * ``2`` — argument error (missing or invalid module/path).
+* ``3`` — the tool failed to load (import or syntax error). The traceback is
+  written to stderr so the launcher's reader thread captures it.
 """
 
 from __future__ import annotations
@@ -76,7 +78,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         argv: Command-line arguments (defaults to ``sys.argv[1:]``).
 
     Returns:
-        Process exit code.
+        Process exit code (0=success, 1=runtime error, 2=arg error, 3=import error).
     """
     args = list(argv) if argv is not None else sys.argv[1:]
     if not args:
@@ -88,7 +90,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         module = _load(target)
     except Exception:
         traceback.print_exc(file=sys.stderr)
-        return 1
+        return 3
 
     run_tool = getattr(module, "run_tool", None)
     if callable(run_tool):
