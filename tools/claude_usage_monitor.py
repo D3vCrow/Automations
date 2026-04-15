@@ -896,9 +896,8 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         )
         self._detail_info.pack(pady=(0, 8))
 
-        # Rotate Now pill
+        # Rotate Now pill — packed by _show_session_detail only when needed
         self._rotate_frame = ctk.CTkFrame(parent, corner_radius=12, fg_color="#2b2b2b")
-        self._rotate_frame.pack(fill="x", padx=8, pady=(0, 8))
 
         self._rotate_pill = ctk.CTkLabel(
             self._rotate_frame, text="—", corner_radius=12,
@@ -1359,7 +1358,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         # Rotate Now pill (LIVE sessions only)
         if is_active:
-            self._rotate_frame.pack(fill="x", padx=8, pady=(0, 8))
+            self._rotate_frame.pack(fill="x", padx=8, pady=(0, 8), before=self._detail_cards_frame)
             sub = _rotate_subscores(s)
             if sub is None:
                 self._rotate_pill.configure(
