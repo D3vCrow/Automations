@@ -208,10 +208,13 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
         
         # Configure treeview style
         style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", borderwidth=0)
-        style.configure("Treeview.Heading", background="#565b5e", foreground="white", relief="flat", font=("Arial", 10, "bold"))
-        style.map("Treeview", background=[('selected', '#1f538d')])
+        style.configure("Treeview", background="#2b2b2b", foreground="white",
+                         fieldbackground="#2b2b2b", borderwidth=0)
+        style.configure("Treeview.Heading", background="#565b5e", foreground="white",
+                         relief="flat", font=("Arial", 10, "bold"))
+        style.map("Treeview",
+                  background=[('selected', '#1f538d')],
+                  foreground=[('selected', 'white')])
         
         # Create treeview with columns
         columns = ("name", "size", "files", "size_percentage", "created", "modified", "accessed")

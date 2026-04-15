@@ -19,6 +19,7 @@ import re
 import json
 import time
 import queue
+import sqlite3
 import threading
 import subprocess
 import concurrent.futures
@@ -217,6 +218,138 @@ def netsh_wlan_info() -> Dict[str, str]:
     }
     return {k: v for k, v in info.items() if v}
 
+def _trigger_wifi_scan():
+    """Force Windows to perform an active Wi-Fi scan using the native WlanScan API."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        wlanapi = ctypes.windll.wlanapi
+        client_handle = wintypes.HANDLE()
+        negotiated = wintypes.DWORD()
+        ret = wlanapi.WlanOpenHandle(2, None, ctypes.byref(negotiated), ctypes.byref(client_handle))
+        if ret != 0:
+            return
+
+        class WLAN_INTERFACE_INFO(ctypes.Structure):
+            _fields_ = [
+                ('InterfaceGuid', ctypes.c_byte * 16),
+                ('strInterfaceDescription', ctypes.c_wchar * 256),
+                ('isState', ctypes.c_uint),
+            ]
+        class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+            _fields_ = [
+                ('dwNumberOfItems', ctypes.c_uint),
+                ('dwIndex', ctypes.c_uint),
+                ('InterfaceInfo', WLAN_INTERFACE_INFO * 1),
+            ]
+
+        info_list = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+        ret2 = wlanapi.WlanEnumInterfaces(client_handle, None, ctypes.byref(info_list))
+        if ret2 == 0 and info_list.contents.dwNumberOfItems > 0:
+            guid = info_list.contents.InterfaceInfo[0].InterfaceGuid
+            guid_bytes = (ctypes.c_byte * 16)(*guid)
+            wlanapi.WlanScan(client_handle, ctypes.byref(guid_bytes), None, None, None)
+
+        wlanapi.WlanCloseHandle(client_handle, None)
+    except Exception:
+        pass
+
+
+def scan_wifi_networks() -> List[Dict]:
+    """Trigger an active Wi-Fi scan, wait briefly, then parse results."""
+    _trigger_wifi_scan()
+    time.sleep(1.5)  # Give the scan time to complete
+    rc, out, _ = safe_run(["netsh", "wlan", "show", "networks", "mode=bssid"], timeout=10)
+    if rc != 0:
+        return []
+    networks = []
+    current: Dict = {}
+
+    def _commit():
+        if current.get("ssid") and current.get("channel"):
+            networks.append(dict(current))
+
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("SSID") and "BSSID" not in line and ":" in line:
+            _commit()
+            current = {"ssid": line.split(":", 1)[1].strip()}
+        elif "BSSID" in line and ":" in line:
+            # If we already have a BSSID, this is a second AP for same SSID — commit previous
+            if current.get("bssid") and current.get("channel"):
+                _commit()
+                ssid = current.get("ssid", "")
+                current = {"ssid": ssid}
+            current["bssid"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Signal") and ":" in line:
+            sig = line.split(":")[1].strip().rstrip("%").strip()
+            try:
+                current["signal_pct"] = int(sig)
+            except ValueError:
+                current["signal_pct"] = 0
+        elif line.startswith("Channel") and ":" in line:
+            try:
+                current["channel"] = int(line.split(":")[1].strip())
+            except ValueError:
+                current["channel"] = 0
+        elif line.startswith("Radio type") and ":" in line:
+            current["radio"] = line.split(":")[1].strip()
+        elif line.startswith("Authentication") and ":" in line:
+            current["auth"] = line.split(":")[1].strip()
+        elif line.startswith("Encryption") and ":" in line:
+            current["encryption"] = line.split(":")[1].strip()
+
+    _commit()  # Don't forget the last network
+    return networks
+
+
+def recommend_channel(networks: List[Dict], my_ssid: str = "") -> Dict:
+    """Score channels 1, 6, 11 and recommend the best one.
+    Returns {best: int, scores: {1: X, 6: Y, 11: Z}, current: int, reason: str}
+    """
+    candidates = [1, 6, 11]
+    scores = {}
+    current_ch = 0
+
+    for candidate in candidates:
+        score = 100.0
+        for net in networks:
+            ch = net.get("channel", 0)
+            sig = net.get("signal_pct", 0)
+            ssid = net.get("ssid", "")
+
+            # Skip our own network
+            if ssid == my_ssid:
+                if ch:
+                    current_ch = ch
+                continue
+
+            # Distance in channels
+            dist = abs(ch - candidate)
+            if dist == 0:
+                # Same channel: full penalty based on signal
+                score -= sig * 0.8
+            elif dist < 5:
+                # Overlapping channel: partial penalty
+                overlap_factor = (5 - dist) / 5.0  # 1.0 at dist=0, 0.2 at dist=4
+                score -= sig * 0.5 * overlap_factor
+
+        scores[candidate] = max(0, round(score, 1))
+
+    best = max(candidates, key=lambda c: scores[c])
+    reason = ""
+    if current_ch == best:
+        reason = "You're already on the best channel!"
+    elif current_ch:
+        diff = scores[best] - scores.get(current_ch, 0)
+        reason = f"Channel {best} has {diff:.0f} points less interference than your current channel {current_ch}"
+    else:
+        reason = f"Channel {best} has the least interference"
+
+    return {"best": best, "scores": scores, "current": current_ch, "reason": reason}
+
+
 def parse_ts(ts: str) -> Optional[datetime]:
     try:
         return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
@@ -367,6 +500,7 @@ class NetworkStabilityEngine:
         else:
             self.intelligence = None
 
+        self._init_db()
         self._load_state()
 
     def _load_state(self):
@@ -391,6 +525,97 @@ class NetworkStabilityEngine:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
+
+    # ---------- SQLite incident database ----------
+
+    def _init_db(self):
+        """Initialise SQLite database for persistent incident storage."""
+        db_dir = os.path.dirname(self.state_path) or "."
+        self._db_path = os.path.join(db_dir, "network_incidents.db")
+        con = sqlite3.connect(self._db_path)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS incidents (
+                id          INTEGER PRIMARY KEY,
+                start_time  TEXT NOT NULL,
+                end_time    TEXT,
+                duration    TEXT,
+                severity    TEXT NOT NULL,
+                category    TEXT NOT NULL,
+                start_status TEXT,
+                end_status  TEXT,
+                cause       TEXT,
+                details     TEXT,
+                cause_timeline TEXT
+            )
+        """)
+        con.commit()
+        con.close()
+
+    def _db_conn(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._db_path)
+
+    def _db_insert_incident(self, inc: 'Incident'):
+        """INSERT a newly created incident into the database."""
+        try:
+            con = self._db_conn()
+            con.execute(
+                "INSERT INTO incidents (id, start_time, end_time, duration, severity, "
+                "category, start_status, end_status, cause, details, cause_timeline) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    inc.id, inc.start_time, inc.end_time, inc.duration,
+                    inc.severity, inc.category, inc.start_status, inc.end_status,
+                    inc.cause,
+                    json.dumps(inc.details, ensure_ascii=False),
+                    json.dumps(inc.cause_timeline, ensure_ascii=False) if inc.cause_timeline else "[]",
+                ),
+            )
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    def _db_update_incident(self, inc: 'Incident'):
+        """UPDATE an existing incident (severity escalation or closure)."""
+        try:
+            con = self._db_conn()
+            con.execute(
+                "UPDATE incidents SET end_time=?, duration=?, severity=?, cause=?, "
+                "details=?, cause_timeline=? WHERE id=?",
+                (
+                    inc.end_time, inc.duration, inc.severity, inc.cause,
+                    json.dumps(inc.details, ensure_ascii=False),
+                    json.dumps(inc.cause_timeline, ensure_ascii=False) if inc.cause_timeline else "[]",
+                    inc.id,
+                ),
+            )
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    def _db_load_incidents(self, limit: int = 500,
+                           severity_filter: str = "ALL",
+                           category_filter: str = "ALL") -> List[Dict]:
+        """Load incidents from DB with optional filters."""
+        try:
+            con = self._db_conn()
+            con.row_factory = sqlite3.Row
+            query = "SELECT * FROM incidents WHERE 1=1"
+            params: list = []
+            if severity_filter != "ALL":
+                query += " AND severity = ?"
+                params.append(severity_filter)
+            if category_filter != "ALL":
+                query += " AND category = ?"
+                params.append(category_filter)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            rows = con.execute(query, params).fetchall()
+            con.close()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
 
     def log_event(self, severity: str, category: str, title: str, details: Dict):
         self.events.append(Event(now_ts(), severity, category, title, details))
@@ -614,36 +839,30 @@ class NetworkStabilityEngine:
         Creates/updates incidents based on category and reason combinations.
         """
         # Normalize variable reasons so fluctuating values don't create separate incidents
-        normalized_reason = reason
-        if "Packet loss detected" in reason:
+        # Strip Wi-Fi signal hint first
+        normalized_reason = reason.split(" [Wi-Fi:")[0] if "[Wi-Fi:" in reason else reason
+
+        # Group all latency issues into ONE incident type (elevated + high share the same root cause)
+        if "High latency" in normalized_reason or "Latency elevated" in normalized_reason:
+            normalized_reason = "Latency issue"
+        elif "Packet loss detected" in normalized_reason:
             normalized_reason = "Packet loss detected"
-        elif "High latency detected" in reason:
-            normalized_reason = "High latency detected"
-        elif "Latency elevated" in reason:
-            normalized_reason = "Latency elevated"
-        elif "Gateway unreachable" in reason:
-            normalized_reason = "Gateway unreachable and internet down"
-        elif "Internet unreachable" in reason:
+        elif "Gateway unreachable" in normalized_reason:
+            normalized_reason = "Gateway unreachable"
+        elif "Internet unreachable" in normalized_reason:
             normalized_reason = "Internet unreachable"
-        elif "DNS slow" in reason:
-            normalized_reason = "DNS slow/timeouts"
-        elif "DNS failing" in reason:
-            normalized_reason = "DNS failing"
-        elif "Wi-Fi:" in reason:
-            # Strip the signal correlation hint for grouping
-            normalized_reason = reason.split(" [Wi-Fi:")[0]
-            # Re-normalize after stripping hint
-            if "High latency detected" in normalized_reason:
-                normalized_reason = "High latency detected"
-            elif "Latency elevated" in normalized_reason:
-                normalized_reason = "Latency elevated"
-            elif "Packet loss detected" in normalized_reason:
-                normalized_reason = "Packet loss detected"
+        elif "DNS slow" in normalized_reason or "DNS failing" in normalized_reason:
+            normalized_reason = "DNS issue"
+        elif "No local IPv4" in normalized_reason:
+            normalized_reason = "No network interface"
 
         key = (category, normalized_reason)
         
-        # Start incident when leaving OK
+        # Start incident when leaving OK — only for WARN and HIGH severity
         if status in ("DEGRADED", "DOWN"):
+            if self._sev_rank(severity) < 2:  # Skip INFO-level
+                return
+
             # Create new incident if this (category, reason) combination doesn't exist
             if key not in self.active_incidents:
                 inc = Incident(
@@ -671,6 +890,7 @@ class NetworkStabilityEngine:
                 self.active_incidents[key] = inc.id
                 self._next_incident_id += 1
                 self.incidents.append(inc)
+                self._db_insert_incident(inc)
             else:
                 # Update existing incident with same category/reason
                 incident_id = self.active_incidents[key]
@@ -681,7 +901,7 @@ class NetworkStabilityEngine:
                     inc.details["latest_category"] = category
                     inc.details["latest_severity"] = severity
                     inc.cause = reason
-                    
+
                     # Add to cause timeline if reason changed
                     if inc.cause_timeline:
                         last_entry = inc.cause_timeline[-1]
@@ -691,17 +911,19 @@ class NetworkStabilityEngine:
                                 "category": category,
                                 "reason": reason
                             })
-        
+                    self._db_update_incident(inc)
+
         # End incidents on recovery to OK - close ALL active incidents
         if status == "OK":
             incidents_to_close = list(self.active_incidents.items())
-            
+
             for (cat, rsn), incident_id in incidents_to_close:
                 inc = self._find_incident(incident_id)
                 if inc and not inc.end_time:
                     inc.end_time = now_ts()
                     inc.duration = duration_str(inc.start_time, inc.end_time)
                     inc.details["end_reason"] = reason
+                    self._db_update_incident(inc)
                 del self.active_incidents[(cat, rsn)]
 
     def _find_incident(self, incident_id: int) -> Optional[Incident]:
@@ -1037,6 +1259,7 @@ class App(AppBase):
 
         # log filter state
         self.filter_category = tk.StringVar(value="ALL")
+        self.filter_severity = tk.StringVar(value="ALL")
 
         # Set initial baseline if we have network info
         if gw or dns:
@@ -1062,6 +1285,8 @@ class App(AppBase):
         threading.Thread(target=self._worker_loop, daemon=True).start()
         # Start monitoring immediately
         self.after(100, self.tick)
+        # Wi-Fi analyzer auto-refresh
+        self.after(20000, self._wifi_auto_refresh)
 
     def _build_ui(self):
         # --- Top bar: single compact row with essential info ---
@@ -1092,11 +1317,13 @@ class App(AppBase):
         self.tab_incidents = nb.add("Incidents (combined)")
         self.tab_events = nb.add("Events (config/meta)")
         self.tab_diagnostics = nb.add("Diagnostics")
+        self.tab_wifi = nb.add("Wi-Fi Analyzer")
 
         self._build_overview()
         self._build_incidents()
         self._build_events()
         self._build_diagnostics()
+        self._build_wifi_analyzer()
 
         self.pack(fill="both", expand=True)
 
@@ -1214,6 +1441,21 @@ class App(AppBase):
 
         ctk.CTkLabel(bar, text="(Click a category to filter)").pack(side="left", padx=10)
 
+    def _build_severity_bar(self, parent, on_change):
+        bar = ctk.CTkFrame(parent)
+        bar.pack(fill="x", padx=10, pady=(4, 0))
+
+        ctk.CTkLabel(bar, text="Severity:").pack(side="left", padx=(0, 8))
+
+        sevs = ["ALL", "WARN", "HIGH"]
+
+        def set_sev(s):
+            self.filter_severity.set(s)
+            on_change()
+
+        for s in sevs:
+            ctk.CTkButton(bar, text=s, width=60, command=lambda ss=s: set_sev(ss)).pack(side="left", padx=2)
+
     def _sort_tree(self, tree, col, reverse):
         """Sort a Treeview by column on heading click."""
         data = [(tree.set(k, col), k) for k in tree.get_children("")]
@@ -1229,12 +1471,16 @@ class App(AppBase):
         f = self.tab_incidents
 
         self._build_category_bar(f, self.refresh_incidents)
+        self._build_severity_bar(f, self.refresh_incidents)
 
         style = ttk.Style(self)
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", borderwidth=0)
-        style.configure("Treeview.Heading", background="#565b5e", foreground="white", relief="flat")
-        style.map("Treeview", background=[('selected', '#1f538d')])
+        style.configure("Treeview", background="#2b2b2b", foreground="white",
+                         fieldbackground="#2b2b2b", borderwidth=0)
+        style.configure("Treeview.Heading", background="#565b5e", foreground="white",
+                         relief="flat", font=("Segoe UI", 9, "bold"))
+        style.map("Treeview",
+                  background=[('selected', '#1f538d')],
+                  foreground=[('selected', 'white')])
 
         # Create main container for side-by-side layout
         main_container = ctk.CTkFrame(f)
@@ -1305,6 +1551,7 @@ class App(AppBase):
         f = self.tab_events
 
         self._build_category_bar(f, self.refresh_events)
+        self._build_severity_bar(f, self.refresh_events)
 
         # Create main container for side-by-side layout (like Incidents)
         main_container = ctk.CTkFrame(f)
@@ -1429,6 +1676,335 @@ class App(AppBase):
         self.diag_dns_status.pack(anchor="w", padx=6, pady=2)
         self.diag_dns_summary = ctk.CTkLabel(self.diag_dns_frame, text="", font=("Segoe UI", 9), wraplength=0, justify="left")
         self.diag_dns_summary.pack(anchor="w", padx=6, pady=2)
+
+    # ---------------------
+    # Wi-Fi Analyzer Tab
+    # ---------------------
+
+    def _build_wifi_analyzer(self):
+        f = self.tab_wifi
+        scroll = ctk.CTkScrollableFrame(f)
+        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Header
+        top = ctk.CTkFrame(scroll, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(top, text="Wi-Fi Channel Analyzer",
+                     font=("Segoe UI", 14, "bold")).pack(side="left")
+        self._wifi_scan_status = ctk.CTkLabel(top, text="", font=("Segoe UI", 9),
+                                               text_color="#888888")
+        self._wifi_scan_status.pack(side="left", padx=10)
+        ctk.CTkButton(top, text="Scan Now", width=80, height=26,
+                      command=self._request_wifi_scan).pack(side="right")
+
+        # Recommendation banner
+        self._wifi_rec_frame = ctk.CTkFrame(scroll, fg_color="#1a2a1a", corner_radius=8)
+        self._wifi_rec_frame.pack(fill="x", pady=(0, 6))
+        self._wifi_rec_lbl = ctk.CTkLabel(self._wifi_rec_frame, text="Click 'Scan Now' to analyze channels",
+            font=("Segoe UI", 12, "bold"), text_color="#888888")
+        self._wifi_rec_lbl.pack(padx=12, pady=8)
+
+        # Channel scores row
+        self._wifi_scores_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self._wifi_scores_frame.pack(fill="x", pady=(0, 6))
+        self._wifi_score_labels: Dict[int, ctk.CTkLabel] = {}
+        for ch in [1, 6, 11]:
+            card = ctk.CTkFrame(self._wifi_scores_frame, fg_color="#1e1e1e", corner_radius=8)
+            card.pack(side="left", fill="x", expand=True, padx=3)
+            ctk.CTkLabel(card, text=f"Channel {ch}", font=("Segoe UI", 9),
+                         text_color="#888888").pack(pady=(6, 0))
+            lbl = ctk.CTkLabel(card, text="--", font=("Segoe UI", 18, "bold"),
+                               text_color="#888888")
+            lbl.pack(pady=(0, 6))
+            self._wifi_score_labels[ch] = lbl
+
+        # Channel map (canvas)
+        map_frame = ctk.CTkFrame(scroll, fg_color="#1e1e1e", corner_radius=8)
+        map_frame.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(map_frame, text="Channel Map — 2.4 GHz",
+                     font=("Segoe UI", 10, "bold"),
+                     text_color="#888888").pack(anchor="w", padx=10, pady=(6, 0))
+        self._wifi_canvas = tk.Canvas(map_frame, height=220, bg="#1a1a1a", highlightthickness=0)
+        self._wifi_canvas.pack(fill="x", padx=8, pady=(2, 8))
+        self._wifi_canvas_width = 700
+        self._wifi_canvas.bind("<Configure>", lambda e: setattr(self, '_wifi_canvas_width', e.width))
+
+        # Networks table
+        table_frame = ctk.CTkFrame(scroll, fg_color="#1e1e1e", corner_radius=8)
+        table_frame.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(table_frame, text="Visible Networks",
+                     font=("Segoe UI", 10, "bold"),
+                     text_color="#888888").pack(anchor="w", padx=10, pady=(6, 2))
+
+        tree_frame = ctk.CTkFrame(table_frame, fg_color="transparent")
+        tree_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        cols = ("ssid", "bssid", "channel", "signal", "radio", "auth", "interference")
+        headers = ("SSID", "BSSID", "Channel", "Signal", "Radio", "Security", "Interference")
+        widths = (160, 130, 60, 60, 80, 100, 90)
+
+        self._wifi_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
+        for col, hdr, w in zip(cols, headers, widths):
+            self._wifi_tree.heading(col, text=hdr)
+            self._wifi_tree.column(col, width=w, stretch=(col == "ssid"))
+        self._wifi_tree.tag_configure("mine", foreground="#00FF88")
+        self._wifi_tree.tag_configure("overlap", foreground="#FFA500")
+        self._wifi_tree.tag_configure("clean", foreground="#cccccc")
+        self._wifi_tree.tag_configure("stale", foreground="#555555")
+        self._wifi_tree.pack(fill="x")
+
+        # Store scan data — accumulate across scans for consistency
+        self._wifi_networks: List[Dict] = []
+        self._wifi_scan_history: List[Tuple[float, List[Dict]]] = []
+        self._wifi_accumulated: Dict[str, Dict] = {}  # bssid -> {network_data, last_seen}
+
+        # Auto-scan on tab switch
+        self.after(1500, self._request_wifi_scan)
+
+    def _request_wifi_scan(self):
+        self._wifi_scan_status.configure(text="Scanning...")
+        # Run in thread to avoid blocking
+        def do_scan():
+            networks = scan_wifi_networks()
+            my_ssid = self.ssid.get() if hasattr(self, 'ssid') else ""
+            if not my_ssid:
+                # Get from current WiFi info
+                wifi = netsh_wlan_info()
+                my_ssid = wifi.get("ssid", "")
+            rec = recommend_channel(networks, my_ssid)
+            self.after(0, lambda: self._on_wifi_scan(networks, rec, my_ssid))
+        threading.Thread(target=do_scan, daemon=True).start()
+
+    def _on_wifi_scan(self, networks: List[Dict], rec: Dict, my_ssid: str):
+        now = time.time()
+
+        # Accumulate: update seen networks, keep those seen in last 90 seconds
+        for net in networks:
+            bssid = net.get("bssid", "")
+            if bssid:
+                self._wifi_accumulated[bssid] = {**net, "_last_seen": now, "_stale": False}
+
+        # Mark stale networks (not seen in this scan but seen recently)
+        current_bssids = {n.get("bssid", "") for n in networks}
+        stale_cutoff = now - 90  # 90 seconds
+        to_remove = []
+        for bssid, data in self._wifi_accumulated.items():
+            if bssid not in current_bssids:
+                if data["_last_seen"] < stale_cutoff:
+                    to_remove.append(bssid)
+                else:
+                    data["_stale"] = True
+        for bssid in to_remove:
+            del self._wifi_accumulated[bssid]
+
+        # Build merged network list from accumulated data
+        merged = list(self._wifi_accumulated.values())
+        self._wifi_networks = merged
+
+        self._wifi_scan_history.append((now, networks))
+        if len(self._wifi_scan_history) > 20:
+            self._wifi_scan_history = self._wifi_scan_history[-20:]
+
+        # Recalculate recommendation using merged (accumulated) networks
+        rec = recommend_channel(merged, my_ssid)
+
+        fresh_count = sum(1 for n in merged if not n.get("_stale"))
+        stale_count = sum(1 for n in merged if n.get("_stale"))
+        now_str = datetime.now().strftime("%H:%M:%S")
+        status = f"Last scan: {now_str} — {fresh_count} active"
+        if stale_count:
+            status += f", {stale_count} recent"
+        self._wifi_scan_status.configure(text=status)
+
+        # Update recommendation
+        best = rec.get("best", 0)
+        current = rec.get("current", 0)
+        scores = rec.get("scores", {})
+        reason = rec.get("reason", "")
+
+        if current == best and current > 0:
+            self._wifi_rec_frame.configure(fg_color="#112211")
+            self._wifi_rec_lbl.configure(
+                text=f"✓ You're on Channel {current} — the best available channel!",
+                text_color="#00FF88")
+        elif best:
+            self._wifi_rec_frame.configure(fg_color="#2a1a00")
+            self._wifi_rec_lbl.configure(
+                text=f"⚡ Recommendation: Switch to Channel {best}  |  {reason}",
+                text_color="#FFD700")
+
+        # Update score cards
+        for ch, lbl in self._wifi_score_labels.items():
+            score = scores.get(ch, 0)
+            if score >= 80:
+                color = "#00FF88"
+            elif score >= 50:
+                color = "#FFD700"
+            else:
+                color = "#FF4444"
+            lbl.configure(text=f"{score:.0f}/100", text_color=color)
+            # Highlight best channel
+            parent = lbl.master
+            if ch == best:
+                parent.configure(border_width=2, border_color=color)
+            else:
+                parent.configure(border_width=0)
+
+        # Draw channel map
+        self._draw_channel_map(networks, my_ssid, current)
+
+        # Update networks table using merged (accumulated) data
+        self._wifi_tree.delete(*self._wifi_tree.get_children())
+        merged = list(self._wifi_accumulated.values())
+        sorted_nets = sorted(merged, key=lambda n: (
+            0 if n.get("ssid") == my_ssid else 1,
+            n.get("_stale", False),  # stale networks last
+            -n.get("signal_pct", 0)
+        ))
+
+        for net in sorted_nets:
+            ssid = net.get("ssid", "?")
+            is_mine = ssid == my_ssid
+            is_stale = net.get("_stale", False)
+            ch = net.get("channel", 0)
+
+            # Calculate interference level
+            if is_mine:
+                interference = "—"
+                tag = "mine"
+            elif is_stale:
+                interference = "?"
+                tag = "stale"
+            else:
+                # Check if overlaps with my channel
+                if current and abs(ch - current) < 5:
+                    overlap = (5 - abs(ch - current)) / 5.0
+                    interference = f"{'High' if overlap > 0.6 else 'Medium' if overlap > 0.3 else 'Low'}"
+                    tag = "overlap"
+                else:
+                    interference = "None"
+                    tag = "clean"
+
+            self._wifi_tree.insert("", "end", values=(
+                ssid, net.get("bssid", ""),
+                ch, f"{net.get('signal_pct', 0)}%",
+                net.get("radio", ""), net.get("auth", ""),
+                interference
+            ), tags=(tag,))
+
+    def _draw_channel_map(self, networks: List[Dict], my_ssid: str, my_channel: int):
+        """Draw visual channel map on canvas."""
+        canvas = self._wifi_canvas
+        canvas.delete("all")
+        w = self._wifi_canvas_width
+        h = 220
+
+        if w < 100:
+            return
+
+        pad_l, pad_r, pad_t, pad_b = 40, 20, 25, 30
+        cw = w - pad_l - pad_r
+        ch_h = h - pad_t - pad_b
+
+        # Background grid
+        for pct in (0, 25, 50, 75, 100):
+            y = pad_t + ch_h - (pct / 100.0) * ch_h
+            canvas.create_line(pad_l, y, w - pad_r, y, fill="#2a2a2a", dash=(2, 4))
+            canvas.create_text(pad_l - 4, y, text=f"{pct}%", anchor="e",
+                               fill="#555555", font=("Segoe UI", 7))
+
+        # Channel labels (1-13)
+        num_channels = 13
+        ch_width = cw / num_channels
+        for ch_num in range(1, num_channels + 1):
+            x = pad_l + (ch_num - 0.5) * ch_width
+            color = "#888888" if ch_num in (1, 6, 11) else "#444444"
+            font_weight = "bold" if ch_num in (1, 6, 11) else ""
+            canvas.create_text(x, h - 10, text=str(ch_num), fill=color,
+                               font=("Segoe UI", 8, font_weight))
+
+        # Draw overlap zones first (semi-transparent wider bars)
+        for net in networks:
+            ch = net.get("channel", 0)
+            sig = net.get("signal_pct", 0)
+            ssid = net.get("ssid", "")
+            if ch < 1 or ch > 13:
+                continue
+
+            is_mine = ssid == my_ssid
+
+            # Overlap zone: channels ch-2 to ch+2 (2.4GHz 22MHz width)
+            for overlap_ch in range(max(1, ch - 2), min(14, ch + 3)):
+                if overlap_ch == ch:
+                    continue
+                x = pad_l + (overlap_ch - 1) * ch_width + 2
+                bar_w = ch_width - 4
+                # Height proportional to signal, but dimmer for overlap
+                bar_h = (sig / 100.0) * ch_h * 0.3
+                y = pad_t + ch_h - bar_h
+                color = "#1a3a1a" if is_mine else "#3a2a1a"
+                canvas.create_rectangle(x, y, x + bar_w, pad_t + ch_h,
+                                       fill=color, outline="")
+
+        # Draw main bars
+        for net in networks:
+            ch = net.get("channel", 0)
+            sig = net.get("signal_pct", 0)
+            ssid = net.get("ssid", "")
+            if ch < 1 or ch > 13:
+                continue
+
+            is_mine = ssid == my_ssid
+            x = pad_l + (ch - 1) * ch_width + 2
+            bar_w = ch_width - 4
+            bar_h = (sig / 100.0) * ch_h
+            y = pad_t + ch_h - bar_h
+
+            if is_mine:
+                fill = "#00CC66"
+                outline = "#00FF88"
+            elif my_channel and abs(ch - my_channel) < 5:
+                fill = "#CC6600"
+                outline = "#FF8800"
+            else:
+                fill = "#4466AA"
+                outline = "#6688CC"
+
+            canvas.create_rectangle(x, y, x + bar_w, pad_t + ch_h,
+                                   fill=fill, outline=outline, width=1)
+
+            # SSID label on bar
+            label = ssid[:12] if ssid else "?"
+            label_y = y - 8 if y > pad_t + 15 else y + 12
+            canvas.create_text(x + bar_w / 2, label_y, text=label,
+                               fill="#ffffff" if is_mine else "#cccccc",
+                               font=("Segoe UI", 7), anchor="n" if label_y == y - 8 else "s")
+
+            # Signal % inside bar
+            if bar_h > 20:
+                canvas.create_text(x + bar_w / 2, y + bar_h / 2,
+                                   text=f"{sig}%", fill="#ffffff",
+                                   font=("Segoe UI", 8, "bold"))
+
+        # Legend
+        lx = pad_l + 8
+        items = [("Your network", "#00CC66"), ("Overlapping", "#CC6600"), ("Non-overlapping", "#4466AA")]
+        for i, (label, color) in enumerate(items):
+            ly = pad_t + 2 + i * 14
+            canvas.create_rectangle(lx, ly, lx + 10, ly + 8, fill=color, outline="")
+            canvas.create_text(lx + 14, ly + 4, text=label, anchor="w",
+                               fill="#999999", font=("Segoe UI", 7))
+
+    def _wifi_auto_refresh(self):
+        """Auto-refresh Wi-Fi scan every 15 seconds when the tab is visible."""
+        if not self.running:
+            return
+        try:
+            if self.nb.get() == "Wi-Fi Analyzer":
+                self._request_wifi_scan()
+        except Exception:
+            pass
+        self.after(15000, self._wifi_auto_refresh)
 
     # ---------------------
     # Actions
@@ -2018,6 +2594,7 @@ class App(AppBase):
             self.inc_tree.delete(i)
 
         fc = self.filter_category.get()
+        fs = self.filter_severity.get()
         incidents = list(self.engine.incidents)
 
         # newest first
@@ -2025,6 +2602,8 @@ class App(AppBase):
 
         for inc in incidents[:1200]:
             if fc != "ALL" and inc.category != fc:
+                continue
+            if fs != "ALL" and inc.severity != fs:
                 continue
 
             end = inc.end_time if inc.end_time else "(open)"
@@ -2236,11 +2815,14 @@ Duration: {inc.duration or 'Still ongoing'}
             self.event_tree.delete(i)
 
         fc = self.filter_category.get()
+        fs = self.filter_severity.get()
         events = list(self.engine.events)
         events.reverse()
 
         for idx, e in enumerate(events[:1200]):
             if fc != "ALL" and e.category != fc:
+                continue
+            if fs != "ALL" and e.severity != fs:
                 continue
             tags = []
             if e.severity == "HIGH":

@@ -525,6 +525,21 @@ def _rotate_pill_state(score: float) -> tuple[str, str]:
     return ("KEEP GOING", "#2a8a2a")
 
 
+def _rotate_bar(score: float, width: int = 10) -> str:
+    """Percentage string for the Sessions tab Rotate column."""
+    pct = max(0.0, min(100.0, score))
+    return f"{int(round(pct))}%"
+
+
+def _rotate_tag(score: float) -> str | None:
+    """Row-tag name for the rotation threshold. None = no extra color."""
+    if score >= _ROTATE_RED:
+        return "rot_red"
+    if score >= _ROTATE_AMBER:
+        return "rot_amber"
+    return None
+
+
 def _rotate_explanation(sub: dict) -> str:
     """One-line explanation of the dominant weighted factor."""
     weighted = sub["weighted"]
@@ -849,8 +864,8 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                    foreground=[("selected", "#ffffff")])
 
         cols = ("status", "project", "session_name", "model", "turns",
-                "tok_in", "tok_cache_r", "tok_cache_w", "tok_out",
-                "cache_hit", "init", "cost", "waste", "duration", "date")
+                "tokens", "init", "cost", "waste", "rotate",
+                "duration", "date")
         self._sess_tree = ttk.Treeview(
             parent, columns=cols, show="headings",
             style="Dark.Treeview", height=20,
@@ -858,23 +873,19 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         headings = {
             "status": ("", 30),
-            "project": ("Project", 140),
-            "session_name": ("Session", 200),
-            "model": ("Model", 110),
-            "turns": ("Turns", 50),
-            "tok_in": ("in", 55),
-            "tok_cache_r": ("cache_r", 65),
-            "tok_cache_w": ("cache_w", 65),
-            "tok_out": ("out", 55),
-            "cache_hit": ("Cache %", 60),
-            "init": ("Init Tok", 65),
+            "project": ("Project", 160),
+            "session_name": ("Session", 220),
+            "model": ("Model", 120),
+            "turns": ("Turns", 55),
+            "tokens": ("Tokens", 80),
+            "init": ("Init Tok", 70),
             "cost": ("Est. Cost", 75),
             "waste": ("Waste", 55),
+            "rotate": ("Rotate", 70),
             "duration": ("Duration", 70),
-            "date": ("Date", 110),
+            "date": ("Date", 120),
         }
-        numeric_cols = ("turns", "tok_in", "tok_cache_r", "tok_cache_w",
-                        "tok_out", "cache_hit", "init", "cost", "waste")
+        numeric_cols = ("turns", "tokens", "init", "cost", "waste", "rotate")
         for col, (text, width) in headings.items():
             self._sess_tree.heading(
                 col, text=text,
@@ -1321,9 +1332,18 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             init_tokens = _turn_total_tokens(s["turn_costs"][0]) if s["turn_costs"] else 0
             duration = _duration_str(s["first_timestamp"], s["last_timestamp"])
 
-            cache_denom = tok_cr + tok_cw + tok_in
-            cache_hit_pct = (tok_cr / cache_denom * 100.0) if cache_denom > 0 else 0.0
-            cache_hit_str = f"{cache_hit_pct:.0f}%" if cache_denom > 0 else "—"
+            total_tokens = tok_in + tok_cr + tok_cw + tok_out
+
+            # Rotation signal: bar + % per row; colored tag for amber/red
+            rot_sub = _rotate_subscores(s)
+            if rot_sub:
+                rot_score = rot_sub["total"]
+                rot_display = _rotate_bar(rot_score)
+                rot_tag_name = _rotate_tag(rot_score)
+            else:
+                rot_score = -1
+                rot_display = ""
+                rot_tag_name = None
 
             date_str = ""
             ts = _parse_timestamp(s["last_timestamp"])
@@ -1331,15 +1351,18 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 local = ts.astimezone()
                 date_str = local.strftime("%Y-%m-%d %H:%M")
 
-            tags = ("active",) if is_active else ()
+            row_tags = []
+            if is_active:
+                row_tags.append("active")
+            if rot_tag_name:
+                row_tags.append(rot_tag_name)
+            tags = tuple(row_tags)
 
             display = (status, proj, sess_name, model, s["assistant_turns"],
-                       _format_tokens(tok_in), _format_tokens(tok_cr),
-                       _format_tokens(tok_cw), _format_tokens(tok_out),
-                       cache_hit_str,
+                       _format_tokens(total_tokens),
                        _format_tokens(init_tokens),
                        _format_cost(s["total_cost"]),
-                       waste_str, duration, date_str)
+                       waste_str, rot_display, duration, date_str)
 
             # Raw values for sorting (numeric where applicable)
             sort_vals = {
@@ -1348,14 +1371,11 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 "session_name": sess_name.lower(),
                 "model": model.lower(),
                 "turns": s["assistant_turns"],
-                "tok_in": tok_in,
-                "tok_cache_r": tok_cr,
-                "tok_cache_w": tok_cw,
-                "tok_out": tok_out,
-                "cache_hit": cache_hit_pct,
+                "tokens": total_tokens,
                 "init": init_tokens,
                 "cost": s["total_cost"],
                 "waste": wf if wf is not None else 0,
+                "rotate": rot_score,
                 "duration": (ts.timestamp() if ts else 0) - (_parse_timestamp(s["first_timestamp"]).timestamp() if _parse_timestamp(s["first_timestamp"]) else 0),
                 "date": s["last_timestamp"] or "",
             }
@@ -1371,6 +1391,9 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             self._sess_tree.insert("", "end", iid=sid, values=display, tags=tags)
 
         self._sess_tree.tag_configure("active", foreground="#44ee44")
+        # Rotation status — background tint, compatible with "active" foreground
+        self._sess_tree.tag_configure("rot_red", background="#4a1a1a")
+        self._sess_tree.tag_configure("rot_amber", background="#4a3a1a")
 
     def _on_heading_click(self, col):
         """Sort sessions table by clicked column header."""
@@ -1382,16 +1405,16 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         # Update heading arrows
         cols = ("status", "project", "session_name", "model", "turns",
-                "tok_in", "tok_cache_r", "tok_cache_w", "tok_out",
-                "cache_hit", "init", "cost", "waste", "duration", "date")
+                "tokens", "init", "cost", "waste", "rotate",
+                "duration", "date")
         base_headings = {
             "status": "", "project": "Project", "session_name": "Session",
             "model": "Model", "turns": "Turns",
-            "tok_in": "in", "tok_cache_r": "cache_r",
-            "tok_cache_w": "cache_w", "tok_out": "out",
-            "cache_hit": "Cache %",
+            "tokens": "Tokens",
             "init": "Init Tok",
-            "cost": "Est. Cost", "waste": "Waste", "duration": "Duration", "date": "Date",
+            "cost": "Est. Cost", "waste": "Waste",
+            "rotate": "Rotate",
+            "duration": "Duration", "date": "Date",
         }
         for c in cols:
             arrow = ""

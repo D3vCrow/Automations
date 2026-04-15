@@ -2019,7 +2019,6 @@ class App(ctk.CTkFrame):
 
     def _apply_tree_style(self):
         style = ttk.Style(self)
-        style.theme_use("default")
         style.configure(
             "Treeview",
             background="#2b2b2b", foreground="white",
@@ -2030,7 +2029,9 @@ class App(ctk.CTkFrame):
             background="#565b5e", foreground="white",
             relief="flat", font=("Arial", 10, "bold"),
         )
-        style.map("Treeview", background=[("selected", "#1f538d")])
+        style.map("Treeview",
+            background=[("selected", "#1f538d")],
+            foreground=[("selected", "white")])
 
     # ── UI build ──────────────────────────────────────────────────────────────
 
