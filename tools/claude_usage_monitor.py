@@ -423,6 +423,133 @@ def _estimate_tool_cost(in_tokens: int, out_tokens: int, pricing: dict) -> float
     )
 
 
+def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, value))
+
+
+def _rotate_subscores(session: dict) -> dict | None:
+    """Compute the five weighted sub-scores for a session.
+
+    Returns None when the session has fewer than 5 turns. Shape:
+        {
+            "cont_cost": float,
+            "fresh_proj": float,
+            "raw": {subscore: raw_0_100, ...},
+            "weighted": {subscore: weighted_contribution, ...},
+            "total": float,              # 0..100
+            "extras": {                  # supporting values for the explanation
+                "early_eff": float,
+                "late_eff": float,
+                "waste_factor": float | None,
+                "turns": int,
+                "cluster_end": bool,
+            },
+        }
+    """
+    tc = session["turn_costs"]
+    if len(tc) < 5:
+        return None
+
+    first5_costs = [row[1] for row in tc[:5]]
+    last5_costs = [row[1] for row in tc[-5:]]
+    fresh_proj = sum(first5_costs) / len(first5_costs)
+    cont_cost = sum(last5_costs) / len(last5_costs)
+
+    # Savings
+    if cont_cost <= 0:
+        savings_raw = 0.0
+    else:
+        savings_raw = _clamp((cont_cost - fresh_proj) / cont_cost * 100)
+
+    # Waste
+    wf = _waste_factor(tc)
+    waste_raw = _clamp((wf - 1) * 25) if wf is not None else 0.0
+
+    # Cache trend (None when <10 turns)
+    trend = session.get("cache_trend")
+    cache_trend_raw = _clamp(-trend * 200) if trend is not None else 0.0
+
+    # Turn count
+    turns = session["assistant_turns"]
+    turn_count_raw = _clamp(max(0, turns - 25) * 2)
+
+    # Cold cluster
+    cluster_end = bool(session.get("cold_turns_cluster_end"))
+    cold_cluster_raw = 100.0 if cluster_end else 0.0
+
+    raw = {
+        "savings": savings_raw,
+        "waste": waste_raw,
+        "cache_trend": cache_trend_raw,
+        "turn_count": turn_count_raw,
+        "cold_cluster": cold_cluster_raw,
+    }
+    weighted = {
+        "savings": _ROTATE_W_SAVINGS * savings_raw,
+        "waste": _ROTATE_W_WASTE * waste_raw,
+        "cache_trend": _ROTATE_W_CACHE_TREND * cache_trend_raw,
+        "turn_count": _ROTATE_W_TURN_COUNT * turn_count_raw,
+        "cold_cluster": _ROTATE_W_COLD_CLUSTER * cold_cluster_raw,
+    }
+    total = sum(weighted.values())
+
+    # Early / late cache efficiency (recomputed for explanation text; cheap)
+    def window_eff(window):
+        inp = sum(row[2] for row in window)
+        cr = sum(row[4] for row in window)
+        cw = sum(row[5] for row in window)
+        return _cache_efficiency(inp, cr, cw)
+
+    return {
+        "cont_cost": cont_cost,
+        "fresh_proj": fresh_proj,
+        "raw": raw,
+        "weighted": weighted,
+        "total": total,
+        "extras": {
+            "early_eff": window_eff(tc[:5]),
+            "late_eff": window_eff(tc[-5:]),
+            "waste_factor": wf,
+            "turns": turns,
+            "cluster_end": cluster_end,
+        },
+    }
+
+
+def _rotate_pill_state(score: float) -> tuple[str, str]:
+    """Return (label, hex_color) for a pill based on the score."""
+    if score >= _ROTATE_RED:
+        return ("ROTATE NOW", "#cc3333")
+    if score >= _ROTATE_AMBER:
+        return ("CONSIDER ROTATING", "#e09a1a")
+    return ("KEEP GOING", "#2a8a2a")
+
+
+def _rotate_explanation(sub: dict) -> str:
+    """One-line explanation of the dominant weighted factor."""
+    weighted = sub["weighted"]
+    dominant = max(weighted, key=weighted.get)
+    ex = sub["extras"]
+
+    if dominant == "savings":
+        return (
+            f"Last 5 turns avg {_format_cost(sub['cont_cost'])} "
+            f"vs projected fresh {_format_cost(sub['fresh_proj'])}"
+        )
+    if dominant == "waste" and ex["waste_factor"] is not None:
+        return f"Context bloat: last-5 turns use {ex['waste_factor']:.1f}x tokens vs first-5"
+    if dominant == "cache_trend":
+        return (
+            f"Cache efficiency falling: "
+            f"{ex['early_eff'] * 100:.0f}% → {ex['late_eff'] * 100:.0f}%"
+        )
+    if dominant == "turn_count":
+        return f"Long session: {ex['turns']} turns in"
+    if dominant == "cold_cluster":
+        return "Cold turns clustering at session end"
+    return "—"
+
+
 def _friendly_project(dirname: str, cwd: str | None = None) -> str:
     """Convert directory name or cwd path into a readable project name.
 
