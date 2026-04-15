@@ -788,6 +788,17 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         self._model_breakdown_frame = ctk.CTkFrame(breakdown_frame, fg_color="transparent")
         self._model_breakdown_frame.pack(fill="x", padx=12, pady=(0, 10))
 
+        # Tool breakdown
+        tool_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
+        tool_frame.pack(fill="x", padx=8, pady=8)
+        ctk.CTkLabel(
+            tool_frame, text="Cost by Tool (est.)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        self._tool_breakdown_frame = ctk.CTkFrame(tool_frame, fg_color="transparent")
+        self._tool_breakdown_frame.pack(fill="x", padx=12, pady=(0, 10))
+
         # Top projects
         proj_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
         proj_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -1138,6 +1149,39 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             bar.pack_propagate(False)
 
             ctk.CTkLabel(row, text=_format_cost(cost), font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
+
+        # Tool breakdown (aggregate across all sessions)
+        for w in self._tool_breakdown_frame.winfo_children():
+            w.destroy()
+
+        tool_costs: dict[str, float] = {}
+        tool_calls: dict[str, int] = {}
+        for s in self._sessions:
+            for name, st in (s.get("tool_stats") or {}).items():
+                tool_costs[name] = tool_costs.get(name, 0.0) + st["est_cost"]
+                tool_calls[name] = tool_calls.get(name, 0) + st["calls"]
+
+        if not tool_costs:
+            ctk.CTkLabel(
+                self._tool_breakdown_frame, text="No tool usage recorded yet.",
+                font=ctk.CTkFont(size=11), text_color="gray",
+            ).pack(anchor="w", pady=4)
+        else:
+            max_tc = max(tool_costs.values()) if tool_costs else 1.0
+            ranked = sorted(tool_costs.items(), key=lambda kv: -kv[1])[:10]
+            for name, cost in ranked:
+                row = ctk.CTkFrame(self._tool_breakdown_frame, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+
+                ctk.CTkLabel(row, text=name, font=ctk.CTkFont(size=11), width=220, anchor="w").pack(side="left")
+
+                bar_width = max(4, int(250 * (cost / max_tc))) if max_tc > 0 else 4
+                bar = ctk.CTkFrame(row, width=bar_width, height=16, corner_radius=4, fg_color="#9e6a3a")
+                bar.pack(side="left", padx=(8, 4))
+                bar.pack_propagate(False)
+
+                info = f"~{_format_cost(cost)}  ({tool_calls[name]} calls)"
+                ctk.CTkLabel(row, text=info, font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
 
         # Project breakdown
         for w in self._project_breakdown_frame.winfo_children():
