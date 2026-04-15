@@ -1,21 +1,37 @@
 """
 Main.py: Premium Toolbox GUI Application
 Refactored for Grid Layout, Search, and Smart Icons.
+
+Tools are launched as isolated subprocesses via ``tools._runner`` so a
+crashing tool cannot bring down the launcher. Tool discovery uses
+``ast.parse`` to read ``TOOL_NAME`` and the module docstring without
+executing arbitrary code.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+import ast
 import json
-import importlib.util
-import traceback
+import logging
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from typing import Optional
+
 import customtkinter as ctk
-from tkinter import messagebox
 import psutil
+from tkinter import messagebox
+
+from tools._common.logging import get_log_dir, get_logger
 
 # -------------------- Global Configuration --------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOOL_FOLDER = os.path.join(BASE_DIR, "tools")
-FAVORITES_PATH = os.path.join(BASE_DIR, "favorites.json")
+BASE_DIR = Path(__file__).resolve().parent
+TOOL_FOLDER = BASE_DIR / "tools"
+FAVORITES_PATH = BASE_DIR / "favorites.json"
+
+log = get_logger("launcher")
 
 # -------------------- Smart Icon Mapping --------------------
 ICON_MAP = {
@@ -34,35 +50,158 @@ ICON_MAP = {
     "decision": "🤔",
 }
 
-def get_icon(name):
+
+def get_icon(name: str) -> str:
+    """Return an emoji icon for the given tool name."""
     name_lower = name.lower()
     for key, icon in ICON_MAP.items():
         if key in name_lower:
             return icon
     return "🛠️"
 
+
+# -------------------- AST-based tool discovery --------------------
+
+def _extract_string_assign(node: ast.Assign, target_name: str) -> Optional[str]:
+    """Return the string value assigned to *target_name* on this node, else None."""
+    if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+        return None
+    for tgt in node.targets:
+        if isinstance(tgt, ast.Name) and tgt.id == target_name:
+            return node.value.value
+    return None
+
+
+def _parse_tool_metadata(path: Path) -> Optional[dict]:
+    """Parse *path* with ``ast`` and extract TOOL_NAME, TOOL_DESC/description, docstring.
+
+    Args:
+        path: Path to a ``.py`` file under the tools folder.
+
+    Returns:
+        A dict with keys ``name``, ``description``, ``filename``, ``path``,
+        or None if the file is not a valid tool (parse error, no ``TOOL_NAME``,
+        no ``run_tool`` defined).
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        log.warning("failed to read %s: %s", path, exc)
+        return None
+
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        log.warning("failed to parse %s: %s", path, exc)
+        return None
+
+    tool_name: Optional[str] = None
+    tool_desc: Optional[str] = None
+    tool_desc_alt: Optional[str] = None
+    has_run_tool = False
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if tool_name is None:
+                tool_name = _extract_string_assign(node, "TOOL_NAME")
+            if tool_desc is None:
+                tool_desc = _extract_string_assign(node, "TOOL_DESC")
+            if tool_desc_alt is None:
+                tool_desc_alt = _extract_string_assign(node, "TOOL_DESCRIPTION")
+        elif isinstance(node, ast.FunctionDef) and node.name == "run_tool":
+            has_run_tool = True
+
+    if tool_name is None or not has_run_tool:
+        return None
+
+    docstring = ast.get_docstring(tree) or ""
+    description = (tool_desc or tool_desc_alt or "").strip()
+    if not description and docstring:
+        description = docstring.splitlines()[0].strip()
+
+    return {
+        "name": tool_name,
+        "description": description,
+        "filename": path.name,
+        "path": str(path),
+        "id": path.name,
+    }
+
+
+def discover_tools(tool_folder: Path) -> tuple[list[dict], list[dict]]:
+    """Discover tools under *tool_folder* without executing their code.
+
+    Args:
+        tool_folder: Directory containing tool ``.py`` files.
+
+    Returns:
+        Tuple ``(tools, failures)``. ``tools`` is a list of dicts ready for
+        display. ``failures`` is a list of ``{"filename", "error"}`` for
+        files that looked like tools but failed to parse.
+    """
+    tools: list[dict] = []
+    failures: list[dict] = []
+
+    if not tool_folder.is_dir():
+        return tools, failures
+
+    for entry in sorted(tool_folder.iterdir()):
+        if entry.is_dir():
+            continue
+        if entry.suffix != ".py":
+            continue
+        if entry.name.startswith("_"):
+            continue
+
+        try:
+            meta = _parse_tool_metadata(entry)
+        except Exception as exc:  # defensive: AST parsing should not raise
+            log.warning("unexpected error discovering %s: %s", entry, exc)
+            failures.append({"filename": entry.name, "error": str(exc)})
+            continue
+
+        if meta is None:
+            # Could be a non-tool helper, a parse failure, or missing run_tool.
+            # Differentiate by attempting a second parse to report errors clearly.
+            try:
+                ast.parse(entry.read_text(encoding="utf-8"), filename=str(entry))
+            except SyntaxError as exc:
+                failures.append({"filename": entry.name, "error": f"SyntaxError: {exc}"})
+            continue
+
+        tools.append(meta)
+
+    return tools, failures
+
+
 # -------------------- Tool Loading Logic --------------------
 class ToolboxApp(ctk.CTk):
-    def __init__(self):
+    """Main launcher window."""
+
+    def __init__(self) -> None:
         super().__init__()
 
         self.title("Automations Toolbox Pro")
         self.geometry("900x700")
 
-        self.all_tools = []  # list of dicts: {"module", "name", "description", "filename", "favorite"}
-        self.failed_tools = []
-        self.filtered_tools = []
-        self.favorites = self._load_favorites()
-        self._open_tools = {}  # filename -> window reference (for single-instance enforcement)
+        self.all_tools: list[dict] = []
+        self.failed_tools: list[dict] = []
+        self.filtered_tools: list[dict] = []
+        self.favorites: set[str] = self._load_favorites()
+        # Process tracking: tool_id -> Popen (single-instance enforcement)
+        self._tool_procs: dict[str, subprocess.Popen] = {}
+        # Reader threads that drain each subprocess's stderr into a file
+        self._reader_threads: dict[str, threading.Thread] = {}
 
         self._build_sidebar()
         self._build_main_content()
-        
+
         # Initialize
-        self._last_columns = None
-        self._resize_job = None
+        self._last_columns: Optional[int] = None
+        self._resize_job: Optional[str] = None
         self.refresh_tools()
         self._start_stats_loop()
+        self._start_proc_reaper()
 
         # Re-render grid on resize for a responsive layout (column-count based)
         self.bind("<Configure>", self._on_resize)
@@ -72,7 +211,10 @@ class ToolboxApp(ctk.CTk):
         self.bind("<Control-F>", lambda _e: self.search_entry.focus_set())
         self.bind("<Return>", self._launch_first_tool_shortcut)
 
-    def _build_sidebar(self):
+        # Terminate child tools on window close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_sidebar(self) -> None:
         self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar.pack(side="left", fill="y")
 
@@ -82,12 +224,12 @@ class ToolboxApp(ctk.CTk):
         # Stats Section
         self.stats_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         self.stats_frame.pack(pady=20, padx=10, fill="x")
-        
+
         ctk.CTkLabel(self.stats_frame, text="SYSTEM STATS", font=ctk.CTkFont(size=12, weight="bold"), text_color="gray").pack(anchor="w")
-        
+
         self.cpu_label = ctk.CTkLabel(self.stats_frame, text="CPU: 0%", font=ctk.CTkFont(size=13))
         self.cpu_label.pack(anchor="w", pady=2)
-        
+
         self.ram_label = ctk.CTkLabel(self.stats_frame, text="RAM: 0%", font=ctk.CTkFont(size=13))
         self.ram_label.pack(anchor="w", pady=2)
 
@@ -109,10 +251,10 @@ class ToolboxApp(ctk.CTk):
         )
         self.fav_only_chk.pack(pady=(0, 10), padx=20, anchor="w")
 
-        self.quit_btn = ctk.CTkButton(self.sidebar, text="Exit App", command=self.quit, fg_color="#bf3a3a", hover_color="#942b2b")
+        self.quit_btn = ctk.CTkButton(self.sidebar, text="Exit App", command=self._on_close, fg_color="#bf3a3a", hover_color="#942b2b")
         self.quit_btn.pack(side="bottom", pady=20, padx=20)
 
-    def _build_main_content(self):
+    def _build_main_content(self) -> None:
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame.pack(side="right", fill="both", expand=True, padx=20, pady=20)
 
@@ -144,7 +286,7 @@ class ToolboxApp(ctk.CTk):
 
         self.search_var = ctk.StringVar()
         self.search_var.trace_add("write", self._on_search_change)
-        
+
         self.search_entry = ctk.CTkEntry(
             self.header,
             placeholder_text="Search tools by name, description, or filename...",
@@ -183,10 +325,7 @@ class ToolboxApp(ctk.CTk):
         self.grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
     # -------------------- Layout helpers --------------------
-    def _get_column_count(self):
-        """
-        Decide how many columns to use based on available width.
-        """
+    def _get_column_count(self) -> int:
         try:
             width = self.scroll_canvas.winfo_width() or self.content_frame.winfo_width()
         except Exception:
@@ -195,16 +334,11 @@ class ToolboxApp(ctk.CTk):
         if width <= 0:
             return 3
 
-        # Each card is about 210px wide + padding; cap between 1 and 4 columns
         approx_card_plus_margin = 240
         cols = max(1, min(4, width // approx_card_plus_margin))
         return cols or 1
 
-    def _on_resize(self, _event=None):
-        """
-        Only re-render when the effective column count would change,
-        to avoid constant blinking while dragging the window.
-        """
+    def _on_resize(self, _event=None) -> None:
         try:
             new_cols = self._get_column_count()
         except Exception:
@@ -215,273 +349,227 @@ class ToolboxApp(ctk.CTk):
 
         self._last_columns = new_cols
 
-        # Longer debounce for smoother resizing
         if self._resize_job is not None:
             try:
                 self.after_cancel(self._resize_job)
             except Exception:
                 pass
         self._resize_job = self.after(
-            200,  # Increased from 80ms to 200ms for smoother experience
+            200,
             lambda: self._render_tools(self.search_var.get() if hasattr(self, "search_var") else ""),
         )
 
     # -------------------- Favorites persistence --------------------
-    def _load_favorites(self):
+    def _load_favorites(self) -> set[str]:
         try:
-            if not os.path.exists(FAVORITES_PATH):
+            if not FAVORITES_PATH.exists():
                 return set()
-            with open(FAVORITES_PATH, "r", encoding="utf-8") as f:
+            with FAVORITES_PATH.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                return set(str(x) for x in data)
+                return {str(x) for x in data}
         except Exception:
             pass
         return set()
 
-    def _save_favorites(self):
+    def _save_favorites(self) -> None:
         try:
             data = sorted(self.favorites)
-            with open(FAVORITES_PATH, "w", encoding="utf-8") as f:
+            with FAVORITES_PATH.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
 
-    def _launch_first_tool_shortcut(self, _event=None):
+    def _launch_first_tool_shortcut(self, _event=None) -> None:
         if self.filtered_tools:
             self._launch_tool(self.filtered_tools[0])
 
-    def _on_search_change(self, *args):
-        # Debounce search to reduce constant re-rendering
-        if hasattr(self, '_search_job') and self._search_job is not None:
+    def _on_search_change(self, *args) -> None:
+        if hasattr(self, "_search_job") and self._search_job is not None:
             try:
                 self.after_cancel(self._search_job)
             except Exception:
                 pass
-        
+
         self._search_job = self.after(
-            300,  # 300ms debounce for search
-            lambda: self._render_tools(self.search_var.get())
+            300,
+            lambda: self._render_tools(self.search_var.get()),
         )
 
-    def load_tools(self):
+    def load_tools(self) -> list[dict]:
+        """Discover tools and the list of parse failures.
+
+        Returns:
+            A list of tool descriptor dicts.
         """
-        Load toolbox-compatible modules from TOOL_FOLDER.
-        Each tool is represented as a dict: {"module", "name", "description", "filename", "favorite"}.
-        """
-        self.failed_tools = []
-        tools = []
-        if not os.path.exists(TOOL_FOLDER):
-            return tools
-
-        for filename in sorted(os.listdir(TOOL_FOLDER)):
-            if not (filename.endswith(".py") and not filename.startswith("__")):
-                continue
-
-            module_name = filename[:-3]
-            module_path = os.path.join(TOOL_FOLDER, filename)
-            spec = importlib.util.spec_from_file_location(module_name, module_path)
-            module = importlib.util.module_from_spec(spec)
-
-            try:
-                spec.loader.exec_module(module)
-            except Exception as e:
-                # Skip broken tools but keep the launcher responsive
-                print(f"❌ Tool {filename} failed to load: {str(e)}")
-                self.failed_tools.append({
-                    'filename': filename,
-                    'error': str(e),
-                    'traceback': traceback.format_exc()
-                })
-                continue
-
-            if not (hasattr(module, "TOOL_NAME") and hasattr(module, "run_tool")):
-                continue
-
-            name = getattr(module, "TOOL_NAME", module_name)
-
-            # Prefer an explicit TOOL_DESC; fall back to first docstring line if present
-            desc = getattr(module, "TOOL_DESC", "").strip()
-            if not desc:
-                doc = (module.__doc__ or "").strip()
-                if doc:
-                    desc = doc.splitlines()[0].strip()
-
-            tool_id = filename  # unique per tool folder
-
-            tools.append(
-                {
-                    "module": module,
-                    "name": name,
-                    "description": desc,
-                    "filename": filename,
-                    "id": tool_id,
-                    "favorite": tool_id in self.favorites,
-                }
-            )
-
+        tools, failures = discover_tools(TOOL_FOLDER)
+        self.failed_tools = failures
+        for t in tools:
+            t["favorite"] = t["id"] in self.favorites
         return tools
 
-    def refresh_tools(self):
+    def refresh_tools(self) -> None:
         self.all_tools = self.load_tools()
         self._render_tools()
 
-    # -------------------- Tool window helpers --------------------
-    def _tool_window_titles(self, tool_dict):
-        titles = []
-        module = tool_dict.get("module")
-        if module is not None:
-            explicit = getattr(module, "TOOL_WINDOW_TITLE", None)
-            if explicit:
-                titles.append(str(explicit))
-            tn = getattr(module, "TOOL_NAME", None)
-            if tn:
-                titles.append(str(tn))
-        name = tool_dict.get("name")
-        if name:
-            titles.append(str(name))
-        # De-duplicate while preserving order
-        seen = set()
-        out = []
-        for t in titles:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
+    # -------------------- Subprocess plumbing --------------------
+    def _log_path_for(self, tool_id: str, pid: int) -> Path:
+        """Return the stderr log path for ``<tool>-<pid>.log``."""
+        safe = tool_id.replace(os.sep, "_").replace(" ", "_")
+        if safe.endswith(".py"):
+            safe = safe[:-3]
+        return get_log_dir() / f"{safe}-{pid}.log"
 
-    def _find_tool_windows(self, tool_dict):
-        titles = self._tool_window_titles(tool_dict)
-        if not titles:
-            return []
-        windows = []
-        for child in self.winfo_children():
-            try:
-                if isinstance(child, ctk.CTkToplevel):
-                    t = child.title()
-                    if any(t.startswith(tt) for tt in titles):
-                        windows.append(child)
-            except Exception:
-                continue
-        return windows
-
-    def _focus_tool_window(self, tool_dict):
-        wins = self._find_tool_windows(tool_dict)
-        if not wins:
-            return False
-        win = wins[0]
+    def _stderr_reader(self, proc: subprocess.Popen, log_file: Path) -> None:
+        """Drain a subprocess's stderr into ``log_file`` (runs in a thread)."""
         try:
-            # Bring window to front with multiple techniques
-            win.lift()                    # Raise to top
-            win.focus_force()             # Force focus
-            win.attributes("-topmost", True)  # Temporarily make topmost
-            win.after(150, lambda w=win: w.attributes("-topmost", False))  # Remove topmost after brief period
-            
-            # Also try to activate the window
-            try:
-                win.state("normal")
-            except Exception:
-                pass
-                
-            return True
-        except Exception:
-            return False
-
-    def _launch_tool(self, tool_dict):
-        module = tool_dict.get("module")
-        name = tool_dict.get("name", "Tool")
-        filename = tool_dict.get("filename", "")
-
-        # Single-instance check: if tool is already open, focus it
-        if filename in self._open_tools:
-            win = self._open_tools[filename]
-            try:
-                # Check if window still exists
-                if win.winfo_exists():
-                    win.lift()
-                    win.focus_force()
+            with log_file.open("w", encoding="utf-8") as f:
+                assert proc.stderr is not None
+                for line in iter(proc.stderr.readline, b""):
                     try:
-                        win.state("normal")
+                        f.write(line.decode("utf-8", errors="replace"))
+                        f.flush()
                     except Exception:
-                        pass
-                    return
-                else:
-                    # Window was closed, remove from tracking
-                    del self._open_tools[filename]
-            except Exception:
-                del self._open_tools[filename]
+                        break
+        except Exception as exc:
+            log.warning("stderr reader crashed for %s: %s", log_file.name, exc)
 
-        # Fallback: check by window title (CTkToplevel children)
-        if self._focus_tool_window(tool_dict):
+    def _launch_tool(self, tool_dict: dict) -> None:
+        """Spawn the tool as a subprocess. Single-instance: focus existing run instead."""
+        name = tool_dict.get("name", "Tool")
+        tool_id = tool_dict.get("id") or tool_dict.get("filename") or ""
+        path = tool_dict.get("path")
+
+        if not tool_id or not path:
+            messagebox.showerror("Tool launch failed", f"Missing path for '{name}'.")
             return
 
-        if module is None:
-            messagebox.showerror("Tool launch failed", f"Module for '{name}' is not available.")
+        # Single-instance: if the previous process is still alive, do nothing
+        # (cannot reliably focus a child window owned by another OS process
+        # from pure Python on Windows without platform APIs — keep it simple).
+        existing = self._tool_procs.get(tool_id)
+        if existing is not None and existing.poll() is None:
+            messagebox.showinfo(
+                "Already running",
+                f"'{name}' is already running (pid {existing.pid}).",
+            )
             return
+
+        # Purge any stale entry before spawning a new process.
+        self._tool_procs.pop(tool_id, None)
 
         try:
-            # Snapshot windows before launch
-            before = set()
-            for child in self.winfo_children():
-                try:
-                    before.add(id(child))
-                except Exception:
-                    pass
-            # Also check all toplevels
-            before_toplevels = set()
-            try:
-                for w in self.winfo_toplevel().winfo_children():
-                    before_toplevels.add(id(w))
-            except Exception:
-                pass
-
-            # Launch the tool
-            module.run_tool()
-
-            # Find the new window and track it
-            self.after(300, lambda: self._track_new_window(tool_dict, before, before_toplevels))
-
-        except Exception as e:
+            creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "tools._runner", str(path)],
+                cwd=str(BASE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=creation_flags,
+            )
+        except Exception as exc:
+            log.exception("failed to spawn %s", tool_id)
             messagebox.showerror(
                 "Tool launch failed",
-                f"An error occurred while launching '{name}':\n\n{e}",
+                f"An error occurred while launching '{name}':\n\n{exc}",
             )
-
-    def _track_new_window(self, tool_dict, before_ids, before_toplevels):
-        """Find and track the newly opened tool window for single-instance enforcement."""
-        filename = tool_dict.get("filename", "")
-        if not filename:
             return
 
-        # Check CTkToplevel children of main window
-        for child in self.winfo_children():
-            try:
-                if id(child) not in before_ids and isinstance(child, (ctk.CTkToplevel, tk.Toplevel)):
-                    self._open_tools[filename] = child
-                    return
-            except Exception:
-                continue
+        self._tool_procs[tool_id] = proc
+        log_file = self._log_path_for(tool_id, proc.pid)
 
-        # Check all toplevels (for tools that create CTk() roots)
+        reader = threading.Thread(
+            target=self._stderr_reader,
+            args=(proc, log_file),
+            daemon=True,
+            name=f"stderr-{tool_id}",
+        )
+        reader.start()
+        self._reader_threads[tool_id] = reader
+
+        log.info("spawned %s pid=%d log=%s", tool_id, proc.pid, log_file)
+
+    def _start_proc_reaper(self) -> None:
+        """Poll every 500ms for exited children so we can surface crash toasts."""
+        self._reap_dead_procs()
         try:
-            for w in self.tk.call('winfo', 'children', '.'):
-                pass
+            self.after(500, self._start_proc_reaper)
         except Exception:
+            # The app is being torn down; stop polling.
             pass
 
-        # Fallback: match by window title
-        titles = self._tool_window_titles(tool_dict)
-        wins = self._find_tool_windows(tool_dict)
-        if wins:
-            self._open_tools[filename] = wins[0]
+    def _reap_dead_procs(self) -> None:
+        for tool_id, proc in list(self._tool_procs.items()):
+            rc = proc.poll()
+            if rc is None:
+                continue
+            self._tool_procs.pop(tool_id, None)
+            if rc != 0:
+                self._notify_crash(tool_id, proc.pid, rc)
+            else:
+                log.info("tool %s exited cleanly pid=%d", tool_id, proc.pid)
 
-    def _render_tools(self, filter_query=""):
+    def _notify_crash(self, tool_id: str, pid: int, rc: int) -> None:
+        """Surface a crash to the user and point at the log file."""
+        log_file = self._log_path_for(tool_id, pid)
+        display_name = tool_id
+        for t in self.all_tools:
+            if t.get("id") == tool_id:
+                display_name = t.get("name") or tool_id
+                break
+        log.warning("tool %s exited rc=%d pid=%d", tool_id, rc, pid)
+
+        message = (
+            f"'{display_name}' exited unexpectedly (code {rc}).\n\n"
+            f"Log: {log_file}\n\n"
+            f"Open log folder?"
+        )
+        try:
+            open_folder = messagebox.askyesno(
+                f"{display_name} exited unexpectedly",
+                message,
+            )
+        except Exception:
+            return
+
+        if open_folder:
+            self._open_path(log_file.parent)
+
+    @staticmethod
+    def _open_path(path: Path) -> None:
+        """Open *path* in the platform's file explorer."""
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            log.warning("could not open %s: %s", path, exc)
+
+    def _on_close(self) -> None:
+        """Terminate running tools (best effort) and exit cleanly."""
+        for tool_id, proc in list(self._tool_procs.items()):
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        self.quit()
+
+    def _render_tools(self, filter_query: str = "") -> None:
         # Clear current grid
         for child in self.grid_frame.winfo_children():
             child.destroy()
 
         # Build filtered list
         fq = (filter_query or "").strip().lower()
-        base = []
+        base: list[dict] = []
         if fq:
             for t in self.all_tools:
                 name = t["name"].lower()
@@ -526,7 +614,6 @@ class ToolboxApp(ctk.CTk):
             return
 
         columns = self._get_column_count()
-        # Ensure grid columns expand evenly
         for c in range(columns):
             self.grid_frame.grid_columnconfigure(c, weight=1)
 
@@ -569,7 +656,6 @@ class ToolboxApp(ctk.CTk):
                     t["favorite"] = True
                     btn.configure(text="★")
                 self._save_favorites()
-                # Delayed re-render to avoid immediate visual disruption
                 self.after(100, lambda: self._render_tools(self.search_var.get()))
 
             fav_btn.configure(command=toggle_fav)
@@ -594,10 +680,10 @@ class ToolboxApp(ctk.CTk):
                 )
                 desc_lbl.pack(pady=(0, 4), padx=10)
 
-            run_btn = ctk.CTkButton(card, text="Launch", width=120, height=32, corner_radius=16, 
-                                   command=lambda t=tool: self._launch_tool(t),
-                                   fg_color="transparent", border_width=2,
-                                   hover_color="#3a7ebf")
+            run_btn = ctk.CTkButton(card, text="Launch", width=120, height=32, corner_radius=16,
+                                    command=lambda t=tool: self._launch_tool(t),
+                                    fg_color="transparent", border_width=2,
+                                    hover_color="#3a7ebf")
             run_btn.pack(side="bottom", pady=(4, 8))
 
             # Hover effects — bind on the card and all its children to avoid flicker
@@ -609,7 +695,7 @@ class ToolboxApp(ctk.CTk):
 
             _bind_hover(card, card)
 
-    def _start_stats_loop(self):
+    def _start_stats_loop(self) -> None:
         def poll():
             try:
                 cpu = psutil.cpu_percent()
@@ -621,77 +707,72 @@ class ToolboxApp(ctk.CTk):
             self.after(2000, poll)
         poll()
 
-    def show_troubleshooting(self):
-        """Show troubleshooting information for failed tools"""
+    def show_troubleshooting(self) -> None:
+        """Show troubleshooting information for failed tools."""
         troubleshoot_window = ctk.CTkToplevel(self)
         troubleshoot_window.title("Tool Troubleshooting")
         troubleshoot_window.geometry("600x400")
-        
-        # Main frame
+
         main_frame = ctk.CTkFrame(troubleshoot_window)
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Title
+
         title = ctk.CTkLabel(main_frame, text="🔧 Tool Troubleshooting", font=ctk.CTkFont(size=18, weight="bold"))
         title.pack(pady=(0, 20))
-        
-        # Create scrollable frame
+
         scroll_frame = ctk.CTkScrollableFrame(main_frame, height=300)
         scroll_frame.pack(fill="both", expand=True)
-        
-        # System info
+
         info_frame = ctk.CTkFrame(scroll_frame)
         info_frame.pack(fill="x", pady=(0, 10))
-        
+
         ctk.CTkLabel(info_frame, text="📊 System Information", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
-        
+
         system_info = [
             f"Python Version: {sys.version}",
             f"Platform: {sys.platform}",
             f"Tools Folder: {TOOL_FOLDER}",
-            f"Tools Folder Exists: {os.path.exists(TOOL_FOLDER)}",
+            f"Tools Folder Exists: {TOOL_FOLDER.exists()}",
+            f"Log Folder: {get_log_dir()}",
         ]
-        
+
         for info in system_info:
             ctk.CTkLabel(info_frame, text=f"• {info}", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=2)
-        
-        # Failed tools
+
         if self.failed_tools:
             failed_frame = ctk.CTkFrame(scroll_frame)
             failed_frame.pack(fill="x", pady=(0, 10))
-            
+
             ctk.CTkLabel(failed_frame, text="❌ Failed Tools", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
-            
+
             for tool in self.failed_tools:
                 tool_info = ctk.CTkFrame(failed_frame)
                 tool_info.pack(fill="x", padx=20, pady=5)
-                
+
                 ctk.CTkLabel(tool_info, text=f"📁 {tool['filename']}", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(5, 2))
-                ctk.CTkLabel(tool_info, text=f"⚠️ Error: {tool['error']}", font=ctk.CTkFont(size=10), text_color="red").pack(anchor="w", padx=20, pady=2)
-                tb_label = ctk.CTkLabel(tool_info, text=tool['traceback'], font=ctk.CTkFont(size=9, family="Consolas"), text_color="orange", justify="left", wraplength=500)
-                tb_label.pack(anchor="w", padx=20, pady=(2, 5))
+                ctk.CTkLabel(tool_info, text=f"⚠️ Error: {tool['error']}", font=ctk.CTkFont(size=10), text_color="red").pack(anchor="w", padx=20, pady=(2, 5))
         else:
             success_frame = ctk.CTkFrame(scroll_frame)
             success_frame.pack(fill="x", pady=(0, 10))
-            
+
             ctk.CTkLabel(success_frame, text="✅ All Tools Loaded Successfully", font=ctk.CTkFont(size=14, weight="bold"), text_color="green").pack(anchor="w", padx=10, pady=10)
             ctk.CTkLabel(success_frame, text="No tool loading errors detected.", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 10))
-        
-        # Successful tools
+
         success_count = len(self.all_tools)
-        total_files = len([f for f in os.listdir(TOOL_FOLDER) if f.endswith('.py') and not f.startswith('__')]) if os.path.exists(TOOL_FOLDER) else 0
-        
+        total_files = 0
+        if TOOL_FOLDER.exists():
+            total_files = len([f for f in TOOL_FOLDER.iterdir() if f.suffix == ".py" and not f.name.startswith("_")])
+
         stats_frame = ctk.CTkFrame(scroll_frame)
         stats_frame.pack(fill="x", pady=(0, 10))
-        
+
         ctk.CTkLabel(stats_frame, text="📈 Loading Statistics", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
         ctk.CTkLabel(stats_frame, text=f"• Total Python files: {total_files}", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=2)
         ctk.CTkLabel(stats_frame, text=f"• Successfully loaded: {success_count}", font=ctk.CTkFont(size=11), text_color="green").pack(anchor="w", padx=20, pady=2)
         ctk.CTkLabel(stats_frame, text=f"• Failed to load: {len(self.failed_tools)}", font=ctk.CTkFont(size=11), text_color="red").pack(anchor="w", padx=20, pady=(2, 10))
-        
-        # Close button
+
         close_btn = ctk.CTkButton(main_frame, text="Close", command=troubleshoot_window.destroy, fg_color="#3a7ebf", hover_color="#2b6194")
         close_btn.pack(pady=(20, 0))
+
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("Dark")
