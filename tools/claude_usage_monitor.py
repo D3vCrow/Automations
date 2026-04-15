@@ -934,6 +934,23 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             v.pack(pady=(0, 6), padx=6)
             self._detail_card_widgets[key] = v
 
+        # Second cards row — rotation signals
+        self._detail_cards2_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self._detail_cards2_frame.pack(fill="x", padx=8, pady=(0, 4))
+
+        for i, (key, label) in enumerate([
+            ("d_cache_eff", "Cache Eff"),
+            ("d_cold_turns", "Cold Turns"),
+            ("d_cache_trend", "Cache Trend"),
+        ]):
+            card = ctk.CTkFrame(self._detail_cards2_frame, corner_radius=8, fg_color="#2b2b2b")
+            card.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
+            self._detail_cards2_frame.grid_columnconfigure(i, weight=1)
+            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=10), text_color="gray").pack(pady=(6, 1), padx=6)
+            v = ctk.CTkLabel(card, text="—", font=ctk.CTkFont(size=15, weight="bold"))
+            v.pack(pady=(0, 6), padx=6)
+            self._detail_card_widgets[key] = v
+
         # Cost growth chart (text-based sparkline)
         chart_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
         chart_frame.pack(fill="x", padx=8, pady=4)
@@ -1390,6 +1407,43 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             self._detail_card_widgets["d_waste"].configure(text=waste_text, text_color=color)
         else:
             self._detail_card_widgets["d_waste"].configure(text="—", text_color="gray")
+
+        # Cache Eff card
+        cache_eff = _cache_efficiency(
+            s["total_input"], s["total_cache_read"], s["total_cache_write"]
+        )
+        self._detail_card_widgets["d_cache_eff"].configure(
+            text=f"{cache_eff * 100:.0f}%",
+            text_color=("#44cc44" if cache_eff >= 0.6
+                        else "#e0b020" if cache_eff >= 0.3
+                        else "#ff4444"),
+        )
+
+        # Cold Turns card
+        total_turns = s["assistant_turns"]
+        cold_n = s["cold_turn_count"]
+        cold_pct = (cold_n / total_turns * 100.0) if total_turns else 0.0
+        self._detail_card_widgets["d_cold_turns"].configure(
+            text=f"{cold_n} / {total_turns}  ({cold_pct:.0f}%)",
+            text_color=("#ff4444" if cold_pct >= 40
+                        else "#e0b020" if cold_pct >= 20
+                        else "#44cc44"),
+        )
+
+        # Cache Trend card
+        trend = s.get("cache_trend")
+        if trend is None:
+            self._detail_card_widgets["d_cache_trend"].configure(text="—", text_color="gray")
+        elif trend > 0.02:
+            self._detail_card_widgets["d_cache_trend"].configure(
+                text=f"↑ {trend * 100:.0f}%", text_color="#44cc44",
+            )
+        elif trend < -0.02:
+            self._detail_card_widgets["d_cache_trend"].configure(
+                text=f"↓ {abs(trend) * 100:.0f}%", text_color="#ff4444",
+            )
+        else:
+            self._detail_card_widgets["d_cache_trend"].configure(text="—", text_color="gray")
 
         # Chart
         self._draw_chart(s["turn_costs"])
