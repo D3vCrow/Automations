@@ -47,6 +47,8 @@ import requests
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set
 
+from tools._common.threadsafe import SnapshotDict
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
@@ -122,7 +124,7 @@ def safe_run(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
 # IP Geolocation & 5-level Connection Classification
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ip_geo_cache: Dict[str, Dict] = {}
+_ip_geo_cache: SnapshotDict = SnapshotDict()
 
 # Countries that warrant SUSPICIOUS classification (user may legitimately use
 # VPN exit nodes here — we flag but do NOT auto-escalate to DANGEROUS)
@@ -243,11 +245,11 @@ SUSPICIOUS_AUDIO_PROCESSES: Set[str] = {
 
 
 def get_ip_geolocation(ip: str) -> Dict[str, str]:
-    global _ip_geo_cache
     if is_private_ip(ip):
         return {"country": "Local", "region": "LAN", "city": "Private", "org": "", "trust": "safe"}
-    if ip in _ip_geo_cache:
-        return _ip_geo_cache[ip]
+    cached = _ip_geo_cache.get(ip)
+    if cached is not None:
+        return cached
     if len(_ip_geo_cache) > 2000:
         _ip_geo_cache.clear()
     try:
@@ -2019,7 +2021,6 @@ class App(ctk.CTkFrame):
 
     def _apply_tree_style(self):
         style = ttk.Style(self)
-        style.theme_use("default")
         style.configure(
             "Treeview",
             background="#2b2b2b", foreground="white",
@@ -2030,7 +2031,9 @@ class App(ctk.CTkFrame):
             background="#565b5e", foreground="white",
             relief="flat", font=("Arial", 10, "bold"),
         )
-        style.map("Treeview", background=[("selected", "#1f538d")])
+        style.map("Treeview",
+            background=[("selected", "#1f538d")],
+            foreground=[("selected", "white")])
 
     # ── UI build ──────────────────────────────────────────────────────────────
 

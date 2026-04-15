@@ -15,26 +15,69 @@ Safely frees disk space and optimises RAM.
 Dependencies (already in venv): customtkinter, psutil
 """
 
+import argparse
 import ctypes
 import ctypes.wintypes
 import glob
+import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from datetime import timedelta
+from enum import Enum
+from pathlib import Path
 from tkinter import messagebox
+from typing import Callable, List, Optional
 
 import customtkinter as ctk
 import psutil
+
+try:  # send2trash is the default (safe) delete path; optional at import time
+    from send2trash import send2trash as _send2trash  # type: ignore
+    _HAS_SEND2TRASH = True
+except Exception:
+    _send2trash = None  # type: ignore
+    _HAS_SEND2TRASH = False
 
 # ──────────────────────────────────────────────
 TOOL_NAME = "System Cleaner Pro"
 TOOL_DESC = "Safely free disk space and optimise RAM — preview sizes before deleting"
 
 _CREATE_NO_WINDOW = 0x08000000
+
+
+# ──────────────────────────────────────────────
+# Deletion mode
+# ──────────────────────────────────────────────
+class DeleteMode(Enum):
+    """Controls how `_delete_dir_contents` and `_delete_glob_files` touch disk.
+
+    Attributes:
+        DRY_RUN: Accumulate size only; do not touch disk.
+        TRASH: Move entries to the OS recycle bin via send2trash (default).
+        PERMANENT: Unlink/rmtree with narrow error handling (legacy behavior).
+    """
+
+    DRY_RUN = "dry_run"
+    TRASH = "trash"
+    PERMANENT = "permanent"
+
+
+DEFAULT_DELETE_MODE = DeleteMode.TRASH
+
+
+def _log_struct(event: str, **fields) -> None:
+    """Emit a structured JSON log line to stderr (pre-A4 shared logger)."""
+    try:
+        payload = {"event": event, **fields}
+        print(json.dumps(payload, default=str), file=sys.stderr)
+    except Exception:
+        # Never let logging raise.
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -82,42 +125,166 @@ def _dir_size(path: str) -> int:
     return total
 
 
-def _delete_dir_contents(path: str, log_cb) -> int:
-    """Delete everything inside `path` (not the folder itself). Returns bytes freed."""
-    if not os.path.isdir(path):
+def _delete_dir_contents(
+    path: str,
+    log_cb: Callable[[str], None],
+    mode: DeleteMode = DEFAULT_DELETE_MODE,
+) -> int:
+    """Delete everything inside ``path`` (not the folder itself).
+
+    Symlinks are always skipped (never followed) to avoid escaping the
+    target directory. Behavior branches on ``mode``:
+
+    * ``DRY_RUN``  — accumulate size only, do not touch disk.
+    * ``TRASH``    — move each entry to the recycle bin via ``send2trash``.
+    * ``PERMANENT`` — unlink/rmtree with narrow per-entry error handling.
+
+    Args:
+        path: Absolute directory whose contents should be removed.
+        log_cb: Callback that receives human-readable status lines.
+        mode: Delete strategy (see :class:`DeleteMode`).
+
+    Returns:
+        Total bytes "freed" (in DRY_RUN, bytes that *would* be freed).
+    """
+    if not path or not os.path.isdir(path):
         log_cb(f"  Not found: {path}")
         return 0
+
+    if mode is DeleteMode.TRASH and not _HAS_SEND2TRASH:
+        log_cb("  send2trash not installed -- nothing deleted (install: pip install send2trash)")
+        _log_struct("send2trash_missing", path=path)
+        return 0
+
     freed = 0
     skipped = 0
     try:
-        for entry in os.listdir(path):
-            full = os.path.join(path, entry)
-            try:
-                size = _dir_size(full) if os.path.isdir(full) else os.path.getsize(full)
-                if os.path.isdir(full):
-                    shutil.rmtree(full, ignore_errors=True)
-                else:
-                    os.remove(full)
-                freed += size
-            except Exception:
-                skipped += 1
-    except Exception as exc:
+        entries = os.listdir(path)
+    except OSError as exc:
         log_cb(f"  Error listing {path}: {exc}")
+        _log_struct("listdir_failed", path=path, errno=getattr(exc, "errno", None), error=str(exc))
+        return 0
+
+    for entry in entries:
+        full = os.path.join(path, entry)
+
+        # Symlink safety: never follow, never delete.
+        if os.path.islink(full):
+            log_cb(f"  Skipped symlink: {entry}")
+            _log_struct("symlink_skipped", path=full)
+            continue
+
+        try:
+            size = _dir_size(full) if os.path.isdir(full) else os.path.getsize(full)
+        except OSError as exc:
+            skipped += 1
+            _log_struct("stat_failed", path=full, errno=getattr(exc, "errno", None))
+            continue
+
+        if mode is DeleteMode.DRY_RUN:
+            freed += size
+            continue
+
+        if mode is DeleteMode.TRASH:
+            try:
+                _send2trash(full)
+                freed += size
+            except Exception as exc:  # send2trash raises its own TrashPermissionError etc.
+                skipped += 1
+                _log_struct(
+                    "trash_failed",
+                    path=full,
+                    error=str(exc),
+                    errno=getattr(exc, "errno", None),
+                )
+            continue
+
+        # PERMANENT
+        try:
+            if os.path.isdir(full):
+                shutil.rmtree(full)
+            else:
+                os.remove(full)
+            freed += size
+        except (OSError, PermissionError) as exc:
+            skipped += 1
+            _log_struct(
+                "permanent_delete_failed",
+                path=full,
+                errno=getattr(exc, "errno", None),
+                error=str(exc),
+            )
+
     if skipped:
-        log_cb(f"  Skipped {skipped} locked/protected file(s)")
+        log_cb(f"  Skipped {skipped} locked/protected entry(ies)")
     return freed
 
 
-def _delete_glob_files(pattern: str, log_cb) -> int:
+def _delete_glob_files(
+    pattern: str,
+    log_cb: Callable[[str], None],
+    mode: DeleteMode = DEFAULT_DELETE_MODE,
+) -> int:
+    """Delete files matching ``pattern`` (symlinks skipped).
+
+    Args:
+        pattern: Glob pattern expanded via :mod:`glob`.
+        log_cb: Callback for human-readable status lines.
+        mode: See :class:`DeleteMode`.
+
+    Returns:
+        Total bytes freed (or that would be freed in DRY_RUN).
+    """
+    if mode is DeleteMode.TRASH and not _HAS_SEND2TRASH:
+        log_cb("  send2trash not installed -- nothing deleted (install: pip install send2trash)")
+        _log_struct("send2trash_missing", pattern=pattern)
+        return 0
+
     freed = 0
     skipped = 0
     for fp in glob.glob(pattern):
+        if os.path.islink(fp):
+            log_cb(f"  Skipped symlink: {os.path.basename(fp)}")
+            _log_struct("symlink_skipped", path=fp)
+            continue
         try:
             size = os.path.getsize(fp)
+        except OSError as exc:
+            skipped += 1
+            _log_struct("stat_failed", path=fp, errno=getattr(exc, "errno", None))
+            continue
+
+        if mode is DeleteMode.DRY_RUN:
+            freed += size
+            continue
+
+        if mode is DeleteMode.TRASH:
+            try:
+                _send2trash(fp)
+                freed += size
+            except Exception as exc:
+                skipped += 1
+                _log_struct(
+                    "trash_failed",
+                    path=fp,
+                    error=str(exc),
+                    errno=getattr(exc, "errno", None),
+                )
+            continue
+
+        # PERMANENT
+        try:
             os.remove(fp)
             freed += size
-        except Exception:
+        except (OSError, PermissionError) as exc:
             skipped += 1
+            _log_struct(
+                "permanent_delete_failed",
+                path=fp,
+                errno=getattr(exc, "errno", None),
+                error=str(exc),
+            )
+
     if skipped:
         log_cb(f"  Skipped {skipped} locked file(s)")
     return freed
@@ -389,6 +556,7 @@ class App(ctk.CTkFrame):
         self._size_cache:   dict = {}
         self._size_labels:  dict = {}
         self._total_freed       = 0
+        self._cancel_flag     = threading.Event()
 
         self._build_ui()
         self.after(300, self._start_size_scan)
@@ -532,6 +700,25 @@ class App(ctk.CTkFrame):
             command=self._clean_selected,
         )
         self._clean_btn.pack(fill="x", padx=8, pady=(6, 0))
+
+        # Preview (dry-run) + Cancel
+        action_row = ctk.CTkFrame(left, fg_color="transparent")
+        action_row.pack(fill="x", padx=8, pady=(4, 0))
+
+        self._preview_btn = ctk.CTkButton(
+            action_row, text="Preview (dry-run)",
+            fg_color="#394b6e", hover_color="#2a3955",
+            command=self._preview_selected,
+        )
+        self._preview_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self._cancel_btn = ctk.CTkButton(
+            action_row, text="Cancel",
+            fg_color="#8c3030", hover_color="#611f1f",
+            command=self._cancel_clean,
+            state="disabled",
+        )
+        self._cancel_btn.pack(side="left", fill="x", expand=True)
 
         # == Left: RAM section ==
         sep = ctk.CTkFrame(left, height=1, fg_color="#444444")
@@ -752,6 +939,59 @@ class App(ctk.CTkFrame):
     # ──────────────────────────────────────────
     # Cleaning
     # ──────────────────────────────────────────
+    def _describe_target(self, cat: dict) -> str:
+        """Return a human-readable target path for the confirmation dialog."""
+        ctype = cat["type"]
+        if ctype == "dir_contents":
+            return cat.get("path") or "(none)"
+        if ctype == "recycle_bin":
+            return "Recycle Bin (all drives)"
+        if ctype == "firefox_cache":
+            paths = _resolve_firefox_cache_paths()
+            return ", ".join(paths) if paths else "(no Firefox profiles found)"
+        if ctype == "gpu_shader":
+            paths = _resolve_gpu_shader_paths()
+            return ", ".join(paths) if paths else "(none)"
+        if ctype == "thumbcache":
+            return os.path.join(
+                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Explorer"),
+                "thumbcache_*.db",
+            )
+        if ctype == "delivery_opt":
+            return os.path.expandvars(
+                r"%SYSTEMROOT%\ServiceProfiles\NetworkService"
+                r"\AppData\Local\Microsoft\Windows\DeliveryOptimization"
+            )
+        if ctype == "event_logs":
+            return "wevtutil cl (Application, System, Security, Setup)"
+        if ctype == "clipboard":
+            return "Windows clipboard"
+        if ctype == "dns_flush":
+            return "ipconfig /flushdns"
+        return "(n/a)"
+
+    def _build_confirmation_body(self, selected: list, mode: DeleteMode) -> str:
+        """Compose the confirmation-dialog body with per-category size + path + badge."""
+        lines = [f"Clean {len(selected)} selected item(s)?", ""]
+        trash_badge = "[Recycle Bin]" if mode is DeleteMode.TRASH else "[PERMANENT]"
+        for cat in selected:
+            key = cat["key"]
+            size = self._size_cache.get(key)
+            if cat["type"] in _NO_SIZE_TYPES or size is None:
+                size_txt = "n/a"
+            else:
+                size_txt = format_size(size)
+            target = self._describe_target(cat)
+            lines.append(f"- {cat['label']}  {trash_badge}")
+            lines.append(f"    size: {size_txt}")
+            lines.append(f"    path: {target}")
+        lines.append("")
+        if mode is DeleteMode.TRASH:
+            lines.append("Files go to the Recycle Bin and can be restored.")
+        else:
+            lines.append("PERMANENT delete -- this cannot be undone.")
+        return "\n".join(lines)
+
     def _clean_selected(self):
         if self._is_cleaning or self._is_scanning:
             return
@@ -759,54 +999,111 @@ class App(ctk.CTkFrame):
         if not selected:
             messagebox.showinfo("Nothing selected", "Please select at least one item to clean.")
             return
-        labels = "\n".join(f"  - {c['label']}" for c in selected)
-        if not messagebox.askyesno(
-            "Confirm Clean",
-            f"Clean {len(selected)} selected item(s)?\n\n{labels}\n\nThis cannot be undone.",
-            parent=self.parent,
-        ):
+
+        mode = DEFAULT_DELETE_MODE
+        if mode is DeleteMode.TRASH and not _HAS_SEND2TRASH:
+            messagebox.showwarning(
+                "send2trash missing",
+                "send2trash is not installed. Install with:\n\n"
+                "    pip install send2trash\n\n"
+                "Falling back to Preview (dry-run) instead.",
+                parent=self.parent,
+            )
+            self._preview_selected()
             return
+
+        body = self._build_confirmation_body(selected, mode)
+        if not messagebox.askyesno("Confirm Clean", body, parent=self.parent):
+            return
+
+        self._start_worker(selected, mode)
+
+    def _preview_selected(self):
+        if self._is_cleaning or self._is_scanning:
+            return
+        selected = [c for c in CATEGORIES if self._check_vars[c["key"]].get()]
+        if not selected:
+            messagebox.showinfo("Nothing selected", "Please select at least one item to preview.")
+            return
+        self._start_worker(selected, DeleteMode.DRY_RUN)
+
+    def _cancel_clean(self):
+        """Signal the worker thread to stop between categories."""
+        if not self._is_cleaning:
+            return
+        self._cancel_flag.set()
+        self._log("  [Cancel requested -- will stop after current category]")
+
+    def _start_worker(self, selected: list, mode: DeleteMode) -> None:
+        self._cancel_flag.clear()
         self._is_cleaning = True
         self._clean_btn.configure(state="disabled", text="Cleaning...")
+        self._preview_btn.configure(state="disabled")
+        self._cancel_btn.configure(state="normal")
+        header = "Preview (dry-run)" if mode is DeleteMode.DRY_RUN else f"Clean ({mode.value})"
         self._log("=" * 45)
-        self._log(f"Starting clean -- {len(selected)} item(s) selected")
+        self._log(f"Starting {header} -- {len(selected)} item(s) selected")
         self._log("=" * 45)
-        threading.Thread(target=self._clean_worker, args=(selected,), daemon=True).start()
+        threading.Thread(
+            target=self._clean_worker, args=(selected, mode), daemon=True
+        ).start()
 
-    def _clean_worker(self, selected: list):
+    def _clean_worker(self, selected: list, mode: DeleteMode):
         session_freed = 0
+        cleaned_count = 0
+        remaining: list = []
         for cat in selected:
+            if self._cancel_flag.is_set():
+                remaining.append(cat["label"])
+                continue
             self._log(f"\n-- {cat['label']} --")
-            freed = self._run_category_clean(cat)
+            freed = self._run_category_clean(cat, mode)
             session_freed += freed
+            cleaned_count += 1
             if cat["type"] not in _NO_SIZE_TYPES:
-                self._log(f"  Freed: {format_size(freed)}")
+                label = "Would free" if mode is DeleteMode.DRY_RUN else "Freed"
+                self._log(f"  {label}: {format_size(freed)}")
 
-        self._total_freed += session_freed
+        if mode is not DeleteMode.DRY_RUN:
+            self._total_freed += session_freed
+
         self._log(f"\n{'=' * 45}")
-        self._log(f"Done! Freed {format_size(session_freed)} this run")
-        self._log(f"   Session total: {format_size(self._total_freed)}")
+        if remaining:
+            self._log(f"Cancelled. Cleaned {cleaned_count}, remaining: {', '.join(remaining)}")
+        else:
+            verb = "Would free" if mode is DeleteMode.DRY_RUN else "Freed"
+            self._log(f"Done! {verb} {format_size(session_freed)} this run")
+        if mode is not DeleteMode.DRY_RUN:
+            self._log(f"   Session total: {format_size(self._total_freed)}")
         self._log(f"{'=' * 45}\n")
-        self.after(0, self._clean_done)
+        self.after(0, lambda: self._clean_done(mode))
 
-    def _clean_done(self):
+    def _clean_done(self, mode: DeleteMode):
         self._is_cleaning = False
+        self._cancel_flag.clear()
         self._clean_btn.configure(state="normal", text="Clean Selected")
+        self._preview_btn.configure(state="normal")
+        self._cancel_btn.configure(state="disabled")
         self._total_label.configure(text=format_size(self._total_freed))
-        self.after(300, self._start_size_scan)
+        if mode is not DeleteMode.DRY_RUN:
+            self.after(300, self._start_size_scan)
 
-    def _run_category_clean(self, cat: dict) -> int:
+    def _run_category_clean(self, cat: dict, mode: DeleteMode = DEFAULT_DELETE_MODE) -> int:
         ctype = cat["type"]
         log   = self._log
+        dry   = mode is DeleteMode.DRY_RUN
 
         if ctype == "dir_contents":
             if cat["admin"] and not self._is_admin:
                 log("  Skipped -- requires Administrator")
                 return 0
-            return _delete_dir_contents(cat["path"], log)
+            return _delete_dir_contents(cat["path"], log, mode)
 
         if ctype == "recycle_bin":
             size = _query_recycle_bin_size()
+            if dry:
+                log(f"  [dry-run] Would empty Recycle Bin ({format_size(size)})")
+                return size
             try:
                 ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 0x00000007)
                 log("  Recycle Bin emptied")
@@ -822,7 +1119,7 @@ class App(ctk.CTkFrame):
                 return 0
             total = 0
             for p in paths:
-                total += _delete_dir_contents(p, log)
+                total += _delete_dir_contents(p, log, mode)
             return total
 
         if ctype == "gpu_shader":
@@ -836,7 +1133,7 @@ class App(ctk.CTkFrame):
                          "AMD" if "AMD" in p.upper() else \
                          "Intel" if "INTEL" in p.upper() else "D3D"
                 log(f"  Cleaning {vendor}: {os.path.basename(p)}")
-                total += _delete_dir_contents(p, log)
+                total += _delete_dir_contents(p, log, mode)
             return total
 
         if ctype == "thumbcache":
@@ -844,8 +1141,8 @@ class App(ctk.CTkFrame):
                 os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Explorer"),
                 "thumbcache_*.db"
             )
-            freed = _delete_glob_files(pattern, log)
-            if freed == 0:
+            freed = _delete_glob_files(pattern, log, mode)
+            if freed == 0 and not dry:
                 log("  Thumbcache files are locked while Explorer runs")
                 log("  Use 'Restart Explorer' button to unlock them")
             return freed
@@ -854,6 +1151,13 @@ class App(ctk.CTkFrame):
             if not self._is_admin:
                 log("  Skipped -- requires Administrator")
                 return 0
+            if dry:
+                do_path = os.path.expandvars(
+                    r"%SYSTEMROOT%\ServiceProfiles\NetworkService"
+                    r"\AppData\Local\Microsoft\Windows\DeliveryOptimization"
+                )
+                log(f"  [dry-run] Would clear Delivery Optimisation cache ({do_path})")
+                return _delete_dir_contents(do_path, log, mode) if os.path.isdir(do_path) else 0
             try:
                 result = subprocess.run(
                     ["powershell", "-NoProfile", "-Command",
@@ -871,7 +1175,7 @@ class App(ctk.CTkFrame):
                         r"\AppData\Local\Microsoft\Windows\DeliveryOptimization"
                     )
                     if os.path.isdir(do_path):
-                        return _delete_dir_contents(do_path, log)
+                        return _delete_dir_contents(do_path, log, mode)
                     log("  No Delivery Optimisation cache found")
             except Exception as e:
                 log(f"  Error: {e}")
@@ -880,6 +1184,9 @@ class App(ctk.CTkFrame):
         if ctype == "event_logs":
             if not self._is_admin:
                 log("  Skipped -- requires Administrator")
+                return 0
+            if dry:
+                log("  [dry-run] Would clear: Application, System, Security, Setup")
                 return 0
             cleared = 0
             for logname in ("Application", "System", "Security", "Setup"):
@@ -901,6 +1208,9 @@ class App(ctk.CTkFrame):
             return 0
 
         if ctype == "clipboard":
+            if dry:
+                log("  [dry-run] Would clear clipboard")
+                return 0
             try:
                 ctypes.windll.user32.OpenClipboard(0)
                 ctypes.windll.user32.EmptyClipboard()
@@ -911,6 +1221,9 @@ class App(ctk.CTkFrame):
             return 0
 
         if ctype == "dns_flush":
+            if dry:
+                log("  [dry-run] Would run ipconfig /flushdns")
+                return 0
             try:
                 result = subprocess.run(
                     ["ipconfig", "/flushdns"],
@@ -1188,10 +1501,172 @@ def run_tool():
     win.geometry(f"960x750+{x}+{y}")
 
 
+# ======================================================
+# Headless scan / clean helpers (CLI)
+# ======================================================
+def _category_size(cat: dict) -> Optional[int]:
+    """Return current on-disk size for a category, or None if not applicable."""
+    ctype = cat["type"]
+    if ctype in _NO_SIZE_TYPES:
+        return None
+    if ctype == "recycle_bin":
+        return _query_recycle_bin_size()
+    if ctype == "firefox_cache":
+        return sum(_dir_size(p) for p in _resolve_firefox_cache_paths())
+    if ctype == "gpu_shader":
+        return sum(_dir_size(p) for p in _resolve_gpu_shader_paths())
+    if ctype == "thumbcache":
+        pattern = os.path.join(
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Explorer"),
+            "thumbcache_*.db",
+        )
+        return sum(os.path.getsize(f) for f in glob.glob(pattern) if os.path.isfile(f))
+    if ctype == "dir_contents":
+        path = cat.get("path")
+        return _dir_size(path) if path and os.path.isdir(path) else 0
+    return 0
+
+
+def _select_categories(keys_or_labels: Optional[str]) -> List[dict]:
+    """Resolve a comma-separated list of category keys or labels. None -> all."""
+    if not keys_or_labels:
+        return list(CATEGORIES)
+    wanted = {s.strip().lower() for s in keys_or_labels.split(",") if s.strip()}
+    out: List[dict] = []
+    for cat in CATEGORIES:
+        if cat["key"].lower() in wanted or cat["label"].lower() in wanted:
+            out.append(cat)
+    return out
+
+
+def _cli_log(line: str) -> None:
+    """Print a cleaning log line to stdout for CLI consumers."""
+    print(line)
+
+
+def _run_headless(mode: DeleteMode, selection: List[dict]) -> int:
+    """Execute category cleaning in headless mode and return total bytes freed."""
+    total = 0
+    for cat in selection:
+        _cli_log(f"\n-- {cat['label']} --")
+        ctype = cat["type"]
+        if ctype == "dir_contents":
+            if cat["admin"] and not is_admin():
+                _cli_log("  Skipped -- requires Administrator")
+                continue
+            freed = _delete_dir_contents(cat["path"], _cli_log, mode)
+        elif ctype == "firefox_cache":
+            freed = 0
+            for p in _resolve_firefox_cache_paths():
+                freed += _delete_dir_contents(p, _cli_log, mode)
+        elif ctype == "gpu_shader":
+            freed = 0
+            for p in _resolve_gpu_shader_paths():
+                freed += _delete_dir_contents(p, _cli_log, mode)
+        elif ctype == "thumbcache":
+            pattern = os.path.join(
+                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Explorer"),
+                "thumbcache_*.db",
+            )
+            freed = _delete_glob_files(pattern, _cli_log, mode)
+        else:
+            # Non-delete operations (recycle_bin, event_logs, clipboard, etc.)
+            # are intentionally *not* fired from CLI — too many side effects
+            # for a batch path. Scan shows sizes; use the GUI for those.
+            _cli_log(f"  Skipped in CLI (use GUI): type={ctype}")
+            freed = 0
+        verb = "Would free" if mode is DeleteMode.DRY_RUN else "Freed"
+        if ctype not in _NO_SIZE_TYPES:
+            _cli_log(f"  {verb}: {format_size(freed)}")
+        total += freed
+    return total
+
+
+def _run_scan(selection: List[dict]) -> int:
+    """Print per-category size report to stdout; returns total."""
+    total = 0
+    for cat in selection:
+        size = _category_size(cat)
+        size_txt = "n/a" if size is None else format_size(size)
+        _cli_log(f"{cat['label']:<32} {size_txt}")
+        if size:
+            total += size
+    _cli_log(f"\nTOTAL: {format_size(total)}")
+    return total
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point. With no args, launches the GUI."""
+    parser = argparse.ArgumentParser(
+        prog="system_cleaner",
+        description="System Cleaner Pro -- scan or clean system junk.",
+    )
+    parser.add_argument(
+        "--scan", action="store_true",
+        help="Report category sizes and exit (no disk changes).",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Run the clean path without touching disk.",
+    )
+    parser.add_argument(
+        "--permanent", action="store_true",
+        help="Permanently delete (bypass Recycle Bin). Requires explicit opt-in.",
+    )
+    parser.add_argument(
+        "--categories", type=str, default=None,
+        help='Comma-separated list of category keys or labels (e.g. "user_temp,chrome_cache").',
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="Confirm that you understand --permanent is irreversible (required with --permanent).",
+    )
+    args = parser.parse_args(argv)
+
+    # No flags -> GUI (preserves Launch.pyw flow).
+    if not (args.scan or args.dry_run or args.permanent):
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        root = ctk.CTk()
+        root.withdraw()
+        run_tool()
+        root.mainloop()
+        return 0
+
+    # Validate --permanent safeguards
+    if args.permanent:
+        if not args.yes:
+            print(
+                "--permanent requires --yes to confirm you understand this is irreversible.",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.categories:
+            print(
+                "--permanent requires --categories to be explicitly specified (refusing to delete ALL categories by default).",
+                file=sys.stderr,
+            )
+            return 2
+
+    selection = _select_categories(args.categories)
+    if not selection:
+        print("No matching categories.", file=sys.stderr)
+        return 2
+
+    if args.scan:
+        _run_scan(selection)
+        return 0
+
+    if args.dry_run and args.permanent:
+        print("--dry-run and --permanent are mutually exclusive.", file=sys.stderr)
+        return 2
+
+    mode = DeleteMode.PERMANENT if args.permanent else DeleteMode.DRY_RUN if args.dry_run else DEFAULT_DELETE_MODE
+    freed = _run_headless(mode, selection)
+    verb = "Would free" if mode is DeleteMode.DRY_RUN else "Freed"
+    print(f"\n{verb} total: {format_size(freed)}")
+    return 0
+
+
 if __name__ == "__main__":
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-    root = ctk.CTk()
-    root.withdraw()
-    run_tool()
-    root.mainloop()
+    sys.exit(main())

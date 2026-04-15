@@ -2,9 +2,12 @@
 screen_lock.py
 
 SCREEN LOCK (Kid-Safe)
-- Transparent overlay covers your entire screen
+- Transparent overlay covers every monitor (virtual screen span)
 - Adjustable opacity slider
-- Unlock: Ctrl + Alt + U  (always) / optional ESC toggle
+- Unlock: Ctrl + Alt + U  (always) / optional ESC toggle (hidden config)
+- Triple-click panic unlock in a configurable corner (1.5s window)
+- Blocks Alt+Tab, Alt+F4, Win keys and Ctrl+Shift+Esc when keyboard hook is live
+- Crash-orphan recovery via PID flag at %APPDATA%\\screen_lock\\locked.flag
 - Educational animated cards for every keypress (letters, numbers, specials)
 - Physics: gravity, bounce, soft peer repulsion
 - Mouse-click emoji bursts
@@ -14,11 +17,23 @@ Dependencies:
   pip install keyboard
 """
 
-import tkinter as tk
-import customtkinter as ctk
-import random
+from __future__ import annotations
+
+import ctypes
+import json
 import math
+import os
+import random
+import sys
+import time
+import tkinter as tk
+from collections import deque
 from datetime import datetime
+from pathlib import Path
+from tkinter import messagebox
+from typing import Optional
+
+import customtkinter as ctk
 
 try:
     import keyboard as _kb
@@ -28,6 +43,230 @@ except ImportError:
 
 TOOL_NAME = "Screen Lock (Kid-Safe)"
 TOOL_DESCRIPTION = "Transparent overlay blocks keyboard input - stops kids from messing with your work"
+
+# ─────────────────────────────────────────────
+#  Config / crash-flag / panic-unlock helpers
+# ─────────────────────────────────────────────
+
+DEFAULT_CONFIG = {
+    "esc_unlock": False,
+    "panic_corner": "top-left",   # one of: top-left, top-right, bottom-left, bottom-right
+    "panic_target_px": 40,
+    "panic_window_s": 1.5,
+}
+
+
+def get_config_dir() -> Path:
+    """Return the ``%APPDATA%/screen_lock`` directory, creating it if needed.
+
+    On non-Windows systems falls back to ``~/.config/screen_lock``. The
+    ``APPDATA`` environment variable is always consulted first so tests can
+    redirect the config location.
+
+    Returns:
+        Path to the config directory (guaranteed to exist).
+    """
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        base = Path(appdata) / "screen_lock"
+    elif sys.platform == "win32":
+        base = Path.home() / "AppData" / "Roaming" / "screen_lock"
+    else:
+        base = Path.home() / ".config" / "screen_lock"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def get_config_path() -> Path:
+    """Return the path to ``config.json`` inside the config dir."""
+    return get_config_dir() / "config.json"
+
+
+def get_flag_path() -> Path:
+    """Return the path to ``locked.flag`` inside the config dir."""
+    return get_config_dir() / "locked.flag"
+
+
+def load_config() -> dict:
+    """Read ``config.json`` and merge with :data:`DEFAULT_CONFIG`.
+
+    A missing or malformed file yields the defaults without raising.
+
+    Returns:
+        Dict with every default key present.
+    """
+    cfg = dict(DEFAULT_CONFIG)
+    path = get_config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            cfg.update({k: v for k, v in parsed.items() if k in DEFAULT_CONFIG})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        print(f"[screen_lock] could not read config: {exc}", file=sys.stderr)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    """Persist ``cfg`` (only known keys) to ``config.json``.
+
+    Unknown keys are ignored. I/O errors are logged to stderr and swallowed
+    — a failed write must not break the UI.
+    """
+    try:
+        path = get_config_path()
+        clean = {k: cfg.get(k, DEFAULT_CONFIG[k]) for k in DEFAULT_CONFIG}
+        path.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[screen_lock] could not save config: {exc}", file=sys.stderr)
+
+
+def write_lock_flag(pid: Optional[int] = None) -> Path:
+    """Write ``locked.flag`` containing the given PID.
+
+    Args:
+        pid: PID to record. Defaults to :func:`os.getpid`.
+
+    Returns:
+        Path to the flag file.
+    """
+    path = get_flag_path()
+    pid = pid if pid is not None else os.getpid()
+    try:
+        path.write_text(str(pid), encoding="utf-8")
+    except OSError as exc:
+        print(f"[screen_lock] could not write lock flag: {exc}", file=sys.stderr)
+    return path
+
+
+def clear_lock_flag() -> None:
+    """Remove the lock flag if it exists. Missing file is not an error."""
+    path = get_flag_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[screen_lock] could not clear lock flag: {exc}", file=sys.stderr)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True when a process with ``pid`` is currently running.
+
+    Uses ``psutil`` when available, falls back to OS-native checks otherwise.
+    """
+    try:
+        import psutil  # type: ignore
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    if sys.platform == "win32":
+        try:
+            PROCESS_QUERY = 0x0400 | 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY, False, int(pid))
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return True  # err on the safe side — do not wrongly claim stale
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def is_stale_lock_flag() -> bool:
+    """Return True when ``locked.flag`` exists but its PID is no longer alive.
+
+    No flag, unreadable flag, or a live PID all return False.
+    """
+    path = get_flag_path()
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    try:
+        pid = int(raw)
+    except ValueError:
+        # Malformed flag — treat as stale so cleanup runs.
+        return True
+    return not _pid_alive(pid)
+
+
+class TripleClickDetector:
+    """Track recent click timestamps and fire a callback on 3 clicks in window.
+
+    Intended for the invisible panic-unlock target. Pure logic — no Tk code —
+    so it can be unit tested.
+
+    Args:
+        window_s: Window length in seconds.
+        required: How many clicks must fall inside the window (default 3).
+    """
+
+    def __init__(self, window_s: float = 1.5, required: int = 3):
+        self.window_s = float(window_s)
+        self.required = int(required)
+        self._clicks: deque[float] = deque(maxlen=self.required)
+
+    def register(self, now: Optional[float] = None) -> bool:
+        """Record a click and return True when the threshold is reached.
+
+        Args:
+            now: Timestamp in seconds. Defaults to :func:`time.monotonic`.
+                 Passed in for deterministic tests.
+        """
+        t = time.monotonic() if now is None else float(now)
+        self._clicks.append(t)
+        if len(self._clicks) < self.required:
+            return False
+        span = self._clicks[-1] - self._clicks[0]
+        if span <= self.window_s:
+            self._clicks.clear()
+            return True
+        return False
+
+    def reset(self) -> None:
+        """Forget pending clicks."""
+        self._clicks.clear()
+
+
+def get_virtual_screen_rect(fallback: tuple[int, int] = (1920, 1080)) -> tuple[int, int, int, int]:
+    """Return ``(x, y, width, height)`` for the Windows virtual screen.
+
+    The virtual screen is the bounding rectangle of every monitor,
+    including negatively-positioned secondary displays. When not running on
+    Windows (or when the ``user32`` call fails), falls back to a primary
+    monitor at the origin.
+
+    Args:
+        fallback: ``(w, h)`` used when the OS call is unavailable.
+
+    Returns:
+        Tuple ``(origin_x, origin_y, width, height)``.
+    """
+    if sys.platform == "win32":
+        try:
+            gsm = ctypes.windll.user32.GetSystemMetrics
+            x = int(gsm(76))   # SM_XVIRTUALSCREEN
+            y = int(gsm(77))   # SM_YVIRTUALSCREEN
+            w = int(gsm(78))   # SM_CXVIRTUALSCREEN
+            h = int(gsm(79))   # SM_CYVIRTUALSCREEN
+            if w > 0 and h > 0:
+                return x, y, w, h
+        except Exception as exc:
+            print(f"[screen_lock] virtual-screen metrics failed: {exc!r}",
+                  file=sys.stderr)
+    fw, fh = fallback
+    return 0, 0, int(fw), int(fh)
 
 # ─────────────────────────────────────────────
 #  Educational content
@@ -332,12 +571,17 @@ class ScreenLockApp:
         self.parent = parent
         self.locked = False
         self._hook: object | None = None
+        self._blocked_ids: list[object] = []
         self._overlay: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
         self._peers: list = []          # active CardPhysics + ClickBurst
 
-        self.alpha_var     = tk.DoubleVar(value=0.25)
-        self.esc_unlock_var = tk.BooleanVar(value=False)
+        self._config = load_config()
+        self.alpha_var = tk.DoubleVar(value=0.25)
+        # ESC-unlock is a hidden config flag (no exposed checkbox).
+        self._panic_detector = TripleClickDetector(
+            window_s=float(self._config.get("panic_window_s", 1.5))
+        )
 
         self._build_ui()
 
@@ -374,21 +618,28 @@ class ScreenLockApp:
         ctk.CTkLabel(row2, text="Opaque",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
 
-        # ESC toggle
-        esc_card = ctk.CTkFrame(w)
-        esc_card.pack(fill="x", padx=20, pady=6)
-        ctk.CTkCheckBox(esc_card, text="Also unlock with  ESC  key",
-                        variable=self.esc_unlock_var,
-                        font=ctk.CTkFont(size=13)).pack(padx=14, pady=14)
-
         # Lock button
         ctk.CTkButton(w, text="🔒  Lock Screen Now",
                       font=ctk.CTkFont(size=15, weight="bold"),
                       height=50, fg_color="#c62828", hover_color="#8e0000",
                       command=self.lock).pack(padx=20, pady=10, fill="x")
 
-        ctk.CTkLabel(w, text="Unlock shortcut:  Ctrl + Alt + U",
-                     font=ctk.CTkFont(size=11), text_color="gray").pack(pady=(0, 6))
+        # Unlock shortcut is documented HERE (unlocked control panel) only.
+        # It is deliberately NOT drawn on the overlay, where a child could
+        # read it. ESC-unlock is a hidden toggle in config.json.
+        ctk.CTkLabel(
+            w,
+            text="Unlock:  Ctrl + Alt + U",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        ).pack(pady=(2, 0))
+        panic_corner = self._config.get("panic_corner", "top-left")
+        ctk.CTkLabel(
+            w,
+            text=f"Panic unlock:  triple-click {panic_corner} corner",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+        ).pack(pady=(0, 6))
 
         if not HAS_KEYBOARD:
             ctk.CTkLabel(w, text="⚠  'keyboard' library not found\n    pip install keyboard",
@@ -405,9 +656,14 @@ class ScreenLockApp:
     def lock(self):
         if self.locked:
             return
+        # Install the keyboard hook FIRST. If the install fails we must
+        # surface the error and refuse to enter locked state — the old code
+        # silently pretended it was locked, so any keypress slipped through.
+        if not self._install_hook():
+            return
         self.locked = True
+        write_lock_flag()
         self._show_overlay()
-        self._install_hook()
         self.parent.withdraw()
 
     def unlock(self):
@@ -415,6 +671,7 @@ class ScreenLockApp:
             return
         self.locked = False
         self._remove_hook()
+        clear_lock_flag()
         self._hide_overlay()
         self.parent.deiconify()
         self.parent.lift()
@@ -425,8 +682,12 @@ class ScreenLockApp:
     def _show_overlay(self):
         ov = tk.Toplevel()
         ov.overrideredirect(True)
-        sw, sh = ov.winfo_screenwidth(), ov.winfo_screenheight()
-        ov.geometry(f"{sw}x{sh}+0+0")
+        # Span across every monitor. Falling back to the primary monitor
+        # would leave other screens uncovered and fully interactive.
+        fallback_w = ov.winfo_screenwidth()
+        fallback_h = ov.winfo_screenheight()
+        ox, oy, sw, sh = get_virtual_screen_rect(fallback=(fallback_w, fallback_h))
+        ov.geometry(f"{sw}x{sh}+{ox}+{oy}")
         ov.configure(bg="#000000")
         ov.attributes("-alpha", self.alpha_var.get())
         ov.attributes("-topmost", True)
@@ -440,6 +701,16 @@ class ScreenLockApp:
         canvas.bind("<Button-2>", self._on_click)
         canvas.bind("<Button-3>", self._on_click)
 
+        # Invisible panic-unlock target. Triple-click within panic_window_s
+        # triggers unlock even if the keyboard hook is dead. The widget is
+        # a Frame (not a Canvas item) so its click handler fires even though
+        # the canvas above is capturing Button-1 on the rest of the surface.
+        panic = tk.Frame(ov, bg="#000000", bd=0, highlightthickness=0,
+                         cursor="arrow")
+        self._panic_detector.reset()
+        panic.bind("<Button-1>", self._on_panic_click)
+        self._place_panic_target(panic, sw, sh)
+
         # Re-grab on focus loss (keep canvas focusable)
         ov.bind("<FocusOut>", lambda e: (ov.focus_force(), ov.grab_set_global()))
 
@@ -448,13 +719,13 @@ class ScreenLockApp:
             ov.bind(seq, lambda e: "break")
 
         # Lock indicator — drawn as permanent canvas text (stays on top after
-        # peer cards because we'll raise it after each spawn)
+        # peer cards because we'll raise it after each spawn).
+        # NOTE: the unlock shortcut is deliberately NOT printed on the overlay
+        # (prior versions leaked it here; a child reading the screen could
+        # trivially unlock). The shortcut is only shown on the control panel.
         canvas.create_text(20, 18, text="🔒", anchor="nw",
                            font=("Segoe UI Emoji", 26),
                            fill="#ffffff", tags="hud")
-        canvas.create_text(20, 56, text="Ctrl + Alt + U  to unlock", anchor="nw",
-                           font=("Segoe UI", 9),
-                           fill="#3a3a3a", tags="hud")
 
         # Clock — top right
         canvas.create_text(sw - 20, 20, text="", anchor="ne",
@@ -492,6 +763,27 @@ class ScreenLockApp:
         canvas.itemconfigure("hud_date",  text=now.strftime("%A, %d %B %Y"))
         self._raise_hud()
         canvas.after(1000, self._tick_clock)
+
+    def _place_panic_target(self, frame: tk.Frame, sw: int, sh: int) -> None:
+        """Place the invisible panic-unlock Frame in the configured corner."""
+        size = int(self._config.get("panic_target_px", 40))
+        size = max(10, min(size, 200))  # clamp sanity
+        corner = str(self._config.get("panic_corner", "top-left")).lower()
+        if corner == "top-right":
+            x, y = sw - size, 0
+        elif corner == "bottom-left":
+            x, y = 0, sh - size
+        elif corner == "bottom-right":
+            x, y = sw - size, sh - size
+        else:
+            x, y = 0, 0  # top-left default
+        frame.place(x=x, y=y, width=size, height=size)
+
+    def _on_panic_click(self, _event) -> None:
+        """Handle a click in the panic-unlock target."""
+        if self._panic_detector.register():
+            print("[screen_lock] panic unlock triggered", file=sys.stderr)
+            _schedule_unlock(self)
 
     def _hide_overlay(self):
         self._canvas  = None
@@ -571,18 +863,56 @@ class ScreenLockApp:
 
     # ── Keyboard hook ────────────────────────────
 
-    def _install_hook(self):
-        if not HAS_KEYBOARD:
-            return
+    # Key combos we actively swallow while the lock is up.
+    # Critical combos: must all be blocked or lock is unsafe. Fail-fast on any failure.
+    _CRITICAL_COMBOS = (
+        "alt+tab",
+        "alt+f4",
+        "ctrl+shift+esc",
+        "left windows",
+        "right windows",
+    )
 
-        esc_enabled = self.esc_unlock_var.get()
+    # Nice-to-have combos: best-effort. If these fail, lock still works.
+    _EXTRA_COMBOS = (
+        "ctrl+esc",   # opens Start menu
+        "alt+esc",    # cycles windows
+        "win",        # redundant on most keyboard library versions (covered by "left windows"/"right windows")
+                      # but kept as best-effort — some versions accept it, some don't. The two "<side> windows"
+                      # entries already cover both physical meta keys, so removal of "win" does not introduce a bypass.
+    )
+
+    def _install_hook(self) -> bool:
+        """Install the global keyboard hook.
+
+        Returns:
+            True when the hook (and every block_key call) succeeded, False
+            when the user should NOT be allowed to enter locked state. On
+            failure a messagebox is shown and stderr logged.
+        """
+        if not HAS_KEYBOARD:
+            messagebox.showerror(
+                "Screen Lock",
+                "The 'keyboard' library is not installed.\n\n"
+                "Install it with:\n    pip install keyboard\n\n"
+                "The screen lock cannot run safely without it because "
+                "Alt+Tab, Alt+F4 and the Windows key would still work.",
+            )
+            print("[screen_lock] refusing to lock: keyboard module missing",
+                  file=sys.stderr)
+            return False
+
+        esc_enabled = bool(self._config.get("esc_unlock", False))
         app = self
         _pressed: set[str] = set()
+        blocked_ids: list[object] = []
 
         def _norm(raw: str) -> str:
             n = (raw or "").lower()
-            if n in ("left ctrl", "right ctrl", "ctrl"):   return "ctrl"
-            if n in ("left alt",  "right alt",  "alt", "alt gr"): return "alt"
+            if n in ("left ctrl", "right ctrl", "ctrl"):
+                return "ctrl"
+            if n in ("left alt",  "right alt",  "alt", "alt gr"):
+                return "alt"
             return n
 
         def _handler(event):
@@ -618,20 +948,111 @@ class ScreenLockApp:
                 except Exception:
                     pass
 
-        self._hook = _kb.hook(_handler, suppress=True)
+        # Attempt to install the suppressing hook. This fails if another
+        # app owns a low-level hook or (rarely) on some restricted Windows
+        # builds. A silent failure would leave the overlay visible while
+        # every key still reached the OS — surface the error instead.
+        try:
+            hook = _kb.hook(_handler, suppress=True)
+        except Exception as exc:
+            errno = getattr(exc, "errno", "")
+            print(
+                f"[screen_lock] keyboard.hook install failed: {exc!r} "
+                f"(errno={errno})",
+                file=sys.stderr,
+            )
+            messagebox.showerror(
+                "Screen Lock",
+                "Could not install the keyboard hook.\n\n"
+                f"{exc}\n\n"
+                "Try running the launcher as Administrator. Aborting lock.",
+            )
+            return False
+
+        # Critical combos: must all succeed. If any fails, rollback and abort.
+        for combo in self._CRITICAL_COMBOS:
+            try:
+                blocked_ids.append(_kb.block_key(combo))
+            except (ValueError, OSError) as exc:
+                # Failed to block a critical combo. Roll back: unblock every combo already
+                # blocked + unhook the event handler.
+                print(
+                    f"[screen_lock] critical block_key({combo!r}) failed: {exc!r}",
+                    file=sys.stderr,
+                )
+                try:
+                    for bid in blocked_ids:
+                        try:
+                            _kb.unblock_key(bid)
+                        except Exception as unblock_exc:
+                            print(
+                                f"[screen_lock] rollback unblock_key failed: {unblock_exc!r}",
+                                file=sys.stderr,
+                            )
+                    _kb.unhook(hook)
+                except Exception as unhook_exc:
+                    print(
+                        f"[screen_lock] unhook rollback failed: {unhook_exc!r}",
+                        file=sys.stderr,
+                    )
+                messagebox.showerror(
+                    "Screen Lock",
+                    f"Could not block critical key combo '{combo}'.\n\n"
+                    f"Error: {exc}\n\n"
+                    "The lock is not safe without this protection. Aborting.",
+                )
+                return False
+
+        # Extra combos: best-effort. If these fail, lock still works.
+        for combo in self._EXTRA_COMBOS:
+            try:
+                blocked_ids.append(_kb.block_key(combo))
+            except (ValueError, OSError) as exc:
+                # Unknown key name or OS denied — log and continue.
+                print(
+                    f"[screen_lock] extra block_key({combo!r}) failed: {exc!r}",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(
+                    f"[screen_lock] extra block_key({combo!r}) unexpected: {exc!r}",
+                    file=sys.stderr,
+                )
+
+        self._hook = hook
+        self._blocked_ids = blocked_ids
+        critical_count = min(len(blocked_ids), len(self._CRITICAL_COMBOS))
+        extra_count = len(blocked_ids) - critical_count
+        print(
+            f"[screen_lock] keyboard hook installed "
+            f"({critical_count} critical + {extra_count} extra key blocks, esc_unlock={esc_enabled})",
+            file=sys.stderr,
+        )
+        return True
 
     def _remove_hook(self):
-        if not HAS_KEYBOARD or self._hook is None:
+        if not HAS_KEYBOARD:
             return
-        try:
-            _kb.unhook(self._hook)
-        except Exception:
-            pass
-        self._hook = None
+        for bid in getattr(self, "_blocked_ids", []) or []:
+            try:
+                _kb.unblock_key(bid)
+            except Exception as exc:
+                print(f"[screen_lock] unblock_key failed: {exc!r}", file=sys.stderr)
+        self._blocked_ids = []
+        if self._hook is not None:
+            try:
+                _kb.unhook(self._hook)
+            except Exception as exc:
+                print(f"[screen_lock] unhook failed: {exc!r}", file=sys.stderr)
+            self._hook = None
+            print("[screen_lock] keyboard hook removed", file=sys.stderr)
 
     def cleanup(self):
         self._remove_hook()
         self._hide_overlay()
+        # Clear the flag on graceful shutdown so we don't false-positive the
+        # next launch into the crash-recovery prompt.
+        clear_lock_flag()
 
 
 def _schedule_unlock(app: ScreenLockApp):
@@ -649,7 +1070,12 @@ def _schedule_unlock(app: ScreenLockApp):
 # ─────────────────────────────────────────────
 
 def run_tool():
+    root: Optional[ctk.CTkToplevel] = None
     try:
+        # Offer crash-recovery prompt BEFORE opening any window so the user
+        # can clear a stale overlay flag from a previous killed session.
+        _maybe_prompt_crash_recovery()
+
         root = ctk.CTkToplevel()
         app  = ScreenLockApp(root)
 
@@ -659,7 +1085,7 @@ def run_tool():
 
         root.protocol("WM_DELETE_WINDOW", on_close)
         root.update_idletasks()
-        w, h = 430, 340
+        w, h = 430, 380
         x = (root.winfo_screenwidth()  - w) // 2
         y = (root.winfo_screenheight() - h) // 2
         root.geometry(f"{w}x{h}+{x}+{y}")
@@ -669,9 +1095,31 @@ def run_tool():
         root.after(250, lambda: root.attributes("-topmost", False))
 
     except Exception as e:
-        from tkinter import messagebox
         messagebox.showerror("Screen Lock", f"Startup error:\n{e}")
-        root.destroy()
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def _maybe_prompt_crash_recovery() -> None:
+    """If a stale ``locked.flag`` is found, offer to clear it.
+
+    Silent no-op when no flag exists or the flagged PID is still alive.
+    """
+    if not is_stale_lock_flag():
+        return
+    try:
+        answer = messagebox.askyesno(
+            "Screen Lock",
+            "A previous Screen Lock session appears to have crashed.\n"
+            "Clear the leftover overlay flag?",
+        )
+    except Exception:
+        answer = True
+    if answer:
+        clear_lock_flag()
 
 
 if __name__ == "__main__":

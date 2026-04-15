@@ -28,6 +28,8 @@ from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
 import psutil
 
+from tools._common.threadsafe import BoundedDeque
+
 TOOL_NAME = "Folder Size Analyzer Pro"
 
 # =============================
@@ -137,8 +139,9 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
         parent.title("Folder Size Analyzer Pro")
         parent.geometry("1200x800")
         
-        # Data
-        self.folders: List[FolderInfo] = []
+        # Data — BoundedDeque keeps a fixed upper bound and allows thread-safe
+        # snapshot reads from UI refresh paths.
+        self.folders: BoundedDeque = BoundedDeque(maxlen=10_000)
         self.current_directory = os.path.expanduser("~")  # Start with user home
         self.sort_column = "size"
         self.sort_reverse = True  # Descending by default
@@ -208,10 +211,13 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
         
         # Configure treeview style
         style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", borderwidth=0)
-        style.configure("Treeview.Heading", background="#565b5e", foreground="white", relief="flat", font=("Arial", 10, "bold"))
-        style.map("Treeview", background=[('selected', '#1f538d')])
+        style.configure("Treeview", background="#2b2b2b", foreground="white",
+                         fieldbackground="#2b2b2b", borderwidth=0)
+        style.configure("Treeview.Heading", background="#565b5e", foreground="white",
+                         relief="flat", font=("Arial", 10, "bold"))
+        style.map("Treeview",
+                  background=[('selected', '#1f538d')],
+                  foreground=[('selected', 'white')])
         
         # Create treeview with columns
         columns = ("name", "size", "files", "size_percentage", "created", "modified", "accessed")
@@ -366,35 +372,50 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
             self.after(0, lambda err=e: messagebox.showerror("Scan Error", f"Error scanning directory:\n{str(err)}"))
             
     def _after_scan(self, folders: List[FolderInfo]):
-        """Called after scan completes"""
-        self.folders = folders
+        """Called after scan completes (always on the Tk main thread via self.after)."""
+        # Rebuild deque from the sorted result so _refresh_tree always reads a
+        # consistent snapshot even if a trace callback fires mid-iteration.
+        self.folders.clear()
         self.is_scanning = False
         self.progress_bar.set(1.0)
         self.progress_label.configure(text="Scan complete")
-        
-        # Sort folders
-        self._sort_folders()
-        
-        # Update tree
+
+        # Sort locally, then populate deque
+        sorted_folders = self._sorted_copy(folders)
+        self.folders.extend(sorted_folders)
+
         self._refresh_tree()
-        
-        # Update status
+
         total_size = sum(f.size for f in folders)
         total_files = sum(f.file_count for f in folders)
         self.status_label.configure(text=f"Found {len(folders)} folders, {total_files} files, {format_size(total_size)} total")
-        
-    def _sort_folders(self):
-        """Sort folders based on current sort settings"""
+
+    def _sorted_copy(self, folders: List[FolderInfo]) -> List[FolderInfo]:
+        """Return *folders* sorted by the current column/direction.
+
+        Args:
+            folders: Unsorted list of FolderInfo objects.
+
+        Returns:
+            New sorted list (original is not mutated).
+        """
         reverse = self.sort_reverse
-        
         if self.sort_column == "size":
-            self.folders.sort(key=lambda f: f.size, reverse=reverse)
-        elif self.sort_column == "name":
-            self.folders.sort(key=lambda f: f.name.lower(), reverse=reverse)
-        elif self.sort_column == "modified_time":
-            self.folders.sort(key=lambda f: f.modified_time, reverse=reverse)
-        elif self.sort_column == "created_time":
-            self.folders.sort(key=lambda f: f.created_time, reverse=reverse)
+            return sorted(folders, key=lambda f: f.size, reverse=reverse)
+        if self.sort_column == "name":
+            return sorted(folders, key=lambda f: f.name.lower(), reverse=reverse)
+        if self.sort_column == "modified_time":
+            return sorted(folders, key=lambda f: f.modified_time, reverse=reverse)
+        if self.sort_column == "created_time":
+            return sorted(folders, key=lambda f: f.created_time, reverse=reverse)
+        return folders[:]
+
+    def _sort_folders(self):
+        """Re-sort the deque in-place (main thread only)."""
+        snap = list(self.folders.snapshot())
+        snap = self._sorted_copy(snap)
+        self.folders.clear()
+        self.folders.extend(snap)
             
     def _refresh_tree(self):
         """Refresh tree view"""
@@ -405,8 +426,8 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
         # Get search filter
         search_term = self.search_var.get().lower()
         
-        # Add folders to tree
-        for folder in self.folders:
+        # Snapshot once so the iteration is not affected by concurrent writes.
+        for folder in self.folders.snapshot():
             # Apply search filter
             if search_term and search_term not in folder.name.lower():
                 continue
@@ -514,16 +535,12 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
     def _export_csv(self, file_path: str):
         """Export to CSV"""
         import csv
-        
+        snap = self.folders.snapshot()
         with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
-            
-            # Write header
-            writer.writerow(['Folder Name', 'Size (Bytes)', 'Size (Formatted)', 'File Count', 
-                           'Size Percentage', 'Created', 'Modified', 'Accessed', 'Full Path'])
-            
-            # Write data
-            for folder in self.folders:
+            writer.writerow(['Folder Name', 'Size (Bytes)', 'Size (Formatted)', 'File Count',
+                             'Size Percentage', 'Created', 'Modified', 'Accessed', 'Full Path'])
+            for folder in snap:
                 writer.writerow([
                     folder.name,
                     folder.size,
@@ -535,19 +552,20 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
                     format_date(folder.accessed_time),
                     folder.path
                 ])
-                
+
     def _export_json(self, file_path: str):
         """Export to JSON"""
+        snap = self.folders.snapshot()
         data = {
             'scan_directory': self.current_directory,
             'scan_time': datetime.now().isoformat(),
-            'total_folders': len(self.folders),
-            'total_size': sum(f.size for f in self.folders),
-            'total_files': sum(f.file_count for f in self.folders),
+            'total_folders': len(snap),
+            'total_size': sum(f.size for f in snap),
+            'total_files': sum(f.file_count for f in snap),
             'folders': []
         }
-        
-        for folder in self.folders:
+
+        for folder in snap:
             folder_data = {
                 'name': folder.name,
                 'path': folder.path,

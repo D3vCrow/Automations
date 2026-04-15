@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional, Set
 
+from tools._common.threadsafe import BoundedDeque
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -1260,7 +1262,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
 
         # State
         self._hist_events: List[ParsedEvent] = []
-        self._live_events: List[ParsedEvent] = []
+        self._live_events: BoundedDeque = BoundedDeque(maxlen=5000)
         self._live_paused = False
         self._live_counter = 0
         self._poll_interval = 5000  # ms
@@ -2117,7 +2119,9 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
 
     def _filter_live(self):
         search = self._live_search.get().lower() if hasattr(self, '_live_search') else ""
-        self._populate_tree(self.live_tree, self._live_events,
+        # Reverse so _populate_tree shows newest events at the top.
+        snap = tuple(reversed(self._live_events.snapshot()))
+        self._populate_tree(self.live_tree, snap,
                            self._active_categories, self._active_severities, search)
 
     def _export_live(self):
@@ -2129,13 +2133,14 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
         if not path:
             return
         try:
-            self.engine.export_events(self._live_events, path)
-            messagebox.showinfo("Export", f"Exported {len(self._live_events)} events to:\n{path}")
+            snap = self._live_events.snapshot()
+            self.engine.export_events(snap, path)
+            messagebox.showinfo("Export", f"Exported {len(snap)} events to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
 
     def _show_event_detail_live(self, event):
-        self._show_event_detail(self.live_tree, self._live_events)
+        self._show_event_detail(self.live_tree, self._live_events.snapshot())
 
     def _start_live_poll(self):
         if not self.running:
@@ -2259,10 +2264,9 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                     self._hist_progress.configure(text=msg[1])
                 elif msg[0] == "live":
                     new_events = msg[1]
-                    self._live_events = new_events + self._live_events
-                    # Cap at 5000
-                    if len(self._live_events) > 5000:
-                        self._live_events = self._live_events[:5000]
+                    # BoundedDeque enforces the 5000 cap via maxlen; oldest items
+                    # are evicted automatically when capacity is exceeded.
+                    self._live_events.extend(new_events)
                     self._live_counter += len(new_events)
                     self._live_count_lbl.configure(
                         text=f"{self._live_counter} events captured")
