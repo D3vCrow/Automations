@@ -94,6 +94,22 @@ def color_temp(val: Optional[float]) -> str:
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def convert_wmi_temp(raw: float) -> Optional[float]:
+    """Convert MSAcpi_ThermalZoneTemperature raw value (tenths of Kelvin) to °C.
+
+    Args:
+        raw: Raw WMI temperature value in tenths of Kelvin.
+
+    Returns:
+        Temperature in °C if the raw value produces a valid result (0–110°C inclusive),
+        otherwise None. Logs a WARNING to stderr for out-of-range values.
+    """
+    celsius = raw / 10.0 - 273.15
+    if 0 <= celsius <= 110:
+        return round(celsius, 1)
+    print(f"WARNING: CPU temp out of range ({celsius:.1f}°C); raw={raw}", file=sys.stderr)
+    return None
+
 def safe_run(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
@@ -190,8 +206,8 @@ class SystemHealthEngine:
         s = HealthSample(timestamp=now)
 
         # CPU
-        s.cpu_percent = psutil.cpu_percent(interval=None)
         s.cpu_per_core = psutil.cpu_percent(percpu=True)
+        s.cpu_percent = sum(s.cpu_per_core) / len(s.cpu_per_core) if s.cpu_per_core else 0
 
         # RAM
         mem = psutil.virtual_memory()
@@ -335,10 +351,7 @@ class SystemHealthEngine:
             ], timeout=5)
             if rc == 0 and out.strip():
                 raw = float(out.strip())
-                # WMI returns temp in tenths of Kelvin
-                celsius = (raw / 10.0) - 273.15
-                if 0 < celsius < 150:
-                    return round(celsius, 1)
+                return convert_wmi_temp(raw)
         except Exception:
             pass
         return None
@@ -403,7 +416,6 @@ class SystemHealthEngine:
 
     def get_processes(self) -> List[Dict]:
         procs = []
-        cpu_count = psutil.cpu_count() or 1
         for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info',
                                        'memory_percent', 'status', 'exe']):
             try:
@@ -414,9 +426,9 @@ class SystemHealthEngine:
                     continue
                 mi = info.get('memory_info')
                 ram_mb = mi.rss / (1024 * 1024) if mi else 0
-                # Normalize CPU% to 0-100 range (psutil reports sum across all cores)
-                raw_cpu = info.get('cpu_percent', 0) or 0
-                norm_cpu = min(raw_cpu / cpu_count * 100, 100) if raw_cpu > 100 else raw_cpu
+                # psutil.cpu_percent() already returns value in [0, 100*num_cores]; clamp to [0, 100]
+                raw_cpu = info.get('cpu_percent', 0) or 0.0
+                norm_cpu = min(raw_cpu, 100.0)
                 procs.append({
                     "pid": pid,
                     "name": info.get('name', '?'),
