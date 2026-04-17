@@ -15,8 +15,12 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-import customtkinter as ctk
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext
+
+import customtkinter as ctk
+
+from tools._common.config import get_path
 
 TOOL_NAME = "FFmpeg Studio"
 TOOL_DESC = "Record gameplay and convert videos using FFmpeg"
@@ -347,7 +351,8 @@ def run_tool():
                            if gpu_label_to_key.get(g) == best_gpu_key), gpu_options[0])
 
     # ── variables ────────────────────────────────────────────────────────────
-    output_dir_var    = ctk.StringVar(value=os.path.expanduser("~/Videos"))
+    output_dir_var    = ctk.StringVar(value=str(get_path(
+        "AUTOMATIONS_FFMPEG_OUTPUT_DIR", default=Path.home() / "Videos")))
     fps_var           = ctk.IntVar(value=60)
     crf_var           = ctk.IntVar(value=23)
     resolution_var    = ctk.StringVar(value="Native (your screen)")
@@ -897,7 +902,8 @@ def run_tool():
     cap_scroll.pack(fill="both", expand=True)
     cp = cap_scroll
 
-    cap_out_var     = ctk.StringVar(value=os.path.expanduser("~/Pictures"))
+    cap_out_var     = ctk.StringVar(value=str(get_path(
+        "AUTOMATIONS_FFMPEG_CAPTURE_DIR", default=Path.home() / "Pictures")))
     cap_fmt_var     = ctk.StringVar(value="PNG  (lossless — best quality)")
     cap_quality_var = ctk.IntVar(value=90)
     cap_delay_var   = ctk.IntVar(value=0)
@@ -1434,7 +1440,8 @@ def run_tool():
     }
 
     input_file_var  = ctk.StringVar()
-    conv_out_var    = ctk.StringVar(value=os.path.expanduser("~/Videos"))
+    conv_out_var    = ctk.StringVar(value=str(get_path(
+        "AUTOMATIONS_FFMPEG_CONVERT_DIR", default=Path.home() / "Videos")))
     conv_fmt_var    = ctk.StringVar(value="mp4")
     conv_codec_var  = ctk.StringVar(value="libx264")
     conv_crf_var    = ctk.IntVar(value=18)
