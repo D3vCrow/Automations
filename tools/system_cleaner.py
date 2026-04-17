@@ -80,6 +80,26 @@ def _log_struct(event: str, **fields) -> None:
         pass
 
 
+def _tree_has_symlink(root_path: str) -> Optional[str]:
+    """Return the first symlink found anywhere under ``root_path``, or None.
+
+    Uses ``os.walk(followlinks=False)`` so the walk never crosses a symlink.
+    We check both directory and file entries at every level because a
+    symlink that points outside ``root_path`` would otherwise allow an
+    ``rmtree``/``send2trash`` call to affect state beyond the intended
+    target. Returns the absolute path of the first offender for logging.
+    """
+    try:
+        for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+            for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    return full
+    except OSError:
+        pass
+    return None
+
+
 # ──────────────────────────────────────────────
 # ctypes struct for Recycle Bin query
 # ──────────────────────────────────────────────
@@ -132,8 +152,13 @@ def _delete_dir_contents(
 ) -> int:
     """Delete everything inside ``path`` (not the folder itself).
 
-    Symlinks are always skipped (never followed) to avoid escaping the
-    target directory. Behavior branches on ``mode``:
+    Symlink-at-top entries are skipped (never followed). Directory entries
+    are additionally tree-walked via ``os.walk(followlinks=False)`` and
+    **refused entirely** if any symlink is present anywhere below — this
+    is stricter than ``rmtree``'s built-in "stop at the link" behavior and
+    emits a structured ``symlink_in_tree_refused`` log entry.
+
+    Behavior branches on ``mode``:
 
     * ``DRY_RUN``  — accumulate size only, do not touch disk.
     * ``TRASH``    — move each entry to the recycle bin via ``send2trash``.
@@ -185,10 +210,22 @@ def _delete_dir_contents(
             freed += size
             continue
 
+        # Refuse to touch any directory entry whose tree contains a symlink.
+        # rmtree/send2trash stop at the link itself, but pre-refusal gives a
+        # louder, auditable signal and matches the Plan A/A1 stance.
+        if os.path.isdir(full):
+            offender = _tree_has_symlink(full)
+            if offender is not None:
+                skipped += 1
+                log_cb(f"  Refused (symlink inside tree): {entry}")
+                _log_struct("symlink_in_tree_refused", path=full, symlink=offender)
+                continue
+
         if mode is DeleteMode.TRASH:
             try:
                 _send2trash(full)
                 freed += size
+                _log_struct("trashed", path=full, bytes=size)
             except Exception as exc:  # send2trash raises its own TrashPermissionError etc.
                 skipped += 1
                 _log_struct(
@@ -206,6 +243,7 @@ def _delete_dir_contents(
             else:
                 os.remove(full)
             freed += size
+            _log_struct("permanent_deleted", path=full, bytes=size)
         except (OSError, PermissionError) as exc:
             skipped += 1
             _log_struct(
@@ -262,6 +300,7 @@ def _delete_glob_files(
             try:
                 _send2trash(fp)
                 freed += size
+                _log_struct("trashed", path=fp, bytes=size)
             except Exception as exc:
                 skipped += 1
                 _log_struct(
@@ -276,6 +315,7 @@ def _delete_glob_files(
         try:
             os.remove(fp)
             freed += size
+            _log_struct("permanent_deleted", path=fp, bytes=size)
         except (OSError, PermissionError) as exc:
             skipped += 1
             _log_struct(

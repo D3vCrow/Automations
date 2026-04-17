@@ -2,7 +2,10 @@
 
 Covers:
     * DRY_RUN does not touch disk.
-    * Symlink entries are skipped, not followed.
+    * Symlink entries at the top level are skipped, not followed.
+    * Directory entries whose tree contains a nested symlink are
+      refused entirely (stricter than rmtree's built-in stop-at-link).
+    * Successful deletions emit a structured log line per outcome.
     * Missing %TEMP% env var resolves to a non-existent path that
       ``_delete_dir_contents`` handles gracefully (no crash, no deletes).
 
@@ -10,6 +13,7 @@ Tests use ``tmp_path`` exclusively -- never touch real user dirs.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -23,6 +27,7 @@ from tools.system_cleaner import (  # noqa: E402
     DeleteMode,
     _delete_dir_contents,
     _delete_glob_files,
+    _tree_has_symlink,
     main,
 )
 
@@ -153,3 +158,92 @@ def test_permanent_without_categories_exits_2(capsys):
     assert exit_code == 2
     _, stderr = capsys.readouterr()
     assert "requires --categories" in stderr
+
+
+# ---------- (e) nested-symlink refusal ----------
+
+def test_nested_symlink_refuses_whole_directory(tmp_path, capsys):
+    """A dir entry whose tree contains a symlink must be refused entirely.
+
+    Stricter than rmtree's "stop at the link" — we refuse the whole
+    directory and emit a ``symlink_in_tree_refused`` structured log so
+    ops can audit the refusal.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    protected = outside / "precious.txt"
+    protected.write_text("do-not-delete", encoding="utf-8")
+
+    target = tmp_path / "target"
+    target.mkdir()
+    # Directory entry with a NESTED symlink (not the top entry itself)
+    nested = target / "nested"
+    nested.mkdir()
+    (nested / "plain.txt").write_text("would-be-deleted", encoding="utf-8")
+    link = nested / "link_inside"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation not permitted in this env: {exc}")
+
+    freed = _delete_dir_contents(str(target), _silent_log, DeleteMode.PERMANENT)
+
+    # The whole nested dir was refused -> nothing inside it was deleted.
+    assert nested.is_dir(), "refused directory must remain"
+    assert (nested / "plain.txt").exists(), "sibling of symlink must not be deleted"
+    assert link.is_symlink(), "symlink must remain"
+    assert protected.exists() and protected.read_text(encoding="utf-8") == "do-not-delete"
+    assert freed == 0, "nothing should have been freed"
+
+    _, stderr = capsys.readouterr()
+    refusal_events = [
+        line for line in stderr.splitlines()
+        if line.strip().startswith("{") and '"symlink_in_tree_refused"' in line
+    ]
+    assert refusal_events, f"expected symlink_in_tree_refused log, got: {stderr!r}"
+    payload = json.loads(refusal_events[0])
+    assert payload["event"] == "symlink_in_tree_refused"
+    assert Path(payload["path"]).name == "nested"
+    assert Path(payload["symlink"]).name == "link_inside"
+
+
+def test_tree_has_symlink_returns_offender(tmp_path):
+    """Unit test for the pre-walk helper: returns first symlink path, None otherwise."""
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "a.txt").write_text("x", encoding="utf-8")
+    assert _tree_has_symlink(str(clean)) is None
+
+    dirty = tmp_path / "dirty"
+    dirty.mkdir()
+    sub = dirty / "sub"
+    sub.mkdir()
+    link = sub / "ln"
+    try:
+        link.symlink_to(clean, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation not permitted in this env: {exc}")
+
+    offender = _tree_has_symlink(str(dirty))
+    assert offender is not None
+    assert Path(offender).name == "ln"
+
+
+# ---------- (f) structured success log ----------
+
+def test_permanent_delete_emits_structured_success_log(tmp_path, capsys):
+    """Each successful PERMANENT delete emits a ``permanent_deleted`` line
+    with path + byte count so operators can audit what a run actually touched."""
+    (tmp_path / "a.txt").write_bytes(b"1234567890")
+    freed = _delete_dir_contents(str(tmp_path), _silent_log, DeleteMode.PERMANENT)
+    assert freed == 10
+
+    _, stderr = capsys.readouterr()
+    events = [
+        json.loads(line) for line in stderr.splitlines()
+        if line.strip().startswith("{") and '"permanent_deleted"' in line
+    ]
+    assert events, f"expected permanent_deleted log, got: {stderr!r}"
+    assert events[0]["event"] == "permanent_deleted"
+    assert Path(events[0]["path"]).name == "a.txt"
+    assert events[0]["bytes"] == 10
