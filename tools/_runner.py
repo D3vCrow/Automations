@@ -45,6 +45,34 @@ from types import ModuleType
 from typing import Optional
 
 
+TOOLS_DIR = Path(__file__).resolve().parent
+
+
+def _validate_under_tools(path: Path) -> Path:
+    """Resolve *path* and ensure it lives under ``tools/``.
+
+    Collapses symlinks and ``..`` segments via ``resolve(strict=True)`` so that
+    a symlink inside ``tools/`` pointing outside is refused alongside a plain
+    external path.
+
+    Args:
+        path: The candidate path (absolute or relative).
+
+    Returns:
+        The resolved absolute path, guaranteed to be under ``tools/``.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+        PermissionError: If the resolved path is outside ``tools/``.
+    """
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(TOOLS_DIR):
+        raise PermissionError(
+            f"refusing to load {resolved}: outside {TOOLS_DIR}"
+        )
+    return resolved
+
+
 def _load_by_path(path: Path) -> ModuleType:
     """Load a module from an explicit file path.
 
@@ -69,10 +97,15 @@ def _load_by_path(path: Path) -> ModuleType:
 
 
 def _load(target: str) -> ModuleType:
-    """Load *target* as either a dotted module name or a file path."""
+    """Load *target* as either a dotted module name or a file path.
+
+    File-path targets are gated by :func:`_validate_under_tools` so that the
+    runner refuses to execute arbitrary ``.py`` files from outside ``tools/``.
+    """
     path_candidate = Path(target)
     if path_candidate.suffix == ".py" or path_candidate.exists():
-        return _load_by_path(path_candidate)
+        safe_path = _validate_under_tools(path_candidate)
+        return _load_by_path(safe_path)
     return importlib.import_module(target)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,35 @@ def _run_runner(arg: str, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.fixture
+def make_tool_file():
+    """Create a .py file inside ``tools/`` for the test's duration.
+
+    The runner's path-containment guard refuses paths outside ``tools/``, so
+    subprocess tests that exercise the file-load branch must place their
+    fixtures under ``tools/``. Files are underscore-prefixed so
+    ``Main.discover_tools`` skips any stragglers if cleanup fails.
+    """
+    created: list[Path] = []
+    tools_dir = PROJECT_ROOT / "tools"
+
+    def _factory(body: str, name: str | None = None) -> Path:
+        if name is None:
+            name = f"_test_{uuid.uuid4().hex[:8]}.py"
+        path = tools_dir / name
+        path.write_text(body, encoding="utf-8")
+        created.append(path)
+        return path
+
+    yield _factory
+
+    for p in created:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def test_runner_exits_with_usage_when_no_args():
     r = subprocess.run(
         [sys.executable, "-m", "tools._runner"],
@@ -180,23 +210,17 @@ def test_runner_exits_with_usage_when_no_args():
     assert "usage" in r.stderr.lower()
 
 
-def test_runner_executes_run_tool_from_file_path(tmp_path):
-    tool_file = tmp_path / "test_tool.py"
-    tool_file.write_text(
-        "def run_tool():\n    print('OK')\n",
-        encoding="utf-8",
-    )
+def test_runner_executes_run_tool_from_file_path(make_tool_file):
+    tool_file = make_tool_file("def run_tool():\n    print('OK')\n")
 
     r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "OK"
 
 
-def test_runner_reports_nonzero_on_tool_exception(tmp_path):
-    tool_file = tmp_path / "crashy.py"
-    tool_file.write_text(
+def test_runner_reports_nonzero_on_tool_exception(make_tool_file):
+    tool_file = make_tool_file(
         "def run_tool():\n    raise RuntimeError('boom')\n",
-        encoding="utf-8",
     )
 
     r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
@@ -205,26 +229,21 @@ def test_runner_reports_nonzero_on_tool_exception(tmp_path):
     assert "boom" in r.stderr
 
 
-def test_runner_propagates_sys_exit_code(tmp_path):
-    tool_file = tmp_path / "exit_code.py"
-    tool_file.write_text(
+def test_runner_propagates_sys_exit_code(make_tool_file):
+    tool_file = make_tool_file(
         "import sys\n"
         "def run_tool():\n    sys.exit(7)\n",
-        encoding="utf-8",
     )
 
     r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
     assert r.returncode == 7
 
 
-def test_runner_handles_spaces_in_filename(tmp_path):
+def test_runner_handles_spaces_in_filename(make_tool_file):
     """Runner must accept file paths containing spaces (e.g., NETWORK STABILITY MONITOR.py)."""
-    spaced_dir = tmp_path / "with spaces"
-    spaced_dir.mkdir()
-    tool_file = spaced_dir / "My Tool.py"
-    tool_file.write_text(
+    tool_file = make_tool_file(
         "def run_tool():\n    print('spaced OK')\n",
-        encoding="utf-8",
+        name="_test with spaces.py",
     )
 
     r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
@@ -232,13 +251,9 @@ def test_runner_handles_spaces_in_filename(tmp_path):
     assert r.stdout.strip() == "spaced OK"
 
 
-def test_runner_runs_module_without_run_tool(tmp_path):
+def test_runner_runs_module_without_run_tool(make_tool_file):
     """If a module has no run_tool(), the runner still exits 0 after import."""
-    tool_file = tmp_path / "no_entry.py"
-    tool_file.write_text(
-        "print('top level ran')\n",
-        encoding="utf-8",
-    )
+    tool_file = make_tool_file("print('top level ran')\n")
 
     r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
     assert r.returncode == 0, r.stderr
@@ -252,15 +267,68 @@ def test_runner_accepts_dotted_module_name():
     assert r.returncode == 0, r.stderr
 
 
-def test_runner_returns_exit_code_3_on_import_failure(tmp_path):
+def test_runner_returns_exit_code_3_on_import_failure(make_tool_file):
     """Runner must return exit code 3 when a tool fails to import (e.g., syntax error)."""
-    tool_file = tmp_path / "broken_import.py"
-    tool_file.write_text(
-        "raise ImportError('broken module')\n",
-        encoding="utf-8",
-    )
+    tool_file = make_tool_file("raise ImportError('broken module')\n")
 
     r = _run_runner(str(tool_file), cwd=PROJECT_ROOT)
     assert r.returncode == 3
     assert "ImportError" in r.stderr
     assert "broken module" in r.stderr
+
+
+# ── Path-containment guard (A8) ──────────────────────────────────────────────
+
+
+def test_runner_refuses_path_outside_tools_dir(tmp_path):
+    """Runner must refuse to load a .py file that lives outside tools/."""
+    outside = tmp_path / "outside_tool.py"
+    outside.write_text(
+        "def run_tool():\n    print('should not run')\n",
+        encoding="utf-8",
+    )
+
+    r = _run_runner(str(outside), cwd=PROJECT_ROOT)
+    assert r.returncode == 3
+    assert "refusing to load" in r.stderr
+    assert "should not run" not in r.stdout
+
+
+def test_runner_refuses_nonexistent_py_path(tmp_path):
+    """A .py path that does not exist must be rejected by the strict-resolve guard."""
+    missing = tmp_path / "does_not_exist.py"
+
+    r = _run_runner(str(missing), cwd=PROJECT_ROOT)
+    assert r.returncode == 3
+    stderr_lower = r.stderr.lower()
+    assert (
+        "filenotfounderror" in stderr_lower
+        or "no such file" in stderr_lower
+        or "cannot find the file" in stderr_lower
+    )
+
+
+def test_runner_refuses_symlink_escape_from_tools(tmp_path):
+    """A symlink inside tools/ pointing outside must be refused after resolve()."""
+    outside = tmp_path / "external_tool.py"
+    outside.write_text(
+        "def run_tool():\n    print('escaped!')\n",
+        encoding="utf-8",
+    )
+
+    link = PROJECT_ROOT / "tools" / "_test_escape_link.py"
+    try:
+        os.symlink(str(outside), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this platform")
+
+    try:
+        r = _run_runner(str(link), cwd=PROJECT_ROOT)
+        assert r.returncode == 3
+        assert "refusing to load" in r.stderr
+        assert "escaped!" not in r.stdout
+    finally:
+        try:
+            link.unlink()
+        except FileNotFoundError:
+            pass
