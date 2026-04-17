@@ -10,8 +10,9 @@ import sys
 import os
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_REPO_ROOT = os.path.dirname(_HERE)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 _missing = []
 try:
@@ -37,7 +38,7 @@ if _missing:
     sys.exit(1)
 
 try:
-    from account_activity_monitor import App
+    from tools.account_activity_monitor import App
 except ImportError as e:
     import tkinter as tk
     from tkinter import messagebox
@@ -45,8 +46,8 @@ except ImportError as e:
     _root.withdraw()
     messagebox.showerror(
         "Import Error",
-        f"Could not load account_activity_monitor.py\n\n"
-        f"Make sure it is in the same folder as this file.\n\nError: {e}"
+        f"Could not load tools.account_activity_monitor\n\n"
+        f"Make sure the repo's tools/ directory is present at {_REPO_ROOT}\n\nError: {e}"
     )
     sys.exit(1)
 

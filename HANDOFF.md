@@ -134,14 +134,17 @@ python -m PyInstaller --clean --noconfirm ToolName.spec --distpath ..\dist
 # Key settings:
 #   console=False (no console window)
 #   uac_admin=True (for tools that need admin: Security Audit, Account Activity)
-#   hiddenimports=['customtkinter', 'psutil', ...]
+#   pathex=[os.path.abspath(os.path.join(SPECPATH, '..', '..'))]
+#     -> repo root, so PyInstaller can find the canonical tools/ package
+#   hiddenimports=['customtkinter', 'psutil', 'tools.<module>',
+#                  'tools._common.threadsafe', ...]
 #   collect_all('customtkinter') for CTk theme files
 ```
 
-After building, also copy the updated tool source to `portable/`:
-```bash
-copy tools\my_tool.py portable\my_tool.py
-```
+Launchers import from the canonical `tools/` package (e.g.
+`from tools.account_activity_monitor import App`) — **do not copy
+sources into `portable/`**. The `tests/test_no_portable_source_drift.py`
+guard fails CI if duplicate sources reappear there.
 
 ---
 

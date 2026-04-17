@@ -144,7 +144,15 @@ Every tool in `tools/` must expose:
 - `Security_Audit.exe` (~14 MB, UAC admin elevation)
 - `Account_Activity_Monitor.exe` (~14 MB, UAC admin elevation)
 
-Each has: PyInstaller spec file, portable Python launcher, batch file wrapper.
+Each has: PyInstaller spec file (`portable/build/*.spec`), portable
+Python launcher (`portable/*_Portable.py`), batch file wrapper
+(`portable/run_*.bat`).
+
+Launchers import tool code directly from the canonical `tools/` package
+(`from tools.account_activity_monitor import App` etc.). Specs set
+`pathex=[repo-root]` so PyInstaller resolves the package from source.
+No duplicate `.py` sources live under `portable/` —
+`tests/test_no_portable_source_drift.py` guards against drift.
 
 ---
 
