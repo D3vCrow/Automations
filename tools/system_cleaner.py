@@ -445,7 +445,7 @@ CATEGORIES = [
     {
         "key":     "win_temp",
         "label":   "Windows TEMP",
-        "path":    r"C:\Windows\Temp",
+        "path":    os.path.expandvars(r"%SystemRoot%\Temp"),
         "type":    "dir_contents",
         "admin":   True,
         "desc":    "System-wide temp files -- requires Administrator",
@@ -472,7 +472,7 @@ CATEGORIES = [
     {
         "key":     "prefetch",
         "label":   "Windows Prefetch",
-        "path":    r"C:\Windows\Prefetch",
+        "path":    os.path.expandvars(r"%SystemRoot%\Prefetch"),
         "type":    "dir_contents",
         "admin":   True,
         "desc":    "App launch optimisation files -- stale ones slow things down",
@@ -482,7 +482,7 @@ CATEGORIES = [
     {
         "key":     "win_update",
         "label":   "Windows Update Cache",
-        "path":    r"C:\Windows\SoftwareDistribution\Download",
+        "path":    os.path.expandvars(r"%SystemRoot%\SoftwareDistribution\Download"),
         "type":    "dir_contents",
         "admin":   True,
         "desc":    "Downloaded update files -- already installed, safe to remove",
