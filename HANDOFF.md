@@ -199,7 +199,7 @@ copy tools\my_tool.py portable\my_tool.py
 | How tools are loaded | `Main.py` lines 266-322 |
 | Tool module template | Any tool's `run_tool()` function |
 | Dark theme constants | Top of any tool file |
-| Network scanner | `NETWORK STABILITY MONITOR.py` → `scan_wifi_networks()` |
+| Network scanner | `network_stability_monitor.py` → `scan_wifi_networks()` |
 | Event log querying | `account_activity_monitor.py` → `ActivityMonitorEngine._query_log()` |
 | GPU detection | `ffmpeg_studio.py` → `_test_encoder()`, `_probe_hardware()` |
 | Process management | `system_health_monitor.py` → `SystemHealthEngine.get_processes()` |

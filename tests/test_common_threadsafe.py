@@ -222,7 +222,7 @@ def test_bounded_deque_no_runtime_error_during_slow_iteration():
     raise zero exceptions.
 
     This test also covers the self.incidents migration in
-    tools/NETWORK STABILITY MONITOR.py (see A5 commit).
+    tools/network_stability_monitor.py (see A5 commit).
     """
     APPEND_COUNT = 2_000
     bd = BoundedDeque(maxlen=500)

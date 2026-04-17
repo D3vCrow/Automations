@@ -240,7 +240,7 @@ def test_runner_propagates_sys_exit_code(make_tool_file):
 
 
 def test_runner_handles_spaces_in_filename(make_tool_file):
-    """Runner must accept file paths containing spaces (e.g., NETWORK STABILITY MONITOR.py)."""
+    """Runner must accept file paths containing spaces (general contract)."""
     tool_file = make_tool_file(
         "def run_tool():\n    print('spaced OK')\n",
         name="_test with spaces.py",

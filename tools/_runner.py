@@ -9,9 +9,9 @@ The argument can be either:
 * A dotted module path (e.g. ``tools.decision_dice``) — imported via
   ``importlib.import_module``.
 * A filesystem path to a ``.py`` file — loaded via
-  ``importlib.util.spec_from_file_location``. This path is required
-  for tool filenames that are not valid Python identifiers (e.g.
-  ``NETWORK STABILITY MONITOR.py`` contains spaces).
+  ``importlib.util.spec_from_file_location``. This path is useful for
+  tool filenames that are not valid Python identifiers (e.g. files
+  containing spaces).
 
 Behavior:
 
@@ -126,6 +126,37 @@ def _apply_ctk_theme() -> None:
         pass
 
 
+def _ensure_hidden_root() -> None:
+    """Pre-create a withdrawn root so CTkToplevel tools don't spawn a visible blank window.
+
+    When ``CTkToplevel()`` is instantiated and ``tk._default_root`` is ``None``,
+    tkinter auto-creates a plain ``Tk()`` root that appears as a blank window.
+    By pre-creating a withdrawn ``CTk`` root here, ``CTkToplevel`` attaches to it
+    and no blank window appears.
+
+    Side-effect: tools like ``network_stability_monitor`` that only call
+    ``mainloop()`` when ``tk._default_root is None`` will skip their own
+    ``mainloop()`` call, letting ``_wait_for_gui()`` manage the event loop.
+    """
+    try:
+        import tkinter as tk  # noqa: WPS433
+        if tk._default_root is not None:
+            return
+    except Exception:
+        return
+    try:
+        import customtkinter as ctk  # noqa: WPS433
+        root = ctk.CTk()
+        root.withdraw()
+    except Exception:
+        try:
+            import tkinter as tk  # noqa: WPS433
+            root = tk.Tk()
+            root.withdraw()
+        except Exception:
+            pass
+
+
 def _wait_for_gui() -> None:
     """If the tool created Tk windows but didn't enter mainloop, do it here.
 
@@ -159,6 +190,16 @@ def _wait_for_gui() -> None:
         has_children = False
     if not has_children:
         return  # Tool imported tk but never built UI.
+
+    # Tools that use CTkToplevel leave an invisible CTk root as a container.
+    # Withdraw it now so it doesn't appear as a blank extra window.
+    # (Tools that use CTk() directly as their main window won't have Toplevel
+    # children yet at this point, so they are unaffected.)
+    try:
+        if any(isinstance(w, tk.Toplevel) for w in root.winfo_children()):
+            root.withdraw()
+    except tk.TclError:
+        pass
 
     def _has_active_window() -> bool:
         try:
@@ -230,6 +271,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     target = args[0]
     _apply_ctk_theme()
+    _ensure_hidden_root()
 
     try:
         module = _load(target)

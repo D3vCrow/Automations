@@ -49,7 +49,7 @@ Every tool in `tools/` must expose:
 
 | Tool | File | Lines | Purpose |
 |------|------|-------|---------|
-| Network Stability Monitor Pro | `NETWORK STABILITY MONITOR.py` | 3,080 | Live network health monitoring with latency tracking, incident timeline, Wi-Fi analyzer, diagnostics |
+| Network Stability Monitor Pro | `network_stability_monitor.py` | 3,080 | Live network health monitoring with latency tracking, incident timeline, Wi-Fi analyzer, diagnostics |
 | Network Intrusion Detector Pro | `network_intrusion_detector_pro.py` | 3,063 | LAN device discovery, connection classification (5 levels), threat detection (Flipper Zero, Tor, audio spying), firewall blocking |
 | Security Audit | `security_audit.py` | 1,836 | One-shot system security scan: startup items, processes, ports, filesystem, DNS, accounts, certificates, event logs |
 | Account Activity Monitor | `account_activity_monitor.py` | 2,362 | Windows Event Log monitor: account changes, logon activity, device events, system changes, spy check (camera/mic access, remote tools) |
