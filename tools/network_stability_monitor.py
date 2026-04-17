@@ -27,6 +27,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
+from tools._common.config import get_bool, get_config
 from tools._common.threadsafe import BoundedDeque
 
 import tkinter as tk
@@ -67,9 +68,10 @@ TOOL_NAME = "Network Stability Monitor Pro"
 # =========================
 # Auto Export Configuration
 # =========================
-AUTO_EXPORT_ENABLED = True
-AUTO_EXPORT_TIME = "23:30"   # HH:MM
-EXPORT_FOLDER = "exports"
+# Overridable via env or <repo>/.env — see .env.example.
+AUTO_EXPORT_ENABLED = get_bool("AUTOMATIONS_NSM_AUTO_EXPORT", default=True)
+AUTO_EXPORT_TIME = get_config("AUTOMATIONS_NSM_EXPORT_TIME", default="23:30")
+EXPORT_FOLDER = get_config("AUTOMATIONS_NSM_EXPORT_DIR", default="exports")
 
 # =========================
 # Helpers
