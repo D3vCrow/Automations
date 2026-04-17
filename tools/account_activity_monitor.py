@@ -1268,6 +1268,9 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
         self._poll_interval = 5000  # ms
         self._active_categories: Set[str] = set(ALL_CATEGORIES)
         self._active_severities: Set[str] = {"CRITICAL", "WARNING", "INFO"}
+        # Guards _active_categories / _active_severities against UI-toggle
+        # writes racing with worker-thread or after()-callback reads.
+        self._filter_lock = threading.RLock()
         self._search_text = ""
         self._hist_hours = 24
 
@@ -1370,29 +1373,40 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
 
     def _toggle_category(self, cat: str, buttons: Dict, on_change):
         icon = CATEGORY_ICONS.get(cat, "")
-        if cat in self._active_categories:
-            self._active_categories.discard(cat)
-            buttons[cat].configure(fg_color="#2a2a2a", text=f"[OFF] {cat}",
-                                    text_color="#555555", border_width=1,
-                                    border_color="#444444")
-        else:
-            self._active_categories.add(cat)
-            buttons[cat].configure(fg_color="#1f538d", text=f"{icon} {cat}",
-                                    text_color=C_WHITE, border_width=0)
+        with self._filter_lock:
+            if cat in self._active_categories:
+                self._active_categories.discard(cat)
+                buttons[cat].configure(fg_color="#2a2a2a", text=f"[OFF] {cat}",
+                                        text_color="#555555", border_width=1,
+                                        border_color="#444444")
+            else:
+                self._active_categories.add(cat)
+                buttons[cat].configure(fg_color="#1f538d", text=f"{icon} {cat}",
+                                        text_color=C_WHITE, border_width=0)
         on_change()
 
     def _toggle_severity(self, sev: str, on_change):
         colors = {"CRITICAL": C_RED, "WARNING": C_ORANGE, "INFO": C_GRAY}
-        if sev in self._active_severities:
-            self._active_severities.discard(sev)
-            self._sev_buttons[sev].configure(fg_color="#2a2a2a", text=f"[OFF] {sev}",
-                                              text_color="#555555", border_width=1,
-                                              border_color="#444444")
-        else:
-            self._active_severities.add(sev)
-            self._sev_buttons[sev].configure(fg_color=colors[sev], text=sev,
-                                              text_color=C_WHITE, border_width=0)
+        with self._filter_lock:
+            if sev in self._active_severities:
+                self._active_severities.discard(sev)
+                self._sev_buttons[sev].configure(fg_color="#2a2a2a", text=f"[OFF] {sev}",
+                                                  text_color="#555555", border_width=1,
+                                                  border_color="#444444")
+            else:
+                self._active_severities.add(sev)
+                self._sev_buttons[sev].configure(fg_color=colors[sev], text=sev,
+                                                  text_color=C_WHITE, border_width=0)
         on_change()
+
+    def _snapshot_filters(self) -> Tuple[frozenset, frozenset]:
+        """Return an atomic snapshot of the active category/severity filters.
+
+        Callers iterate or membership-test against the returned frozensets so
+        that concurrent toggle writes cannot mutate the sets mid-read.
+        """
+        with self._filter_lock:
+            return frozenset(self._active_categories), frozenset(self._active_severities)
 
     # ── Historical Timeline Tab ──
 
@@ -1791,14 +1805,15 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
     def _load_historical(self):
         hours = self._hist_hours if self._hist_hours > 0 else 8760  # "All" = 1 year
         self._hist_progress.configure(text="Loading...")
-        self.work_q.put_nowait(("historical", hours, set(self._active_categories)))
+        cats, _ = self._snapshot_filters()
+        self.work_q.put_nowait(("historical", hours, cats))
 
     def _filter_historical(self):
         """Apply category, severity, and text filters to historical events."""
         self._search_text = self._hist_search.get().lower() if hasattr(self, '_hist_search') else ""
+        cats, sevs = self._snapshot_filters()
         self._populate_tree(self.hist_tree, self._hist_events,
-                           self._active_categories, self._active_severities,
-                           self._search_text)
+                           cats, sevs, self._search_text)
 
     def _populate_tree(self, tree: ttk.Treeview, events: List[ParsedEvent],
                        categories: Set[str], severities: Set[str],
@@ -1837,9 +1852,10 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
             return
         try:
             # Export filtered events
+            cats, sevs = self._snapshot_filters()
             filtered = [e for e in self._hist_events
-                       if e.category in self._active_categories
-                       and e.severity in self._active_severities]
+                       if e.category in cats
+                       and e.severity in sevs]
             self.engine.export_events(filtered, path)
             messagebox.showinfo("Export", f"Exported {len(filtered)} events to:\n{path}")
         except Exception as e:
@@ -2121,8 +2137,8 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
         search = self._live_search.get().lower() if hasattr(self, '_live_search') else ""
         # Reverse so _populate_tree shows newest events at the top.
         snap = tuple(reversed(self._live_events.snapshot()))
-        self._populate_tree(self.live_tree, snap,
-                           self._active_categories, self._active_severities, search)
+        cats, sevs = self._snapshot_filters()
+        self._populate_tree(self.live_tree, snap, cats, sevs, search)
 
     def _export_live(self):
         path = filedialog.asksaveasfilename(
@@ -2146,7 +2162,8 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
         if not self.running:
             return
         if not self._live_paused:
-            self.work_q.put_nowait(("live", set(self._active_categories)))
+            cats, _ = self._snapshot_filters()
+            self.work_q.put_nowait(("live", cats))
         self.after(self._poll_interval, self._start_live_poll)
 
     # ── Settings Tab ──
@@ -2270,12 +2287,14 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                     self._live_counter += len(new_events)
                     self._live_count_lbl.configure(
                         text=f"{self._live_counter} events captured")
-                    # Insert at top of tree
+                    # Insert at top of tree — snapshot filters once so a toggle
+                    # firing mid-loop can't mutate the sets during iteration.
                     search = self._live_search.get().lower() if hasattr(self, '_live_search') else ""
+                    cats, sevs = self._snapshot_filters()
                     for e in reversed(new_events):
-                        if e.category not in self._active_categories:
+                        if e.category not in cats:
                             continue
-                        if e.severity not in self._active_severities:
+                        if e.severity not in sevs:
                             continue
                         if search:
                             searchable = f"{e.title} {e.details} {e.user} {e.category}".lower()
