@@ -15,8 +15,61 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
+
 import customtkinter as ctk
 from tkinter import filedialog, messagebox, scrolledtext
+
+
+class OutputDirError(ValueError):
+    """Raised when an output directory fails containment validation."""
+
+
+def _validate_output_dir(raw, allowed_bases=None):
+    """Validate a user-supplied output directory.
+
+    Blocks the two defenses the attack needs: traversal segments (``..``)
+    and relative paths. If ``allowed_bases`` is given (tests / PoCs), the
+    resolved path must sit under one of them.
+
+    Returns the resolved :class:`pathlib.Path`. Raises
+    :class:`OutputDirError` on any violation — callers should catch it
+    and surface a user-friendly error (messagebox).
+    """
+    if raw is None or not str(raw).strip():
+        raise OutputDirError("Output folder is empty.")
+
+    raw_str = str(raw).strip()
+
+    if ".." in Path(raw_str).parts:
+        raise OutputDirError(
+            "Output folder cannot contain '..' path segments."
+        )
+
+    expanded = Path(raw_str).expanduser()
+    if not expanded.is_absolute():
+        raise OutputDirError("Output folder must be an absolute path.")
+
+    try:
+        candidate = expanded.resolve()
+    except (OSError, RuntimeError) as e:
+        raise OutputDirError(f"Cannot resolve output folder: {e}") from e
+
+    if allowed_bases:
+        bases = [Path(b).expanduser().resolve() for b in allowed_bases]
+        for base in bases:
+            try:
+                candidate.relative_to(base)
+                return candidate
+            except ValueError:
+                continue
+        raise OutputDirError(
+            "Output folder must be inside one of: "
+            + ", ".join(str(b) for b in bases)
+        )
+
+    return candidate
+
 
 TOOL_NAME = "FFmpeg Studio"
 TOOL_DESC = "Record gameplay and convert videos using FFmpeg"
@@ -499,9 +552,10 @@ def run_tool():
     def start_recording():
         nonlocal recording_proc, record_start_time, timer_running
 
-        out_dir = output_dir_var.get().strip()
-        if not out_dir:
-            messagebox.showwarning("No output folder", "Please select an output folder.", parent=win)
+        try:
+            out_dir = str(_validate_output_dir(output_dir_var.get()))
+        except OutputDirError as e:
+            messagebox.showerror("Invalid output folder", str(e), parent=win)
             return
 
         # Warn about known-unsupported combinations before starting
@@ -1282,7 +1336,11 @@ def run_tool():
     cap_btn_row.pack(pady=(4, 6))
 
     def _do_capture():
-        out_d   = cap_out_var.get().strip()
+        try:
+            out_d = str(_validate_output_dir(cap_out_var.get()))
+        except OutputDirError as e:
+            messagebox.showerror("Invalid output folder", str(e), parent=win)
+            return
         fmt_key = cap_fmt_var.get()
         ext, _  = CAP_FORMATS[fmt_key]
         scale   = RESOLUTIONS.get(cap_res_var.get())
