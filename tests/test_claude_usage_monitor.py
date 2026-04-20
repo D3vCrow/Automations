@@ -376,3 +376,283 @@ class TestGetPricing:
     def test_empty_model_returns_default(self):
         assert _get_pricing("") is not None
         assert _get_pricing("") == _get_pricing("claude-sonnet-4-6")
+
+
+# =============================================================================
+# T1 — mtime-cache for JSONL parsing
+# =============================================================================
+
+from tools.claude_usage_monitor import (  # noqa: E402
+    _parse_session_file_cached,
+    _SESSION_CACHE,
+)
+
+
+class TestSessionMtimeCache:
+    """_parse_session_file_cached must skip re-parse on unchanged mtime."""
+
+    def _write_jsonl(self, path: Path) -> None:
+        # Minimal assistant turn so _parse_session_file produces a session dict.
+        line = {
+            "type": "assistant",
+            "timestamp": "2026-04-20T10:00:00Z",
+            "sessionId": "sid-mtime",
+            "cwd": str(path.parent),
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 100, "output_tokens": 50,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        }
+        import json as _json
+        path.write_text(_json.dumps(line) + "\n", encoding="utf-8")
+
+    def test_cache_hit_returns_same_object(self, tmp_path):
+        _SESSION_CACHE.clear()
+        f = tmp_path / "s.jsonl"
+        self._write_jsonl(f)
+        first = _parse_session_file_cached(str(f))
+        second = _parse_session_file_cached(str(f))
+        assert first is second  # cached dict reused by identity
+
+    def test_cache_invalidates_on_mtime_change(self, tmp_path):
+        import os as _os, time as _time
+        _SESSION_CACHE.clear()
+        f = tmp_path / "s.jsonl"
+        self._write_jsonl(f)
+        first = _parse_session_file_cached(str(f))
+        # Bump mtime by 2s to guarantee filesystem granularity picks it up.
+        new_mtime = _os.path.getmtime(f) + 2
+        _os.utime(f, (new_mtime, new_mtime))
+        second = _parse_session_file_cached(str(f))
+        assert first is not second  # re-parsed, fresh object
+
+    def test_missing_file_falls_through_without_caching(self, tmp_path):
+        _SESSION_CACHE.clear()
+        missing = tmp_path / "nope.jsonl"
+        result = _parse_session_file_cached(str(missing))
+        # Missing files produce a session dict with 0 turns, not a crash.
+        assert result["assistant_turns"] == 0
+        assert str(missing) not in _SESSION_CACHE
+
+
+# =============================================================================
+# T4 — time-window filter bucketing
+# =============================================================================
+
+from tools.claude_usage_monitor import ClaudeUsageMonitor  # noqa: E402
+
+
+class TestWindowFilter:
+    """_session_in_window must bucket sessions against Today/Week/Month cutoffs."""
+
+    def _monitor(self, window: str):
+        obj = object.__new__(ClaudeUsageMonitor)
+        obj._window = window
+        return obj
+
+    def _session(self, ts: datetime) -> dict:
+        return {"last_timestamp": ts.isoformat().replace("+00:00", "Z")}
+
+    def test_all_passes_everything(self):
+        m = self._monitor("All")
+        ancient = self._session(datetime(2000, 1, 1, tzinfo=timezone.utc))
+        assert m._session_in_window(ancient) is True
+
+    def test_today_excludes_yesterday(self):
+        m = self._monitor("Today")
+        now = datetime.now(timezone.utc)
+        yesterday = self._session(now - timedelta(days=1))
+        assert m._session_in_window(yesterday) is False
+
+    def test_today_includes_current_hour(self):
+        m = self._monitor("Today")
+        now = datetime.now(timezone.utc)
+        assert m._session_in_window(self._session(now)) is True
+
+    def test_week_bucketing(self):
+        m = self._monitor("Week")
+        now = datetime.now(timezone.utc)
+        assert m._session_in_window(self._session(now - timedelta(days=3))) is True
+        assert m._session_in_window(self._session(now - timedelta(days=8))) is False
+
+    def test_month_bucketing(self):
+        m = self._monitor("Month")
+        now = datetime.now(timezone.utc)
+        assert m._session_in_window(self._session(now - timedelta(days=20))) is True
+        assert m._session_in_window(self._session(now - timedelta(days=31))) is False
+
+    def test_missing_timestamp_excluded_when_filtered(self):
+        m = self._monitor("Today")
+        assert m._session_in_window({}) is False
+
+    def test_missing_timestamp_included_on_all(self):
+        m = self._monitor("All")
+        # 'All' short-circuits before timestamp parsing.
+        assert m._session_in_window({}) is True
+
+
+# =============================================================================
+# T10 — notification dedup state
+# =============================================================================
+
+from tools.claude_usage_monitor import (  # noqa: E402
+    _rotate_level,
+    _should_notify,
+    _record_notified,
+    _evict_inactive_notifs,
+)
+
+
+class TestRotateLevel:
+    def test_below_amber_is_none(self):
+        assert _rotate_level(0) == "none"
+        assert _rotate_level(29.9) == "none"
+
+    def test_amber_threshold(self):
+        assert _rotate_level(30) == "amber"
+        assert _rotate_level(59.9) == "amber"
+
+    def test_red_threshold(self):
+        assert _rotate_level(60) == "red"
+        assert _rotate_level(100) == "red"
+
+
+class TestShouldNotify:
+    """Fires only on tier upgrades; downgrades stay silent."""
+
+    def test_first_alert_fires(self):
+        state: dict = {}
+        assert _should_notify(state, "s1", "amber") is True
+        assert _should_notify(state, "s1", "red") is True
+
+    def test_none_level_never_fires(self):
+        assert _should_notify({}, "s1", "none") is False
+
+    def test_same_level_no_refire(self):
+        state = {"s1": {"level": "amber", "fired_at": "x"}}
+        assert _should_notify(state, "s1", "amber") is False
+
+    def test_upgrade_amber_to_red_fires(self):
+        state = {"s1": {"level": "amber", "fired_at": "x"}}
+        assert _should_notify(state, "s1", "red") is True
+
+    def test_downgrade_red_to_amber_is_silent(self):
+        state = {"s1": {"level": "red", "fired_at": "x"}}
+        assert _should_notify(state, "s1", "amber") is False
+
+    def test_downgrade_to_none_is_silent(self):
+        state = {"s1": {"level": "red", "fired_at": "x"}}
+        assert _should_notify(state, "s1", "none") is False
+
+    def test_independent_sessions_tracked_separately(self):
+        state = {"s1": {"level": "red", "fired_at": "x"}}
+        assert _should_notify(state, "s2", "amber") is True
+
+
+class TestRecordNotified:
+    def test_record_stamps_level_and_timestamp(self):
+        state: dict = {}
+        _record_notified(state, "s1", "amber")
+        assert state["s1"]["level"] == "amber"
+        assert "fired_at" in state["s1"]
+
+    def test_record_overwrites_prior_entry(self):
+        state: dict = {}
+        _record_notified(state, "s1", "amber")
+        _record_notified(state, "s1", "red")
+        assert state["s1"]["level"] == "red"
+
+
+# =============================================================================
+# Cost composition + turn stats (Session Detail)
+# =============================================================================
+
+from tools.claude_usage_monitor import (  # noqa: E402
+    _cost_composition,
+    _turn_cost_stats,
+)
+
+
+class TestCostComposition:
+    """_cost_composition splits session cost into four token-type buckets."""
+
+    def test_empty_session_returns_zero_total(self):
+        comp = _cost_composition([])
+        assert comp == {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0}
+
+    def test_single_turn_sonnet_46_pricing(self):
+        # 1M input, 1M output, 1M cache_read, 1M cache_write (5m rate)
+        # sonnet-4-6: 3 + 15 + 0.30 + 3.75 = $22.05
+        turns = [("t", 0.0, 1_000_000, 1_000_000, 1_000_000, 1_000_000, "claude-sonnet-4-6")]
+        comp = _cost_composition(turns)
+        assert comp["input"] == 3.0
+        assert comp["output"] == 15.0
+        assert comp["cache_read"] == 0.30
+        assert comp["cache_write"] == 3.75
+        assert abs(comp["total"] - 22.05) < 1e-6
+
+    def test_multi_model_sums_per_turn(self):
+        turns = [
+            ("t", 0.0, 1_000_000, 0, 0, 0, "claude-sonnet-4-6"),  # 3.0 input
+            ("t", 0.0, 1_000_000, 0, 0, 0, "claude-opus-4-6"),    # 5.0 input
+        ]
+        comp = _cost_composition(turns)
+        assert comp["input"] == 8.0
+        assert comp["output"] == 0.0
+
+    def test_unknown_model_uses_default_pricing(self):
+        turns = [("t", 0.0, 1_000_000, 0, 0, 0, "claude-unknown-99")]
+        comp = _cost_composition(turns)
+        # Default falls back to sonnet-4-6 -> $3 for 1M input
+        assert comp["input"] == 3.0
+
+
+class TestTurnCostStats:
+    def test_none_when_no_turns(self):
+        assert _turn_cost_stats([]) is None
+
+    def test_single_turn_all_same(self):
+        turns = [("t", 0.75, 0, 0, 0, 0, "m")]
+        stats = _turn_cost_stats(turns)
+        assert stats == {"first": 0.75, "last": 0.75, "avg": 0.75, "peak": 0.75, "n": 1}
+
+    def test_first_last_avg_peak(self):
+        turns = [
+            ("t", 0.1, 0, 0, 0, 0, "m"),
+            ("t", 0.5, 0, 0, 0, 0, "m"),
+            ("t", 0.2, 0, 0, 0, 0, "m"),
+        ]
+        stats = _turn_cost_stats(turns)
+        assert stats["first"] == 0.1
+        assert stats["last"] == 0.2
+        assert stats["peak"] == 0.5
+        assert abs(stats["avg"] - 0.2666) < 0.001
+        assert stats["n"] == 3
+
+
+class TestEvictInactiveNotifs:
+    def test_keeps_live_sessions(self):
+        state = {
+            "s1": {"level": "red", "fired_at": "x"},
+            "s2": {"level": "amber", "fired_at": "y"},
+        }
+        _evict_inactive_notifs(state, {"s1", "s2"})
+        assert set(state) == {"s1", "s2"}
+
+    def test_drops_sessions_no_longer_live(self):
+        state = {
+            "s1": {"level": "red", "fired_at": "x"},
+            "s2": {"level": "amber", "fired_at": "y"},
+        }
+        _evict_inactive_notifs(state, {"s1"})
+        assert set(state) == {"s1"}
+
+    def test_mutates_in_place_and_returns_same_dict(self):
+        state = {"s1": {"level": "red", "fired_at": "x"}}
+        returned = _evict_inactive_notifs(state, set())
+        assert returned is state
+        assert state == {}

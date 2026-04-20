@@ -9,10 +9,17 @@ import json
 import glob
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import customtkinter as ctk
 from tkinter import ttk
+
+try:
+    from winotify import Notification as _WinotifyNotification  # type: ignore
+    _HAS_TOAST = True
+except Exception:
+    _WinotifyNotification = None  # type: ignore
+    _HAS_TOAST = False
 
 TOOL_NAME = "Claude Usage Monitor"
 TOOL_DESC = "Live monitor for Claude Code session costs, tokens & waste"
@@ -71,6 +78,12 @@ _TOOL_CHARS_PER_TOKEN = 4
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
+ORDER_FILE = CLAUDE_DIR / "claude_usage_monitor_order.json"
+
+# A session is considered "live" if its last activity is within this window.
+# PID-based liveness was too sticky — stale session files kept rows marked LIVE
+# long after the CLI exited.
+_LIVE_WINDOW_SECONDS = 3600  # 1 hour
 
 # Capture the local timezone once at import time so every comparison uses the
 # same wall-clock reference — avoids DST shift mid-run ambiguity.
@@ -302,6 +315,68 @@ def _parse_timestamp(ts_str: str) -> datetime | None:
         return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _is_recently_active(last_timestamp: str | None) -> bool:
+    """True if the session had activity within the last _LIVE_WINDOW_SECONDS."""
+    ts = _parse_timestamp(last_timestamp)
+    if not ts:
+        return False
+    return (datetime.now(timezone.utc) - ts).total_seconds() < _LIVE_WINDOW_SECONDS
+
+
+def _latest_session_id_per_project(sessions: list[dict]) -> set[str]:
+    """Return the session_id of the most recent session for each project."""
+    latest: dict[str, tuple[str, str]] = {}  # proj -> (sid, ts)
+    for s in sessions:
+        proj = s.get("project") or ""
+        ts = s.get("last_timestamp") or ""
+        cur = latest.get(proj)
+        if cur is None or ts > cur[1]:
+            latest[proj] = (s["session_id"], ts)
+    return {sid for sid, _ in latest.values()}
+
+
+def _load_project_state() -> tuple[list[str], list[str], dict]:
+    """Load persisted state: project order, collapsed projects, notification state.
+
+    Shape (all keys optional for backward compat):
+        {"order": [...], "collapsed": [...], "notif_state": {sid: level}}
+    """
+    try:
+        data = json.loads(ORDER_FILE.read_text(encoding="utf-8"))
+        order = [str(p) for p in data.get("order", []) if isinstance(p, str)]
+        collapsed = [str(p) for p in data.get("collapsed", []) if isinstance(p, str)]
+        notif = data.get("notif_state", {})
+        if not isinstance(notif, dict):
+            notif = {}
+        return order, collapsed, notif
+    except Exception:
+        return [], [], {}
+
+
+def _save_project_state(order: list[str], collapsed: list[str],
+                        notif_state: dict) -> None:
+    """Persist ordered projects, collapsed set, and notification dedup state."""
+    try:
+        ORDER_FILE.write_text(
+            json.dumps({
+                "order": order,
+                "collapsed": collapsed,
+                "notif_state": notif_state,
+            }, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # non-fatal
+
+# Back-compat wrappers so existing call sites continue to work during refactor.
+def _load_project_order() -> list[str]:
+    return _load_project_state()[0]
+
+def _save_project_order(order: list[str]) -> None:
+    _, collapsed, notif = _load_project_state()
+    _save_project_state(order, collapsed, notif)
 
 
 def _format_tokens(n: int) -> str:
@@ -546,6 +621,85 @@ def _rotate_tag(score: float) -> str | None:
     return None
 
 
+# Notification tiers (higher = more urgent). "none" means below amber threshold.
+_NOTIF_TIERS = {"none": 0, "amber": 1, "red": 2}
+
+
+def _rotate_level(score: float) -> str:
+    """Map a rotate score to a notification tier name."""
+    if score >= _ROTATE_RED:
+        return "red"
+    if score >= _ROTATE_AMBER:
+        return "amber"
+    return "none"
+
+
+def _should_notify(state: dict, session_id: str, new_level: str) -> bool:
+    """Return True if a new_level alert should fire for this session.
+
+    Fires only on upgrades: none→amber, none→red, amber→red. Downgrades
+    (red→amber, amber→none) are silent so the banner doesn't re-trigger
+    when a session drops below a threshold and climbs back.
+    """
+    if new_level == "none":
+        return False
+    last = state.get(session_id, {}).get("level", "none")
+    return _NOTIF_TIERS.get(new_level, 0) > _NOTIF_TIERS.get(last, 0)
+
+
+def _record_notified(state: dict, session_id: str, level: str) -> None:
+    """Stamp the dedup state with the level just fired."""
+    state[session_id] = {
+        "level": level,
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _evict_inactive_notifs(state: dict, live_ids: set) -> dict:
+    """Drop dedup entries for sessions that are no longer LIVE.
+
+    Returns the pruned dict (same object, mutated in place) so callers can
+    chain or reassign.
+    """
+    for sid in [s for s in state if s not in live_ids]:
+        state.pop(sid, None)
+    return state
+
+
+def _cost_composition(turn_costs: list) -> dict:
+    """Break session cost down by token type by re-applying per-turn model pricing.
+
+    Returns {"input": $, "output": $, "cache_read": $, "cache_write": $, "total": $}.
+    Walks turn-by-turn so sessions with multi-model turns are costed correctly.
+    """
+    buckets = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}
+    for tc in turn_costs:
+        model = tc[6] if len(tc) > 6 else ""
+        p = _get_pricing(model)
+        buckets["input"]       += tc[2] * p.get("input", 0.0) / 1_000_000
+        buckets["output"]      += tc[3] * p.get("output", 0.0) / 1_000_000
+        buckets["cache_read"]  += tc[4] * p.get("cache_read", 0.0) / 1_000_000
+        # Assume 5m cache-writes when breakdown is unknown (matches _calc_turn_cost).
+        cw_rate = p.get("cache_write_5m", p.get("cache_write", 0.0))
+        buckets["cache_write"] += tc[5] * cw_rate / 1_000_000
+    buckets["total"] = sum(buckets.values())
+    return buckets
+
+
+def _turn_cost_stats(turn_costs: list) -> dict | None:
+    """Return {first, last, avg, peak, n} turn costs, or None for empty sessions."""
+    if not turn_costs:
+        return None
+    costs = [tc[1] for tc in turn_costs]
+    return {
+        "first": costs[0],
+        "last": costs[-1],
+        "avg": sum(costs) / len(costs),
+        "peak": max(costs),
+        "n": len(costs),
+    }
+
+
 def _rotate_explanation(sub: dict) -> str:
     """One-line explanation of the dominant weighted factor."""
     weighted = sub["weighted"]
@@ -593,19 +747,45 @@ def _friendly_project(dirname: str, cwd: str | None = None) -> str:
     return "/".join(segments)
 
 
+# Cache parsed sessions by file path; keyed by mtime so unchanged files
+# skip the JSONL re-parse on every 30s refresh.
+_SESSION_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _parse_session_file_cached(filepath: str) -> dict:
+    """_parse_session_file with an mtime-based cache."""
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        return _parse_session_file(filepath)
+    cached = _SESSION_CACHE.get(filepath)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    sess = _parse_session_file(filepath)
+    _SESSION_CACHE[filepath] = (mtime, sess)
+    return sess
+
+
 def load_all_sessions() -> list[dict]:
     """Scan all projects and return parsed session data, newest first."""
     sessions = []
     if not PROJECTS_DIR.exists():
         return sessions
 
+    seen_paths: set[str] = set()
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
             continue
         for jsonl_file in proj_dir.glob("*.jsonl"):
-            sess = _parse_session_file(str(jsonl_file))
+            path = str(jsonl_file)
+            seen_paths.add(path)
+            sess = _parse_session_file_cached(path)
             if sess["assistant_turns"] > 0:
                 sessions.append(sess)
+
+    # Evict cache entries for files that have disappeared.
+    for stale in [p for p in _SESSION_CACHE if p not in seen_paths]:
+        _SESSION_CACHE.pop(stale, None)
 
     # Sort by last timestamp descending
     sessions.sort(
@@ -615,8 +795,22 @@ def load_all_sessions() -> list[dict]:
     return sessions
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the process *pid* is still running."""
+    try:
+        import psutil  # available via launcher requirements
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _get_active_session_ids() -> set:
-    """Read ~/.claude/sessions/*.json to find currently active sessions."""
+    """Read ~/.claude/sessions/*.json and check pid liveness for each entry."""
     active = set()
     if not SESSIONS_DIR.exists():
         return active
@@ -624,11 +818,37 @@ def _get_active_session_ids() -> set:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             sid = data.get("sessionId")
-            if sid:
-                active.add(sid)
+            pid = data.get("pid")
+            if not sid:
+                continue
+            if pid and not _pid_alive(int(pid)):
+                continue  # process is gone — session is not live
+            active.add(sid)
         except Exception:
             pass
     return active
+
+
+# ---------------------------------------------------------------------------
+# Sessions-tab column spec (shared header + per-project Treeview)
+# ---------------------------------------------------------------------------
+# Fields: (col_id, heading_text, width_px, is_numeric)
+# The shared heading row and every per-card Treeview iterate this tuple so
+# pixel-widths stay aligned. Change here to change both sides at once.
+_SESSION_COLUMNS = (
+    ("status",       "",          30,  False),
+    ("session_name", "Session",   200, False),
+    ("model",        "Model",     110, False),
+    ("turns",        "Turns",     55,  True),
+    ("tokens",       "Tokens",    80,  True),
+    ("init",         "Init",      60,  True),
+    ("cost",         "Cost",      70,  True),
+    ("last_turn",    "Last Turn", 75,  True),
+    ("waste",        "Waste",     55,  True),
+    ("rotate",       "Rotate",    70,  True),
+    ("duration",     "Duration",  70,  True),
+    ("date",         "Date",      110, False),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -646,9 +866,15 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         self._active_ids: set = set()
         self._loading = False
         self._auto_refresh = True
-        self._sort_col = "date"       # default sort column
+        self._sort_col = "date"       # default sort column (kept for compat)
         self._sort_reverse = True     # newest first
         self._plan = "Max 5x ($100/mo)"  # default plan
+        self._window = "All"  # time-window filter: Today / Week / Month / All
+        order, collapsed, notif = _load_project_state()
+        self._project_order: list[str] = order
+        self._collapsed_projects: set[str] = set(collapsed)
+        self._notif_state: dict = notif  # {session_id: "amber"|"red"}
+        self._project_cards: dict = {}  # proj_name -> card widgets
 
         self._build_ui()
         self._start_load()
@@ -672,6 +898,16 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         btn_frame = ctk.CTkFrame(top, fg_color="transparent")
         btn_frame.pack(side="right", padx=12)
+
+        # Time-window filter — affects dashboard totals and sessions list
+        ctk.CTkLabel(btn_frame, text="Window:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
+        self._window_var = ctk.StringVar(value=self._window)
+        window_seg = ctk.CTkSegmentedButton(
+            btn_frame, values=["Today", "Week", "Month", "All"],
+            variable=self._window_var, command=self._on_window_change,
+            font=ctk.CTkFont(size=11), height=28,
+        )
+        window_seg.pack(side="left", padx=(0, 12))
 
         # Plan selector
         self._plan_var = ctk.StringVar(value=self._plan)
@@ -703,6 +939,33 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             command=self._start_load,
             fg_color="#3a7ebf", hover_color="#2b6194",
         ).pack(side="left")
+
+        # Rotate-alert banner — hidden until _fire_rotate_notification surfaces
+        # one. Placed between the top bar and the tabs so it can't be scrolled
+        # off the visible area.
+        self._banner = ctk.CTkFrame(self, height=36, corner_radius=0, fg_color="#e09a1a")
+        self._banner_msg = ctk.CTkLabel(
+            self._banner, text="", font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#1e1e1e", anchor="w",
+        )
+        self._banner_msg.pack(side="left", padx=12, pady=6, fill="x", expand=True)
+        self._banner_btn = ctk.CTkButton(
+            self._banner, text="Jump to session", width=120, height=24,
+            fg_color="#1e1e1e", hover_color="#333", text_color="#ffffff",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._banner_jump,
+        )
+        self._banner_btn.pack(side="right", padx=(4, 8), pady=6)
+        self._banner_dismiss = ctk.CTkButton(
+            self._banner, text="X", width=28, height=24,
+            fg_color="transparent", hover_color="#3a3a3a",
+            text_color="#1e1e1e",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._banner_dismiss_click,
+        )
+        self._banner_dismiss.pack(side="right", padx=(0, 6), pady=6)
+        self._banner_target_sid: str | None = None  # which session Jump goes to
+        # Not packed yet — _show_banner handles pack(fill="x") when firing.
 
         # Tabs
         self._tabs = ctk.CTkTabview(self, corner_radius=10)
@@ -823,10 +1086,23 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         # Top projects
         proj_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
         proj_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        proj_header = ctk.CTkFrame(proj_frame, fg_color="transparent")
+        proj_header.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(
-            proj_frame, text="Cost by Project",
+            proj_header, text="Cost by Project",
             font=ctk.CTkFont(size=13, weight="bold"),
-        ).pack(anchor="w", padx=12, pady=(10, 4))
+        ).pack(side="left")
+
+        # Toggle: Top 10 (default) vs Show all. Gets a dynamic label in _render_dashboard.
+        self._proj_show_all = ctk.BooleanVar(value=False)
+        self._proj_toggle_btn = ctk.CTkButton(
+            proj_header, text="Show all", width=90, height=24,
+            fg_color="#3a3a3a", hover_color="#4a4a4a",
+            font=ctk.CTkFont(size=11),
+            command=self._toggle_proj_show_all,
+        )
+        self._proj_toggle_btn.pack(side="right")
 
         self._project_breakdown_frame = ctk.CTkFrame(proj_frame, fg_color="transparent")
         self._project_breakdown_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
@@ -849,19 +1125,19 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         self._hide_archived_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            filt, text="Active only",
+            filt, text="Recent only (latest per project + <1h active)",
             variable=self._hide_archived_var,
             command=self._render_sessions,
             font=ctk.CTkFont(size=11),
         ).pack(side="left", padx=(8, 0))
 
-        # Treeview
+        # Treeview style shared across per-project cards
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Dark.Treeview",
                         background="#1e1e1e", foreground="#e0e0e0",
                         fieldbackground="#1e1e1e", borderwidth=0,
-                        font=("Segoe UI", 10))
+                        font=("Segoe UI", 10), rowheight=22)
         style.configure("Dark.Treeview.Heading",
                         background="#2b2b2b", foreground="#ffffff",
                         font=("Segoe UI", 10, "bold"))
@@ -869,49 +1145,44 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                    background=[("selected", "#3a7ebf")],
                    foreground=[("selected", "#ffffff")])
 
-        cols = ("status", "project", "session_name", "model", "turns",
-                "tokens", "init", "cost", "waste", "rotate",
-                "duration", "date")
-        self._sess_tree = ttk.Treeview(
-            parent, columns=cols, show="headings",
-            style="Dark.Treeview", height=20,
-        )
-
-        headings = {
-            "status": ("", 30),
-            "project": ("Project", 160),
-            "session_name": ("Session", 220),
-            "model": ("Model", 120),
-            "turns": ("Turns", 55),
-            "tokens": ("Tokens", 80),
-            "init": ("Init Tok", 70),
-            "cost": ("Est. Cost", 75),
-            "waste": ("Waste", 55),
-            "rotate": ("Rotate", 70),
-            "duration": ("Duration", 70),
-            "date": ("Date", 120),
-        }
-        numeric_cols = ("turns", "tokens", "init", "cost", "waste", "rotate")
-        for col, (text, width) in headings.items():
-            self._sess_tree.heading(
-                col, text=text,
-                command=lambda c=col: self._on_heading_click(c),
+        # Shared column header — one row at the top of the sessions tab.
+        # Each per-project card drops its own heading so we save vertical space
+        # and stop repeating column labels for every project.
+        header_bar = ctk.CTkFrame(parent, fg_color="#2b2b2b", height=26)
+        header_bar.pack(fill="x", padx=2, pady=(4, 0))
+        header_bar.pack_propagate(False)
+        x_px = 8  # matches per-card tree's padx
+        for col_id, text, w, numeric in _SESSION_COLUMNS:
+            lbl = ctk.CTkLabel(
+                header_bar, text=text, width=w, height=26,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#ffffff",
+                anchor=("e" if numeric else "w"),
             )
-            anchor = "e" if col in numeric_cols else "w"
-            self._sess_tree.column(col, width=width, anchor=anchor, minwidth=40)
+            lbl.place(x=x_px, y=0)
+            x_px += w
 
-        self._sess_tree.pack(fill="both", expand=True)
-        self._sess_tree.bind("<Double-1>", self._on_session_double_click)
+        # Scrollable container — each project gets its own card inside.
+        self._sess_scroll = ctk.CTkScrollableFrame(
+            parent, fg_color="#151515", corner_radius=0,
+        )
+        self._sess_scroll.pack(fill="both", expand=True, padx=2, pady=(0, 2))
 
         hint = ctk.CTkLabel(
-            parent, text="Double-click a session to see per-turn detail",
+            parent,
+            text="Double-click a session for detail  ·  ↑/↓ to reorder projects",
             font=ctk.CTkFont(size=10), text_color="gray",
         )
         hint.pack(pady=(2, 4))
 
     # ------ Detail tab
     def _build_detail_tab(self):
-        parent = self._tab_detail
+        # Wrap the entire detail body in a scrollable frame so cards + chart +
+        # tools panel + turn table are reachable on small window sizes.
+        outer = ctk.CTkScrollableFrame(self._tab_detail, fg_color="transparent")
+        outer.pack(fill="both", expand=True)
+        parent = outer
+        self._detail_scroll = outer
 
         self._detail_header = ctk.CTkLabel(
             parent, text="Select a session from the Sessions tab",
@@ -952,6 +1223,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             ("d_cache_read", "Cache Read"),
             ("d_cache_write", "Cache Write"),
             ("d_cost", "Total Cost"),
+            ("d_last_turn", "Last Turn Tok"),
             ("d_waste", "Waste Factor"),
         ]):
             card = ctk.CTkFrame(self._detail_cards_frame, corner_radius=8, fg_color="#2b2b2b")
@@ -978,6 +1250,76 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             v = ctk.CTkLabel(card, text="—", font=ctk.CTkFont(size=15, weight="bold"))
             v.pack(pady=(0, 6), padx=6)
             self._detail_card_widgets[key] = v
+
+        # Cost composition — where the $ actually went (per token-type).
+        cost_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
+        cost_frame.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(
+            cost_frame, text="Cost Composition",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+
+        self._cost_rows: dict[str, dict] = {}  # token-type -> {bar, label}
+        cost_body = ctk.CTkFrame(cost_frame, fg_color="transparent")
+        cost_body.pack(fill="x", padx=12, pady=(0, 6))
+        # Visually distinct swatch per token-type so the reader scans quickly.
+        palette = {
+            "input":       "#3a7ebf",
+            "output":      "#bf6a3a",
+            "cache_read":  "#2a8a2a",
+            "cache_write": "#9e6a3a",
+        }
+        for key, label in (
+            ("input",       "Input"),
+            ("output",      "Output"),
+            ("cache_read",  "Cache Read"),
+            ("cache_write", "Cache Write"),
+        ):
+            row = ctk.CTkFrame(cost_body, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(
+                row, text=label, width=95, anchor="w",
+                font=ctk.CTkFont(size=11),
+            ).pack(side="left")
+            bar = ctk.CTkProgressBar(
+                row, height=12, progress_color=palette[key],
+                fg_color="#1e1e1e",
+            )
+            bar.set(0.0)
+            bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            val = ctk.CTkLabel(
+                row, text="$0.00  (0%)", width=110, anchor="e",
+                font=ctk.CTkFont(size=11),
+            )
+            val.pack(side="right")
+            self._cost_rows[key] = {"bar": bar, "val": val}
+
+        # Turn-cost stats (first / last / avg / peak) — spots session inflation.
+        stats_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
+        stats_frame.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(
+            stats_frame, text="Turn Cost Stats",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+
+        turn_stats_body = ctk.CTkFrame(stats_frame, fg_color="transparent")
+        turn_stats_body.pack(fill="x", padx=12, pady=(0, 10))
+        self._turn_stat_widgets: dict[str, ctk.CTkLabel] = {}
+        for i, (key, label) in enumerate([
+            ("first", "First Turn"),
+            ("last",  "Last Turn"),
+            ("avg",   "Avg Turn"),
+            ("peak",  "Peak Turn"),
+        ]):
+            cell = ctk.CTkFrame(turn_stats_body, corner_radius=6, fg_color="#1e1e1e")
+            cell.grid(row=0, column=i, padx=4, pady=2, sticky="nsew")
+            turn_stats_body.grid_columnconfigure(i, weight=1)
+            ctk.CTkLabel(
+                cell, text=label, font=ctk.CTkFont(size=10), text_color="gray",
+            ).pack(pady=(6, 1), padx=6)
+            v = ctk.CTkLabel(cell, text="—", font=ctk.CTkFont(size=14, weight="bold"))
+            v.pack(pady=(0, 6), padx=6)
+            self._turn_stat_widgets[key] = v
 
         # Cost growth chart (text-based sparkline)
         chart_frame = ctk.CTkFrame(parent, corner_radius=10, fg_color="#2b2b2b")
@@ -1023,7 +1365,9 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             self._turn_tree.column(col, width=w, anchor=anchor)
         self._turn_tree.tag_configure("cold", foreground="#ff6666")
         self._turn_tree.tag_configure("warm", foreground="#888888")
-        self._turn_tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        # fill="x" (not "both" + expand) because we now live inside a
+        # CTkScrollableFrame — the outer scroll handles vertical overflow.
+        self._turn_tree.pack(fill="x", padx=8, pady=(0, 8))
 
     # ------------------------------------------------------------------ Data loading
     def _start_load(self):
@@ -1035,21 +1379,32 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
     def _bg_load(self):
         sessions = load_all_sessions()
-        active = _get_active_session_ids()
-        self.after(0, lambda: self._on_loaded(sessions, active))
+        # Time-based liveness: PID-based detection was too sticky, leaving
+        # LIVE badges on rows long after the CLI actually exited.
+        self.after(0, lambda: self._on_loaded(sessions))
 
-    def _on_loaded(self, sessions, active):
+    def _on_loaded(self, sessions, _legacy=None):
         self._sessions = sessions
-        self._active_ids = active
+        self._active_ids = {
+            s["session_id"] for s in sessions
+            if _is_recently_active(s.get("last_timestamp"))
+        }
         self._loading = False
 
         total = len(sessions)
+        in_window = sum(1 for s in sessions if self._session_in_window(s))
+        window_str = self._window
+        if window_str == "All":
+            status = f"{total} sessions"
+        else:
+            status = f"{in_window} in {window_str} (of {total})"
         self._status_label.configure(
-            text=f"{total} sessions loaded  |  Last refresh: {datetime.now().strftime('%H:%M:%S')}"
+            text=f"{status}  |  Last refresh: {datetime.now().strftime('%H:%M:%S')}"
         )
 
         self._render_dashboard()
         self._render_sessions()
+        self._scan_rotate_notifications()
 
         # Schedule next auto-refresh
         if self._auto_refresh:
@@ -1072,6 +1427,49 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
     def _on_plan_change(self, _val=None):
         self._plan = self._plan_var.get()
         self._render_dashboard()
+
+    def _toggle_proj_show_all(self):
+        self._proj_show_all.set(not self._proj_show_all.get())
+        self._render_dashboard()
+
+    def _on_window_change(self, _val=None):
+        self._window = self._window_var.get()
+        self._render_dashboard()
+        self._render_sessions()
+
+    @staticmethod
+    def _window_cutoff(window: str) -> datetime | None:
+        """UTC cutoff timestamp for a time-window label. None = no filter."""
+        if window == "All":
+            return None
+        now = datetime.now(timezone.utc)
+        if window == "Today":
+            return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if window == "Week":
+            return now - timedelta(days=7)
+        if window == "Month":
+            return now - timedelta(days=30)
+        return None
+
+    def _session_in_window(self, s: dict) -> bool:
+        """True if the session's last activity falls within the active window."""
+        cutoff = self._window_cutoff(self._window)
+        if cutoff is None:
+            return True
+        ts = _parse_timestamp(s.get("last_timestamp"))
+        if ts is None:
+            return False
+        return ts >= cutoff
+
+    def _window_months(self) -> float:
+        """Fraction of a month covered by the active window (for plan-cost scaling)."""
+        if self._window == "Today":
+            return 1.0 / 30.0
+        if self._window == "Week":
+            return 7.0 / 30.0
+        if self._window == "Month":
+            return 1.0
+        return self._months_spanned()
 
     @staticmethod
     def _plan_monthly_cost(plan: str) -> float | None:
@@ -1103,16 +1501,19 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------ Renderers
     def _render_dashboard(self):
-        api_value = sum(s["total_cost"] for s in self._sessions)
-        total_turns = sum(s["assistant_turns"] for s in self._sessions)
+        # Apply the time-window filter to the dashboard view.
+        windowed = [s for s in self._sessions if self._session_in_window(s)]
+
+        api_value = sum(s["total_cost"] for s in windowed)
+        total_turns = sum(s["assistant_turns"] for s in windowed)
         total_tokens = sum(
             s["total_input"] + s["total_output"] + s["total_cache_read"] + s["total_cache_write"]
-            for s in self._sessions
+            for s in windowed
         )
 
-        # Plan calculations
+        # Plan calculations — scale by the active window (Today / Week / Month / All).
         monthly = self._plan_monthly_cost(self._plan)
-        months = self._months_spanned()
+        months = self._window_months()
 
         if monthly is not None:
             plan_total = monthly * months
@@ -1138,19 +1539,19 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             self._card_widgets["savings"].configure(text="N/A", text_color="gray")
             self._card_widgets["value_ratio"].configure(text="N/A", text_color="gray")
 
-        self._card_widgets["total_sessions"].configure(text=str(len(self._sessions)))
+        self._card_widgets["total_sessions"].configure(text=str(len(windowed)))
         self._card_widgets["total_turns"].configure(text=f"{total_turns:,}")
         self._card_widgets["total_tokens"].configure(text=_format_tokens(total_tokens))
 
         # Peak hours
-        self._render_peak_hours()
+        self._render_peak_hours(windowed)
 
         # Model breakdown
         for w in self._model_breakdown_frame.winfo_children():
             w.destroy()
 
         model_costs: dict[str, float] = {}
-        for s in self._sessions:
+        for s in windowed:
             for m in s["models_used"]:
                 model_costs[m] = model_costs.get(m, 0) + s["total_cost"]
         if not model_costs:
@@ -1175,7 +1576,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
         tool_costs: dict[str, float] = {}
         tool_calls: dict[str, int] = {}
-        for s in self._sessions:
+        for s in windowed:
             for name, st in (s.get("tool_stats") or {}).items():
                 tool_costs[name] = tool_costs.get(name, 0.0) + st["est_cost"]
                 tool_calls[name] = tool_calls.get(name, 0) + st["calls"]
@@ -1202,41 +1603,66 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 info = f"~{_format_cost(cost)}  ({tool_calls[name]} calls)"
                 ctk.CTkLabel(row, text=info, font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
 
-        # Project breakdown
+        # Project breakdown (2-col grid; Top 10 by default, Show all toggle)
         for w in self._project_breakdown_frame.winfo_children():
             w.destroy()
 
         proj_costs: dict[str, float] = {}
         proj_sessions: dict[str, int] = {}
         proj_cwd: dict[str, str | None] = {}
-        for s in self._sessions:
+        for s in windowed:
             p = s["project"]
             proj_costs[p] = proj_costs.get(p, 0) + s["total_cost"]
             proj_sessions[p] = proj_sessions.get(p, 0) + 1
             if p not in proj_cwd:
                 proj_cwd[p] = s.get("cwd")
 
-        max_pc = max(proj_costs.values()) if proj_costs else 1
-        for proj, cost in sorted(proj_costs.items(), key=lambda x: -x[1]):
+        ranked = sorted(proj_costs.items(), key=lambda x: -x[1])
+        total_projects = len(ranked)
+        show_all = self._proj_show_all.get()
+        visible = ranked if show_all else ranked[:10]
+
+        # Update toggle label with accurate count
+        if total_projects > 10:
+            self._proj_toggle_btn.configure(
+                text=f"Top 10" if show_all else f"Show all ({total_projects})"
+            )
+            self._proj_toggle_btn.pack(side="right")
+        else:
+            # Nothing to toggle — hide the button.
+            self._proj_toggle_btn.pack_forget()
+
+        max_pc = max((c for _, c in visible), default=1)
+        self._project_breakdown_frame.grid_columnconfigure(0, weight=1, uniform="pcol")
+        self._project_breakdown_frame.grid_columnconfigure(1, weight=1, uniform="pcol")
+        for idx, (proj, cost) in enumerate(visible):
             row = ctk.CTkFrame(self._project_breakdown_frame, fg_color="transparent")
-            row.pack(fill="x", pady=2)
+            row.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=4, pady=2)
 
             friendly = _friendly_project(proj, proj_cwd.get(proj))
-            ctk.CTkLabel(row, text=friendly, font=ctk.CTkFont(size=11), width=220, anchor="w").pack(side="left")
+            ctk.CTkLabel(
+                row, text=friendly, font=ctk.CTkFont(size=11),
+                width=160, anchor="w",
+            ).pack(side="left")
 
-            bar_width = max(4, int(250 * (cost / max_pc))) if max_pc > 0 else 4
-            bar = ctk.CTkFrame(row, width=bar_width, height=16, corner_radius=4, fg_color="#bf6a3a")
-            bar.pack(side="left", padx=(8, 4))
+            bar_width = max(4, int(140 * (cost / max_pc))) if max_pc > 0 else 4
+            bar = ctk.CTkFrame(row, width=bar_width, height=14, corner_radius=4, fg_color="#bf6a3a")
+            bar.pack(side="left", padx=(6, 4))
             bar.pack_propagate(False)
 
-            info = f"{_format_cost(cost)}  ({proj_sessions[proj]} sessions)"
-            ctk.CTkLabel(row, text=info, font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
+            info = f"{_format_cost(cost)} ({proj_sessions[proj]})"
+            ctk.CTkLabel(row, text=info, font=ctk.CTkFont(size=11)).pack(side="left", padx=2)
 
-    def _render_peak_hours(self):
-        """Draw 24-bar chart of total cost per hour-of-day and update peak pill."""
+    def _render_peak_hours(self, sessions: list[dict] | None = None):
+        """Draw 24-bar chart of total cost per hour-of-day and update peak pill.
+
+        If `sessions` is omitted, aggregate across everything; the dashboard
+        passes a window-filtered subset so the peak view honors Today/Week/Month.
+        """
+        sessions = sessions if sessions is not None else self._sessions
         # Aggregate cost per local hour across every turn
         hour_costs = [0.0] * 24
-        for s in self._sessions:
+        for s in sessions:
             for tc in s["turn_costs"]:
                 ts_str, cost = tc[0], tc[1]
                 ts = _parse_timestamp(ts_str)
@@ -1312,18 +1738,33 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         )
 
     def _render_sessions(self):
-        for item in self._sess_tree.get_children():
-            self._sess_tree.delete(item)
+        """Reconcile-by-key: update existing cards in place, only create/destroy deltas.
+
+        Destroy-rebuild reset the outer scroll position every 30s whenever a
+        new project appeared. Now we diff self._project_cards against the
+        freshly-computed order, so scroll position is preserved.
+        """
+        # Belt-and-braces: save and restore outer scroll position (T7).
+        try:
+            saved_yview = self._sess_scroll._parent_canvas.yview()
+        except Exception:
+            saved_yview = None
 
         query = self._sess_search_var.get().strip().lower()
-        hide_archived = self._hide_archived_var.get()
+        recent_only = self._hide_archived_var.get()
 
-        # Build rows with both display values and raw sortable values
-        rows = []
+        # "Recent only" = latest session per project OR <1h since last activity.
+        latest_ids = _latest_session_id_per_project(self._sessions)
+
+        # Filter + enrich (with time-window filter from T9).
+        enriched = []
         for s in self._sessions:
-            is_active = s["session_id"] in self._active_ids
+            if not self._session_in_window(s):
+                continue
+            is_live = s["session_id"] in self._active_ids  # time-based (<1h)
+            is_latest = s["session_id"] in latest_ids
 
-            if hide_archived and not is_active:
+            if recent_only and not (is_live or is_latest):
                 continue
 
             proj = _friendly_project(s["project"], s.get("cwd"))
@@ -1332,121 +1773,440 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
 
             if query and query not in proj.lower() and query not in model.lower() and query not in sess_name.lower():
                 continue
-            status = "LIVE" if is_active else ""
-            tok_in = s["total_input"]
-            tok_out = s["total_output"]
-            tok_cr = s["total_cache_read"]
-            tok_cw = s["total_cache_write"]
+
+            enriched.append({
+                "s": s, "proj": proj, "model": model,
+                "sess_name": sess_name, "is_live": is_live,
+            })
+
+        # Bucket by project
+        buckets: dict[str, list[dict]] = {}
+        for item in enriched:
+            buckets.setdefault(item["proj"], []).append(item)
+
+        # Resolve display order: user-saved first, then remaining by total cost desc.
+        saved = [p for p in self._project_order if p in buckets]
+        remaining = sorted(
+            [p for p in buckets if p not in saved],
+            key=lambda p: sum(i["s"]["total_cost"] for i in buckets[p]),
+            reverse=True,
+        )
+        ordered = saved + remaining
+
+        # Persist (merges newly-seen projects into the saved order).
+        if ordered != self._project_order:
+            self._project_order = ordered
+            _save_project_state(
+                ordered, sorted(self._collapsed_projects), self._notif_state,
+            )
+
+        # --- Reconcile ---
+        # Destroy cards for projects that no longer appear.
+        for proj in list(self._project_cards.keys()):
+            if proj not in buckets:
+                self._project_cards[proj]["card"].destroy()
+                self._project_cards.pop(proj, None)
+
+        # Create or update cards, in order.
+        total = len(ordered)
+        for index, proj in enumerate(ordered):
+            items = buckets[proj]
+            if proj in self._project_cards:
+                self._update_project_card(proj, items, index, total)
+            else:
+                self._build_project_card(proj, items, index, total)
+
+        # Re-pack in desired order. pack_forget + pack preserves widget
+        # identity (scroll, selection, etc.) and only reshuffles layout.
+        for proj in ordered:
+            card = self._project_cards[proj]["card"]
+            card.pack_forget()
+            card.pack(fill="x", pady=6, padx=4)
+
+        # Restore scroll position after layout settles.
+        if saved_yview is not None:
+            def _restore():
+                try:
+                    self._sess_scroll._parent_canvas.yview_moveto(saved_yview[0])
+                except Exception:
+                    pass
+            self.after_idle(_restore)
+
+    def _build_project_card(self, proj: str, items: list[dict],
+                            index: int, total: int) -> None:
+        """Build one project card (header + embedded Treeview). Stores widget
+        handles in self._project_cards[proj] so _update_project_card can refresh
+        in place without destroy+rebuild.
+        """
+        card = ctk.CTkFrame(
+            self._sess_scroll, fg_color="#1e1e1e",
+            corner_radius=10, border_width=1, border_color="#333",
+        )
+        card.pack(fill="x", pady=6, padx=4)
+
+        # ---- Header
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(8, 4))
+
+        # Collapse toggle (T8). Keeps tree hidden when user prefers.
+        collapse_btn = ctk.CTkButton(
+            header, text="▼", width=24, height=24,
+            fg_color="transparent", hover_color="#3a3a3a",
+            font=ctk.CTkFont(size=11),
+            command=lambda p=proj: self._toggle_project_collapsed(p),
+        )
+        collapse_btn.pack(side="left", padx=(0, 4))
+
+        title_lbl = ctk.CTkLabel(
+            header, text=proj,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffd479",
+        )
+        title_lbl.pack(side="left")
+
+        meta_lbl = ctk.CTkLabel(
+            header, text="",
+            font=ctk.CTkFont(size=11), text_color="gray",
+        )
+        meta_lbl.pack(side="left")
+
+        live_lbl = ctk.CTkLabel(
+            header, text="  LIVE",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#44ee44",
+        )
+        # Packed/unpacked in _update_project_card based on any_live.
+
+        # Reorder arrows (rightmost)
+        down_btn = ctk.CTkButton(
+            header, text="↓", width=26, height=26,
+            fg_color="#2b2b2b", hover_color="#3a3a3a",
+            command=lambda p=proj: self._move_project(p, +1),
+        )
+        down_btn.pack(side="right", padx=2)
+        up_btn = ctk.CTkButton(
+            header, text="↑", width=26, height=26,
+            fg_color="#2b2b2b", hover_color="#3a3a3a",
+            command=lambda p=proj: self._move_project(p, -1),
+        )
+        up_btn.pack(side="right", padx=2)
+
+        # ---- Body: Treeview (columns come from shared _SESSION_COLUMNS so the
+        # hoisted header bar stays pixel-aligned). show="" hides the per-card
+        # heading row — we rely on the shared bar above _sess_scroll instead.
+        cols = tuple(c[0] for c in _SESSION_COLUMNS)
+        tree = ttk.Treeview(
+            card, columns=cols, show="",
+            style="Dark.Treeview", height=1,
+        )
+        for col_id, _text, w, numeric in _SESSION_COLUMNS:
+            tree.column(
+                col_id, width=w, minwidth=40,
+                anchor=("e" if numeric else "w"),
+                stretch=False,
+            )
+
+        tree.pack(fill="x", padx=8, pady=(0, 8))
+        tree.bind("<Double-1>", self._on_session_double_click)
+        tree.tag_configure("active", foreground="#44ee44")
+        tree.tag_configure("rot_red", background="#4a1a1a")
+        tree.tag_configure("rot_amber", background="#4a3a1a")
+        tree.tag_configure("group_model", background="#222222", foreground="#89c2ff")
+
+        self._project_cards[proj] = {
+            "card": card,
+            "header": header,
+            "title": title_lbl,
+            "meta": meta_lbl,
+            "live": live_lbl,
+            "up": up_btn,
+            "down": down_btn,
+            "collapse": collapse_btn,
+            "tree": tree,
+            "tree_multi_model": False,  # show style may need swap on update
+        }
+        self._update_project_card(proj, items, index, total)
+
+    def _update_project_card(self, proj: str, items: list[dict],
+                             index: int, total: int) -> None:
+        """Refresh an existing project card in place without destroying widgets.
+
+        Preserves outer scroll position: we only mutate text, state, and
+        Treeview rows — never destroy the card frame.
+        """
+        handles = self._project_cards[proj]
+        card = handles["card"]
+        meta_lbl = handles["meta"]
+        live_lbl = handles["live"]
+        up_btn = handles["up"]
+        down_btn = handles["down"]
+        tree = handles["tree"]
+
+        n = len(items)
+        turns = sum(i["s"]["assistant_turns"] for i in items)
+        tokens = sum(
+            i["s"]["total_input"] + i["s"]["total_output"]
+            + i["s"]["total_cache_read"] + i["s"]["total_cache_write"]
+            for i in items
+        )
+        cost = sum(i["s"]["total_cost"] for i in items)
+        any_live = any(i["is_live"] for i in items)
+
+        meta = (
+            f"  ·  {n} session{'s' if n != 1 else ''}"
+            f"  ·  {turns} turns"
+            f"  ·  {_format_tokens(tokens)} tok"
+            f"  ·  {_format_cost(cost)}"
+        )
+        meta_lbl.configure(text=meta)
+
+        if any_live:
+            # Pack after the meta label (which is `side="left"`), before the ↑↓ buttons.
+            if not live_lbl.winfo_ismapped():
+                live_lbl.pack(side="left")
+        else:
+            if live_lbl.winfo_ismapped():
+                live_lbl.pack_forget()
+
+        up_btn.configure(state="disabled" if index == 0 else "normal")
+        down_btn.configure(state="disabled" if index == total - 1 else "normal")
+
+        # Border tint by max live rotate score (T13).
+        card.configure(border_color=self._project_border_color(items))
+
+        # Re-populate the tree contents. We keep the Treeview widget alive
+        # so its own state (scroll/selection) is intact within the card.
+        self._populate_project_tree(tree, proj, items)
+
+        # Collapse state (T8) — honor user preference.
+        if proj in self._collapsed_projects:
+            if tree.winfo_ismapped():
+                tree.pack_forget()
+            handles["collapse"].configure(text="▶")
+        else:
+            if not tree.winfo_ismapped():
+                tree.pack(fill="x", padx=8, pady=(0, 8))
+            handles["collapse"].configure(text="▼")
+
+    def _populate_project_tree(self, tree: "ttk.Treeview", proj: str,
+                               items: list[dict]) -> None:
+        """Clear and re-fill the per-project Treeview with current items.
+
+        Flat list (no model-grouping) — the model is shown in its own column,
+        which keeps every row aligned with the hoisted header bar.
+        """
+        # Preserve selection inside this card if it survives the refresh.
+        prior_sel = tree.selection()
+        prior_focus = tree.focus()
+
+        # show="" is enforced at build time; height follows row count.
+        tree.configure(height=max(1, len(items)))
+
+        # Clear old rows (flat — no nested children after the switch).
+        for iid in tree.get_children():
+            tree.delete(iid)
+
+        # Newest first inside each project card.
+        items_sorted = sorted(
+            items, key=lambda i: i["s"]["last_timestamp"] or "", reverse=True,
+        )
+
+        for i in items_sorted:
+            s = i["s"]
+            is_live = i["is_live"]
+            tok_in = s["total_input"]; tok_out = s["total_output"]
+            tok_cr = s["total_cache_read"]; tok_cw = s["total_cache_write"]
+            total_tokens = tok_in + tok_cr + tok_cw + tok_out
+
             wf = _waste_factor(s["turn_costs"])
             waste_str = f"{wf:.1f}x" if wf is not None else "—"
             init_tokens = _turn_total_tokens(s["turn_costs"][0]) if s["turn_costs"] else 0
+            last_turn_tokens = _turn_total_tokens(s["turn_costs"][-1]) if s["turn_costs"] else 0
             duration = _duration_str(s["first_timestamp"], s["last_timestamp"])
 
-            total_tokens = tok_in + tok_cr + tok_cw + tok_out
-
-            # Rotation signal: bar + % per row; colored tag for amber/red
             rot_sub = _rotate_subscores(s)
             if rot_sub:
-                rot_score = rot_sub["total"]
-                rot_display = _rotate_bar(rot_score)
-                rot_tag_name = _rotate_tag(rot_score)
+                rot_display = _rotate_bar(rot_sub["total"])
+                rot_tag_name = _rotate_tag(rot_sub["total"])
             else:
-                rot_score = -1
                 rot_display = ""
                 rot_tag_name = None
 
             date_str = ""
             ts = _parse_timestamp(s["last_timestamp"])
             if ts:
-                local = ts.astimezone(LOCAL_TZ)
-                date_str = local.strftime("%Y-%m-%d %H:%M")
+                date_str = ts.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
 
-            row_tags = []
-            if is_active:
-                row_tags.append("active")
+            tags = []
+            if is_live:
+                tags.append("active")
             if rot_tag_name:
-                row_tags.append(rot_tag_name)
-            tags = tuple(row_tags)
+                tags.append(rot_tag_name)
 
-            display = (status, proj, sess_name, model, s["assistant_turns"],
-                       _format_tokens(total_tokens),
-                       _format_tokens(init_tokens),
-                       _format_cost(s["total_cost"]),
-                       waste_str, rot_display, duration, date_str)
+            display = (
+                "LIVE" if is_live else "",
+                i["sess_name"], i["model"], s["assistant_turns"],
+                _format_tokens(total_tokens),
+                _format_tokens(init_tokens),
+                _format_cost(s["total_cost"]),
+                _format_tokens(last_turn_tokens),
+                waste_str, rot_display, duration, date_str,
+            )
+            tree.insert(
+                "", "end", iid=s["session_id"],
+                text="", values=display, tags=tuple(tags),
+            )
 
-            # Raw values for sorting (numeric where applicable)
-            sort_vals = {
-                "status": (0 if is_active else 1),
-                "project": proj.lower(),
-                "session_name": sess_name.lower(),
-                "model": model.lower(),
-                "turns": s["assistant_turns"],
-                "tokens": total_tokens,
-                "init": init_tokens,
-                "cost": s["total_cost"],
-                "waste": wf if wf is not None else 0,
-                "rotate": rot_score,
-                "duration": (ts.timestamp() if ts else 0) - (_parse_timestamp(s["first_timestamp"]).timestamp() if _parse_timestamp(s["first_timestamp"]) else 0),
-                "date": s["last_timestamp"] or "",
-            }
+        # Restore selection if the iid still exists.
+        try:
+            survivors = [iid for iid in prior_sel if tree.exists(iid)]
+            if survivors:
+                tree.selection_set(survivors)
+            if prior_focus and tree.exists(prior_focus):
+                tree.focus(prior_focus)
+        except Exception:
+            pass
 
-            rows.append((s["session_id"], display, tags, sort_vals))
+    def _project_border_color(self, items: list[dict]) -> str:
+        """Ambient rotation border: reflect worst LIVE rotate score for this project."""
+        worst = 0.0
+        for i in items:
+            if not i["is_live"]:
+                continue
+            sub = _rotate_subscores(i["s"])
+            if sub is None:
+                continue
+            if sub["total"] > worst:
+                worst = sub["total"]
+        if worst >= _ROTATE_RED:
+            return "#cc3333"
+        if worst >= _ROTATE_AMBER:
+            return "#e09a1a"
+        return "#333"
 
-        # Apply current sort
-        col, reverse = self._sort_col, self._sort_reverse
-        if col:
-            rows.sort(key=lambda r: r[3].get(col, ""), reverse=reverse)
-
-        for sid, display, tags, _ in rows:
-            self._sess_tree.insert("", "end", iid=sid, values=display, tags=tags)
-
-        self._sess_tree.tag_configure("active", foreground="#44ee44")
-        # Rotation status — background tint, compatible with "active" foreground
-        self._sess_tree.tag_configure("rot_red", background="#4a1a1a")
-        self._sess_tree.tag_configure("rot_amber", background="#4a3a1a")
-
-    def _on_heading_click(self, col):
-        """Sort sessions table by clicked column header."""
-        if self._sort_col == col:
-            self._sort_reverse = not self._sort_reverse
+    def _toggle_project_collapsed(self, proj: str) -> None:
+        if proj in self._collapsed_projects:
+            self._collapsed_projects.discard(proj)
         else:
-            self._sort_col = col
-            self._sort_reverse = False
-
-        # Update heading arrows
-        cols = ("status", "project", "session_name", "model", "turns",
-                "tokens", "init", "cost", "waste", "rotate",
-                "duration", "date")
-        base_headings = {
-            "status": "", "project": "Project", "session_name": "Session",
-            "model": "Model", "turns": "Turns",
-            "tokens": "Tokens",
-            "init": "Init Tok",
-            "cost": "Est. Cost", "waste": "Waste",
-            "rotate": "Rotate",
-            "duration": "Duration", "date": "Date",
-        }
-        for c in cols:
-            arrow = ""
-            if c == self._sort_col:
-                arrow = " v" if self._sort_reverse else " ^"
-            self._sess_tree.heading(c, text=base_headings[c] + arrow)
-
+            self._collapsed_projects.add(proj)
+        _save_project_state(
+            self._project_order,
+            sorted(self._collapsed_projects),
+            self._notif_state,
+        )
         self._render_sessions()
 
+    def _move_project(self, proj: str, delta: int) -> None:
+        """Swap project with its neighbour in the saved order, then re-render."""
+        order = list(self._project_order)
+        if proj not in order:
+            return
+        idx = order.index(proj)
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(order):
+            return
+        order[idx], order[new_idx] = order[new_idx], order[idx]
+        self._project_order = order
+        _save_project_state(order, sorted(self._collapsed_projects), self._notif_state)
+        self._render_sessions()
+
+    # ------------------------------------------------------------------ Rotate banner + toast
+    def _show_banner(self, level: str, proj: str, session_id: str) -> None:
+        """Display the top-of-window rotate banner targeting a specific session."""
+        color = "#cc3333" if level == "red" else "#e09a1a"
+        label = "ROTATE NOW" if level == "red" else "CONSIDER ROTATING"
+        self._banner.configure(fg_color=color)
+        self._banner_msg.configure(text=f"{label} — {proj}")
+        self._banner_target_sid = session_id
+        try:
+            self._banner.pack(fill="x", before=self._tabs)
+        except Exception:
+            # Fallback if _tabs isn't packed yet; banner simply won't show.
+            pass
+
+    def _banner_jump(self) -> None:
+        sid = self._banner_target_sid
+        if not sid:
+            return
+        session = next((s for s in self._sessions if s["session_id"] == sid), None)
+        if session is None:
+            self._banner_dismiss_click()
+            return
+        self._show_session_detail(session)
+        self._tabs.set("Session Detail")
+        self._banner_dismiss_click()
+
+    def _banner_dismiss_click(self) -> None:
+        self._banner_target_sid = None
+        try:
+            self._banner.pack_forget()
+        except Exception:
+            pass
+
+    def _fire_toast(self, level: str, proj: str, explanation: str) -> None:
+        """OS-level toast via winotify. No-op if the dep is missing."""
+        if not _HAS_TOAST:
+            return
+        try:
+            label = "ROTATE NOW" if level == "red" else "Consider rotating"
+            toast = _WinotifyNotification(
+                app_id="Claude Usage Monitor",
+                title=f"{label} — {proj}",
+                msg=explanation,
+            )
+            toast.show()
+        except Exception:
+            # Never let a flaky toast crash the refresh loop.
+            pass
+
+    def _scan_rotate_notifications(self) -> None:
+        """Walk LIVE sessions, fire dedup'd toasts + banner on threshold upgrades."""
+        live_sessions = [s for s in self._sessions if s["session_id"] in self._active_ids]
+        live_ids = {s["session_id"] for s in live_sessions}
+        _evict_inactive_notifs(self._notif_state, live_ids)
+
+        # Find the single highest-tier unfired upgrade to surface in the banner.
+        # Multiple hot sessions are still each toasted; banner shows the worst.
+        banner_candidate: tuple[int, dict, str] | None = None  # (tier, session, level)
+        fired = False
+
+        for s in live_sessions:
+            sub = _rotate_subscores(s)
+            if sub is None:
+                continue
+            level = _rotate_level(sub["total"])
+            sid = s["session_id"]
+            if _should_notify(self._notif_state, sid, level):
+                proj = _friendly_project(s["project"], s.get("cwd"))
+                self._fire_toast(level, proj, _rotate_explanation(sub))
+                _record_notified(self._notif_state, sid, level)
+                fired = True
+                tier = _NOTIF_TIERS[level]
+                if banner_candidate is None or tier > banner_candidate[0]:
+                    banner_candidate = (tier, s, level)
+
+        if banner_candidate is not None:
+            _, s, level = banner_candidate
+            proj = _friendly_project(s["project"], s.get("cwd"))
+            self._show_banner(level, proj, s["session_id"])
+
+        if fired:
+            _save_project_state(
+                self._project_order,
+                sorted(self._collapsed_projects),
+                self._notif_state,
+            )
+
     def _on_session_double_click(self, event):
-        sel = self._sess_tree.selection()
+        # Each project card owns its own Treeview — find the one that fired.
+        tree = event.widget
+        sel = tree.selection()
         if not sel:
             return
         sid = sel[0]
-        session = None
-        for s in self._sessions:
-            if s["session_id"] == sid:
-                session = s
-                break
+        session = next((s for s in self._sessions if s["session_id"] == sid), None)
         if not session:
             return
-
         self._show_session_detail(session)
         self._tabs.set("Session Detail")
 
@@ -1492,6 +2252,29 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         self._detail_card_widgets["d_cache_read"].configure(text=_format_tokens(s["total_cache_read"]))
         self._detail_card_widgets["d_cache_write"].configure(text=_format_tokens(s["total_cache_write"]))
         self._detail_card_widgets["d_cost"].configure(text=_format_cost(s["total_cost"]))
+
+        last_turn_tokens = _turn_total_tokens(s["turn_costs"][-1]) if s["turn_costs"] else 0
+        self._detail_card_widgets["d_last_turn"].configure(text=_format_tokens(last_turn_tokens))
+
+        # Cost composition + turn stats
+        comp = _cost_composition(s["turn_costs"])
+        comp_total = comp["total"] or 1e-9  # avoid div-by-zero when session is empty
+        for key in ("input", "output", "cache_read", "cache_write"):
+            amt = comp[key]
+            pct = amt / comp_total
+            row = self._cost_rows[key]
+            row["bar"].set(pct)
+            row["val"].configure(text=f"{_format_cost(amt)}  ({pct * 100:.0f}%)")
+
+        stats = _turn_cost_stats(s["turn_costs"])
+        if stats is None:
+            for w in self._turn_stat_widgets.values():
+                w.configure(text="—")
+        else:
+            self._turn_stat_widgets["first"].configure(text=_format_cost(stats["first"]))
+            self._turn_stat_widgets["last"].configure(text=_format_cost(stats["last"]))
+            self._turn_stat_widgets["avg"].configure(text=_format_cost(stats["avg"]))
+            self._turn_stat_widgets["peak"].configure(text=_format_cost(stats["peak"]))
 
         wf = _waste_factor(s["turn_costs"])
         if wf is not None:
