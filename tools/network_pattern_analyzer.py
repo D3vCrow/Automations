@@ -22,7 +22,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
 
+from tools._common.exceptions import narrow_excepts
+from tools._common.logging import get_logger
+
 TOOL_NAME = "Network Pattern Analyzer"
+log = get_logger(__name__)
 
 class NetworkPatternAnalyzer:
     def __init__(self):
@@ -102,7 +106,7 @@ class NetworkPatternAnalyzer:
                         self.export_data.append(data)
                         incidents_count += len(data.get('incidents', []))
                         events_count += len(data.get('events', []))
-                except Exception as e:
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
                     print(f"Error loading {file_path}: {e}")
                     
             self.status_label.configure(
@@ -120,8 +124,8 @@ class NetworkPatternAnalyzer:
                 
             self.results_text.insert(tk.END, f"\nClick 'Analyze' to detect patterns...")
             self.results_text.configure(state="disabled")
-            
-        except Exception as e:
+
+        except (OSError, tk.TclError) as e:
             messagebox.showerror("Load Error", f"Error loading export files:\n{e}")
             self.status_label.configure(text="Error loading files")
             
@@ -157,8 +161,8 @@ class NetworkPatternAnalyzer:
             # Display results
             self._display_results()
             self.status_label.configure(text="Analysis complete!")
-            
-        except Exception as e:
+
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
             messagebox.showerror("Analysis Error", f"Error during analysis:\n{e}")
             self.status_label.configure(text="Analysis failed")
             
@@ -375,17 +379,20 @@ class NetworkPatternAnalyzer:
                 
             messagebox.showinfo("Export Complete", f"Analysis results saved to:\n{file_path}")
             self.status_label.configure(text="Analysis exported successfully")
-            
-        except Exception as e:
+
+        except (OSError, TypeError) as e:
             messagebox.showerror("Export Error", f"Error exporting analysis:\n{e}")
             
     # Helper methods
+    @narrow_excepts(ValueError, TypeError, default=None)
     def _parse_timestamp(self, timestamp_str: str) -> datetime:
-        """Parse timestamp string to datetime object"""
-        try:
-            return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
+        """Parse timestamp string to datetime object.
+
+        Returns ``None`` on malformed or non-string input (caught by the
+        decorator). ``ValueError`` covers format mismatches; ``TypeError``
+        covers non-string values slipping through loose JSON input.
+        """
+        return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
             
     def _calculate_duration_seconds(self, start_time: str, end_time: str) -> float:
         """Calculate duration in seconds between two timestamps"""
@@ -426,7 +433,8 @@ def run_tool():
     try:
         app = NetworkPatternAnalyzer()
         app.run()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: surface any startup fault to UI
+        log.exception("Network Pattern Analyzer startup failed")
         messagebox.showerror("Network Pattern Analyzer", f"Startup error:\n{e}")
 
 if __name__ == "__main__":
