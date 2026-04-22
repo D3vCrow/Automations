@@ -31,8 +31,12 @@ except ImportError:
     import tkinter as tk
     from tkinter import ttk
 
+from tools._common.exceptions import narrow_excepts
+from tools._common.logging import get_logger
+
 TOOL_NAME = "Security Audit"
 TOOL_DESCRIPTION = "Comprehensive security audit — checks startup, processes, ports, files, DNS, accounts, Wi-Fi, USB, browser, event logs"
+log = get_logger(__name__)
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -49,21 +53,25 @@ def safe_run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
         return cp.returncode, cp.stdout, cp.stderr
     except subprocess.TimeoutExpired:
         return 1, "", "timeout"
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         return 1, "", str(e)
 
+@narrow_excepts(AttributeError, OSError, default=False)
 def is_admin() -> bool:
-    try:
-        import ctypes
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
+    """Return True when running with Windows admin rights.
 
+    Caught: ``AttributeError`` (non-Windows: ``ctypes.windll`` missing),
+    ``OSError`` (ctypes shell32 call failure). Non-admin falls through
+    the decorator with ``default=False``.
+    """
+    import ctypes
+    return ctypes.windll.shell32.IsUserAnAdmin() != 0
+
+
+@narrow_excepts(OSError, ValueError, default=9999)
 def _age_days(path: str) -> float:
-    try:
-        return (time.time() - os.path.getmtime(path)) / 86400
-    except Exception:
-        return 9999
+    """Return file age in days; 9999 sentinel on stat failure."""
+    return (time.time() - os.path.getmtime(path)) / 86400
 
 SAFE_PROCESS_PATHS = [
     "\\microsoft\\", "\\windows defender\\", "\\windows\\system32\\",
@@ -185,14 +193,14 @@ class SecurityAuditEngine:
         try:
             with open(self.state_path, "r") as f:
                 return json.load(f)
-        except Exception:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {"baseline": None, "last_scan": None, "last_findings": []}
 
     def save_state(self):
         try:
             with open(self.state_path, "w") as f:
                 json.dump(self.state, f, indent=2, default=str)
-        except Exception:
+        except (OSError, TypeError):
             pass
 
     def save_baseline(self, findings: List[Finding]):
@@ -346,9 +354,9 @@ class SecurityAuditEngine:
                             suspicious_tasks.append((task_name, task_run, author))
                         else:
                             normal_task_count += 1
-                    except Exception:
+                    except (KeyError, ValueError, AttributeError):
                         continue
-        except Exception:
+        except (OSError, subprocess.SubprocessError, csv.Error):
             findings.append(Finding("startup", "INFO", "Could not enumerate scheduled tasks",
                                     "schtasks command failed"))
 
@@ -421,7 +429,7 @@ class SecurityAuditEngine:
                                 f"Unsigned executable: {os.path.basename(exe)}",
                                 f"Path: {exe}\nDigital signature: Not signed",
                                 "Unsigned executables from unusual locations should be investigated."))
-                    except Exception:
+                    except (OSError, TypeError, AttributeError):
                         pass
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -454,7 +462,7 @@ class SecurityAuditEngine:
                     pname = ""
                     try:
                         pname = psutil.Process(pid).name() if pid else "unknown"
-                    except Exception:
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
                         pname = f"PID {pid}"
 
                     listeners.append((port, addr, pname, pid))
@@ -509,7 +517,7 @@ class SecurityAuditEngine:
                         "RDP allows remote access to this computer.\n"
                         "If you don't use RDP, this is a security risk.",
                         "Disable RDP: Settings → System → Remote Desktop → Off"))
-            except Exception:
+            except (OSError, FileNotFoundError):
                 pass
 
         # Firewall rules (inbound allow from any)
@@ -552,7 +560,7 @@ class SecurityAuditEngine:
                         f"Top apps accepting inbound connections:\n{top_apps}" +
                         (f"\n  ... and {len(rule_counts)-10} more" if len(rule_counts) > 10 else ""),
                         "Normal for dev/gaming PCs. Review unused apps in Windows Firewall."))
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
 
         return findings
@@ -592,7 +600,7 @@ class SecurityAuditEngine:
                     for f in files:
                         try:
                             ext = os.path.splitext(f)[1].lower()
-                        except Exception:
+                        except (TypeError, AttributeError):
                             continue
                         if ext in exec_exts:
                             try:
@@ -600,7 +608,7 @@ class SecurityAuditEngine:
                                 # Ensure safe string representation
                                 fp_safe = fp.encode("utf-8", errors="replace").decode("utf-8")
                                 f_safe = f.encode("utf-8", errors="replace").decode("utf-8")
-                            except Exception:
+                            except (AttributeError, UnicodeError):
                                 continue
                             age = _age_days(fp)
                             if age < 7:
@@ -757,7 +765,7 @@ class SecurityAuditEngine:
                     findings.append(Finding("dns", "INFO",
                         "No system proxy configured", "ProxyEnable = 0 (good)"))
                 winreg.CloseKey(key)
-            except Exception:
+            except (OSError, FileNotFoundError):
                 pass
 
         # DNS resolution verification
@@ -1119,7 +1127,7 @@ class SecurityAuditEngine:
                         exp_date = datetime.strptime(notafter, "%Y-%m-%d")
                         if exp_date < datetime.now():
                             expired_certs.append(f"{subject[:70]} (expired {notafter})")
-                    except Exception:
+                    except (ValueError, TypeError):
                         pass
 
                     cert_lower = subject.lower()
@@ -1161,7 +1169,7 @@ class SecurityAuditEngine:
                 else:
                     findings.append(Finding("browser", "INFO",
                         "No unknown root certificates", "All CAs are recognized."))
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             findings.append(Finding("browser", "INFO",
                 "Could not check certificate store", "PowerShell command failed."))
 
@@ -1181,7 +1189,7 @@ class SecurityAuditEngine:
                 except FileNotFoundError:
                     pass
                 winreg.CloseKey(key)
-            except Exception:
+            except OSError:
                 pass
 
         if not findings:
@@ -1257,7 +1265,7 @@ class SecurityAuditEngine:
                         f"{desc}: {count} events",
                         f"{count} {desc.lower()} events found."))
 
-            except Exception:
+            except (OSError, subprocess.SubprocessError, ValueError):
                 continue
 
         if not admin:
@@ -1504,7 +1512,8 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                 cat_key = futures[future]
                 try:
                     findings = future.result()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - boundary: any check may raise, we must still report
+                    log.exception("Category check %s failed", cat_key)
                     findings = [Finding(cat_key, "INFO", "Check failed", str(e))]
                 self.result_q.put(("category_done", cat_key, findings))
 
@@ -1513,7 +1522,8 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
     def _safe_check(self, method):
         try:
             return method()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - boundary: safe wrapper for worker-thread checks
+            log.exception("Safe-check wrapper caught fault in %s", getattr(method, "__qualname__", method))
             return [Finding("unknown", "INFO", "Check error", str(e))]
 
     def _ui_tick(self):
@@ -1811,7 +1821,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
             with open(filepath, "w") as f:
                 json.dump(report, f, indent=2, default=str)
             self.status_label.configure(text=f"Exported: {filepath}")
-        except Exception as e:
+        except (OSError, TypeError, ValueError) as e:
             self.status_label.configure(text=f"Export failed: {e}")
 
     def destroy(self):
