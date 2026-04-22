@@ -28,9 +28,12 @@ from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
 import psutil
 
+from tools._common.exceptions import narrow_excepts
+from tools._common.logging import get_logger
 from tools._common.threadsafe import BoundedDeque
 
 TOOL_NAME = "Folder Size Analyzer Pro"
+log = get_logger(__name__)
 
 # =============================
 # Utilities
@@ -97,17 +100,24 @@ def get_folder_size(folder_path: str, progress_callback=None) -> Tuple[int, int,
 
     return total_size, file_count, created_time, modified_time, accessed_time
 
+@narrow_excepts(
+    OSError,
+    PermissionError,
+    default={'total': 0, 'used': 0, 'free': 0},
+)
 def get_drive_info(path: str) -> Dict[str, int]:
-    """Get drive information (total, used, free space)"""
-    try:
-        stat = psutil.disk_usage(path)
-        return {
-            'total': stat.total,
-            'used': stat.used,
-            'free': stat.free
-        }
-    except:
-        return {'total': 0, 'used': 0, 'free': 0}
+    """Get drive information (total, used, free space).
+
+    Returns a zeroed dict on missing path or permission denied (caught by
+    the decorator). ``psutil.disk_usage`` raises ``OSError`` for invalid
+    paths and ``PermissionError`` for protected mount points.
+    """
+    stat = psutil.disk_usage(path)
+    return {
+        'total': stat.total,
+        'used': stat.used,
+        'free': stat.free,
+    }
 
 # =============================
 # Data Models
@@ -367,7 +377,7 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
                     
             self.after(0, lambda data=folder_data: self._after_scan(data))
 
-        except Exception as e:
+        except (OSError, PermissionError, TypeError) as e:
             self.after(0, lambda: self._after_scan([]))
             self.after(0, lambda err=e: messagebox.showerror("Scan Error", f"Error scanning directory:\n{str(err)}"))
             
@@ -528,8 +538,8 @@ class FolderSizeAnalyzerApp(ctk.CTkFrame):
                 self._export_csv(file_path)
                 
             messagebox.showinfo("Export Successful", f"Results exported to:\n{file_path}")
-            
-        except Exception as e:
+
+        except (OSError, TypeError, ValueError) as e:
             messagebox.showerror("Export Error", f"Error exporting results:\n{str(e)}")
             
     def _export_csv(self, file_path: str):
@@ -613,8 +623,9 @@ def run_tool():
         root.focus_force()
         root.attributes("-topmost", True)
         root.after(250, lambda: root.attributes("-topmost", False))
-        
-    except Exception as e:
+
+    except Exception as e:  # noqa: BLE001 - boundary: surface any startup fault to UI
+        log.exception("Folder Size Analyzer Pro startup failed")
         messagebox.showerror("Folder Size Analyzer Pro", f"Startup error:\n{e}")
 
 if __name__ == "__main__":
