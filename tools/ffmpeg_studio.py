@@ -21,9 +21,12 @@ from tkinter import filedialog, messagebox, scrolledtext
 import customtkinter as ctk
 
 from tools._common.config import get_path
+from tools._common.exceptions import narrow_excepts
+from tools._common.logging import get_logger
 
 TOOL_NAME = "FFmpeg Studio"
 TOOL_DESC = "Record gameplay and convert videos using FFmpeg"
+log = get_logger(__name__)
 
 # ── Presets ───────────────────────────────────────────────────────────────────
 PRESETS = {
@@ -176,19 +179,24 @@ CROP_PRESETS = [
 ]
 
 # ── FFmpeg capability detection ───────────────────────────────────────────────
+@narrow_excepts(
+    OSError, subprocess.SubprocessError, subprocess.TimeoutExpired,
+    default=False,
+)
 def _test_encoder(encoder_name, pix_fmt="yuv420p"):
-    """Actually run a 0.1-second dummy encode to confirm the encoder works."""
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-f", "lavfi", "-i", "nullsrc=s=320x240",
-             "-t", "0.1", "-vcodec", encoder_name,
-             "-pix_fmt", pix_fmt, "-f", "null", "-"],
-            capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
+    """Actually run a 0.1-second dummy encode to confirm the encoder works.
+
+    Returns ``False`` on any subprocess/OS failure (caught by the
+    decorator) so capability probes never raise into the UI thread.
+    """
+    r = subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", "nullsrc=s=320x240",
+         "-t", "0.1", "-vcodec", encoder_name,
+         "-pix_fmt", pix_fmt, "-f", "null", "-"],
+        capture_output=True, timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return r.returncode == 0
 
 def _probe_hardware():
     """
@@ -202,7 +210,7 @@ def _probe_hardware():
         r = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         listed = r.stdout + r.stderr
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         listed = ""
 
     gpu_options      = []
@@ -254,27 +262,30 @@ def _probe_hardware():
 
     return gpu_options, gpu_label_to_key, hevc_ok, best_gpu_key
 
+@narrow_excepts(OSError, subprocess.SubprocessError, default=[])
 def _detect_audio_devices():
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-            capture_output=True, text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        devices, in_audio = [], False
-        for line in r.stderr.splitlines():
-            if "DirectShow audio devices" in line:
-                in_audio = True
-                continue
-            if "DirectShow video devices" in line:
-                in_audio = False
-            if in_audio:
-                m = re.search(r'"([^"]+)"', line)
-                if m and "Alternative name" not in line:
-                    devices.append(m.group(1))
-        return devices or []
-    except Exception:
-        return []
+    """Enumerate DShow audio input devices via ``ffmpeg -list_devices``.
+
+    Returns an empty list on subprocess/OS failure (caught by the
+    decorator).
+    """
+    r = subprocess.run(
+        ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+        capture_output=True, text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    devices, in_audio = [], False
+    for line in r.stderr.splitlines():
+        if "DirectShow audio devices" in line:
+            in_audio = True
+            continue
+        if "DirectShow video devices" in line:
+            in_audio = False
+        if in_audio:
+            m = re.search(r'"([^"]+)"', line)
+            if m and "Alternative name" not in line:
+                devices.append(m.group(1))
+    return devices or []
 
 def _gpu_key_from_label(label):
     l = label.lower()
@@ -476,13 +487,13 @@ def run_tool():
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-        except Exception:
+        except OSError:
             content = "(could not read log file)"
 
         # Clean up the temp log file now that we have read it
         try:
             os.remove(log_path)
-        except Exception:
+        except OSError:
             pass
 
         log_win = ctk.CTkToplevel(win)
@@ -565,7 +576,7 @@ def run_tool():
             messagebox.showerror("FFmpeg not found",
                                  "FFmpeg was not found. Make sure it is installed and in your PATH.", parent=win)
             return
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
             messagebox.showerror("Error", str(e), parent=win)
             return
         finally:
@@ -573,7 +584,7 @@ def run_tool():
             if log_file and recording_proc is None:
                 try:
                     log_file.close()
-                except Exception:
+                except OSError:
                     pass
 
         # Disable controls immediately while we verify startup
@@ -591,13 +602,13 @@ def run_tool():
                 try:
                     log_file.flush()
                     log_file.close()
-                except Exception:
+                except OSError:
                     pass
                 # Remove 0-byte output file if it exists
                 try:
                     if os.path.exists(out_file) and os.path.getsize(out_file) == 0:
                         os.remove(out_file)
-                except Exception:
+                except OSError:
                     pass
 
                 def _on_fail():
@@ -639,20 +650,20 @@ def run_tool():
             recording_proc.stdin.write(b"q")
             recording_proc.stdin.flush()
             recording_proc.wait(timeout=15)
-        except Exception:
+        except (OSError, BrokenPipeError, subprocess.TimeoutExpired):
             recording_proc.kill()
         # Close the log file handle and clean up temp log
         lf = getattr(recording_proc, "_log_file", None)
         if lf:
             try:
                 lf.close()
-            except Exception:
+            except OSError:
                 pass
         lp = getattr(recording_proc, "_log_path", None)
         if lp:
             try:
                 os.remove(lp)
-            except Exception:
+            except OSError:
                 pass
         recording_proc = None
         start_rec_btn.configure(state="normal")
@@ -664,7 +675,7 @@ def run_tool():
         for w in _lockable_widgets:
             try:
                 w.configure(state=state)
-            except Exception:
+            except tk.TclError:
                 pass
 
     # ════════════════════════════════════════════════════════════════════════
@@ -1073,7 +1084,7 @@ def run_tool():
             bg_img = tk.PhotoImage(file=bg_path)
             cv.create_image(0, 0, anchor="nw", image=bg_img, tags="bg")
             cv._bg_ref = bg_img          # prevent garbage-collection
-        except Exception:
+        except (OSError, tk.TclError):
             pass                         # fallback: plain black canvas
 
         # ── Initial full-screen dim (stipple = 50 % grey dots over screenshot) ──
@@ -1201,7 +1212,7 @@ def run_tool():
             ex, ey = _apply_snap(state["sx"], state["sy"], e.x, e.y, bool(e.state & 0x1))
             try:
                 ov.destroy()
-            except Exception:
+            except tk.TclError:
                 pass
             win.deiconify()
             win.lift()
@@ -1212,18 +1223,18 @@ def run_tool():
                 win.after(100, _update_region_display)
             try:
                 os.remove(bg_path)
-            except Exception:
+            except OSError:
                 pass
 
         def on_escape(e):
             try:
                 ov.destroy()
-            except Exception:
+            except tk.TclError:
                 pass
             win.deiconify()
             try:
                 os.remove(bg_path)
-            except Exception:
+            except OSError:
                 pass
 
         cv.bind("<ButtonPress-1>",   on_press)
@@ -1347,7 +1358,7 @@ def run_tool():
                     cap_result_label.configure(text=e, text_color="#FF6B6B"),
                     cap_btn.configure(state="normal", text="📷  Capture Screenshot"),
                 ))
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
             win.after(0, lambda: (
                 set_status(f"Error: {e}", "red"),
                 cap_btn.configure(state="normal", text="📷  Capture Screenshot"),
@@ -1567,7 +1578,7 @@ def run_tool():
                                       creationflags=subprocess.CREATE_NO_WINDOW)
                 ok = proc.returncode == 0
                 err = proc.stderr.decode("utf-8", errors="replace") if not ok else ""
-            except Exception as e:
+            except (OSError, subprocess.SubprocessError, ValueError) as e:
                 ok, err = False, str(e)
 
             def done():
