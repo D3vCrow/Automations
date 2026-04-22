@@ -39,13 +39,17 @@ import psutil
 try:  # send2trash is the default (safe) delete path; optional at import time
     from send2trash import send2trash as _send2trash  # type: ignore
     _HAS_SEND2TRASH = True
-except Exception:
+except ImportError:
     _send2trash = None  # type: ignore
     _HAS_SEND2TRASH = False
+
+from tools._common.exceptions import narrow_excepts
+from tools._common.logging import get_logger
 
 # ──────────────────────────────────────────────
 TOOL_NAME = "System Cleaner Pro"
 TOOL_DESC = "Safely free disk space and optimise RAM — preview sizes before deleting"
+log = get_logger(__name__)
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -75,7 +79,7 @@ def _log_struct(event: str, **fields) -> None:
     try:
         payload = {"event": event, **fields}
         print(json.dumps(payload, default=str), file=sys.stderr)
-    except Exception:
+    except (OSError, TypeError, ValueError):
         # Never let logging raise.
         pass
 
@@ -114,11 +118,14 @@ class _SHQUERYRBINFO(ctypes.Structure):
 # ──────────────────────────────────────────────
 # Module-level helpers
 # ──────────────────────────────────────────────
+@narrow_excepts(AttributeError, OSError, default=False)
 def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+    """Return True when the current process has Windows admin rights.
+
+    Caught: ``AttributeError`` (``ctypes.windll`` absent on non-Windows),
+    ``OSError`` (shell32 call failure).
+    """
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
 
 
 def format_size(n: int) -> str:
@@ -140,7 +147,7 @@ def _dir_size(path: str) -> int:
                     total += os.path.getsize(os.path.join(root, f))
                 except OSError:
                     pass
-    except Exception:
+    except OSError:
         pass
     return total
 
@@ -226,7 +233,7 @@ def _delete_dir_contents(
                 _send2trash(full)
                 freed += size
                 _log_struct("trashed", path=full, bytes=size)
-            except Exception as exc:  # send2trash raises its own TrashPermissionError etc.
+            except OSError as exc:  # send2trash.TrashPermissionError subclasses OSError
                 skipped += 1
                 _log_struct(
                     "trash_failed",
@@ -301,7 +308,7 @@ def _delete_glob_files(
                 _send2trash(fp)
                 freed += size
                 _log_struct("trashed", path=fp, bytes=size)
-            except Exception as exc:
+            except OSError as exc:  # send2trash.TrashPermissionError subclasses OSError
                 skipped += 1
                 _log_struct(
                     "trash_failed",
@@ -341,17 +348,20 @@ def _query_recycle_bin_size() -> int:
     try:
         ctypes.windll.shell32.SHQueryRecycleBinW(None, ctypes.byref(info))
         return max(0, info.i64Size)
-    except Exception:
+    except (AttributeError, OSError):
+        # AttributeError: ctypes.windll missing on non-Windows. OSError: shell32 call failure.
         return 0
 
 
+@narrow_excepts(psutil.Error, OSError, default=timedelta(0))
 def _get_system_uptime() -> timedelta:
-    """Return system uptime as a timedelta."""
-    try:
-        boot = psutil.boot_time()
-        return timedelta(seconds=time.time() - boot)
-    except Exception:
-        return timedelta(0)
+    """Return system uptime as a timedelta.
+
+    Caught: ``psutil.Error`` (boot_time unavailable), ``OSError`` (clock read
+    failure). Returns ``timedelta(0)`` on failure so callers can still render.
+    """
+    boot = psutil.boot_time()
+    return timedelta(seconds=time.time() - boot)
 
 
 def _format_uptime(td: timedelta) -> str:
@@ -384,48 +394,50 @@ def _resolve_gpu_shader_paths() -> list:
     return [p for p in candidates if os.path.isdir(p)]
 
 
+@narrow_excepts(AttributeError, OSError, default=False)
 def _enable_privilege(privilege_name: str) -> bool:
-    """Enable a Windows privilege (e.g. SeProfileSingleProcessPrivilege). Needs admin."""
-    try:
-        TOKEN_ADJUST_PRIVILEGES = 0x0020
-        TOKEN_QUERY = 0x0008
-        SE_PRIVILEGE_ENABLED = 0x00000002
+    """Enable a Windows privilege (e.g. SeProfileSingleProcessPrivilege). Needs admin.
 
-        class LUID(ctypes.Structure):
-            _fields_ = [("LowPart", ctypes.wintypes.DWORD),
-                        ("HighPart", ctypes.wintypes.LONG)]
+    Caught: ``AttributeError`` (``ctypes.windll`` absent on non-Windows),
+    ``OSError`` (advapi32/kernel32 call failure). Returns ``False`` on failure.
+    """
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_QUERY = 0x0008
+    SE_PRIVILEGE_ENABLED = 0x00000002
 
-        class LUID_AND_ATTRIBUTES(ctypes.Structure):
-            _fields_ = [("Luid", LUID),
-                        ("Attributes", ctypes.wintypes.DWORD)]
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", ctypes.wintypes.DWORD),
+                    ("HighPart", ctypes.wintypes.LONG)]
 
-        class TOKEN_PRIVILEGES(ctypes.Structure):
-            _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
-                        ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID),
+                    ("Attributes", ctypes.wintypes.DWORD)]
 
-        advapi32 = ctypes.windll.advapi32
-        kernel32 = ctypes.windll.kernel32
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
+                    ("Privileges", LUID_AND_ATTRIBUTES * 1)]
 
-        token = ctypes.wintypes.HANDLE()
-        advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            ctypes.byref(token),
-        )
+    advapi32 = ctypes.windll.advapi32
+    kernel32 = ctypes.windll.kernel32
 
-        luid = LUID()
-        advapi32.LookupPrivilegeValueW(None, privilege_name, ctypes.byref(luid))
+    token = ctypes.wintypes.HANDLE()
+    advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        ctypes.byref(token),
+    )
 
-        tp = TOKEN_PRIVILEGES()
-        tp.PrivilegeCount = 1
-        tp.Privileges[0].Luid = luid
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+    luid = LUID()
+    advapi32.LookupPrivilegeValueW(None, privilege_name, ctypes.byref(luid))
 
-        advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
-        kernel32.CloseHandle(token)
-        return True
-    except Exception:
-        return False
+    tp = TOKEN_PRIVILEGES()
+    tp.PrivilegeCount = 1
+    tp.Privileges[0].Luid = luid
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+    advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+    kernel32.CloseHandle(token)
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -876,11 +888,13 @@ class App(ctk.CTkFrame):
                 color = "#4caf50"
 
             self._uptime_label.configure(text=text, text_color=color)
-        except Exception:
+        except (tk.TclError, AttributeError):
+            # Widget destroyed during shutdown or not yet attached.
             pass
         try:
             self.after(30000, self._update_uptime)
-        except Exception:
+        except tk.TclError:
+            # Tk root gone — stop rescheduling.
             pass
 
     # ──────────────────────────────────────────
@@ -1147,7 +1161,8 @@ class App(ctk.CTkFrame):
             try:
                 ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 0x00000007)
                 log("  Recycle Bin emptied")
-            except Exception as e:
+            except (AttributeError, OSError) as e:
+                # AttributeError on non-Windows; OSError on shell32 call failure.
                 log(f"  Error: {e}")
                 return 0
             return size
@@ -1217,7 +1232,8 @@ class App(ctk.CTkFrame):
                     if os.path.isdir(do_path):
                         return _delete_dir_contents(do_path, log, mode)
                     log("  No Delivery Optimisation cache found")
-            except Exception as e:
+            except (OSError, subprocess.SubprocessError) as e:
+                # OSError: spawn failure. SubprocessError: TimeoutExpired etc.
                 log(f"  Error: {e}")
             return 0
 
@@ -1242,7 +1258,8 @@ class App(ctk.CTkFrame):
                         cleared += 1
                     else:
                         log(f"  Could not clear {logname}: {result.stderr.strip()}")
-                except Exception as e:
+                except (OSError, subprocess.SubprocessError) as e:
+                    # wevtutil spawn failure or timeout per-log.
                     log(f"  Error clearing {logname}: {e}")
             log(f"  {cleared} event log(s) cleared")
             return 0
@@ -1256,7 +1273,8 @@ class App(ctk.CTkFrame):
                 ctypes.windll.user32.EmptyClipboard()
                 ctypes.windll.user32.CloseClipboard()
                 log("  Clipboard cleared")
-            except Exception as e:
+            except (AttributeError, OSError) as e:
+                # AttributeError on non-Windows; OSError on user32 call failure.
                 log(f"  {e}")
             return 0
 
@@ -1275,7 +1293,8 @@ class App(ctk.CTkFrame):
                     line = line.strip()
                     if line:
                         log(f"  {line}")
-            except Exception as e:
+            except (OSError, subprocess.SubprocessError) as e:
+                # ipconfig spawn failure or timeout.
                 log(f"  {e}")
             return 0
 
@@ -1295,11 +1314,14 @@ class App(ctk.CTkFrame):
                 text=f"RAM: {used:.1f} GB / {tot:.1f} GB  ({pct:.0f}% used)",
                 text_color=color,
             )
-        except Exception:
+        except (OSError, AttributeError, tk.TclError):
+            # OSError: psutil read failure. AttributeError: label not attached.
+            # TclError: widget destroyed during shutdown.
             pass
         try:
             self.after(2000, self._start_ram_update_loop)
-        except Exception:
+        except tk.TclError:
+            # Tk root gone — stop rescheduling.
             pass
 
     def _start_ram_optimize(self):
@@ -1331,7 +1353,9 @@ class App(ctk.CTkFrame):
                     )
                     kernel32.CloseHandle(handle)
                     trimmed += 1
-            except Exception:
+            except (psutil.Error, OSError, AttributeError):
+                # psutil.Error: process vanished. OSError: kernel32 call rejected.
+                # AttributeError: windll missing on non-Windows.
                 failed += 1
 
         time.sleep(0.8)
@@ -1393,7 +1417,8 @@ class App(ctk.CTkFrame):
                 self._log("  Standby memory purged via NtSetSystemInformation")
             else:
                 self._log(f"  NtSetSystemInformation returned status: 0x{status & 0xFFFFFFFF:08X}")
-        except Exception as e:
+        except (AttributeError, OSError) as e:
+            # AttributeError on non-Windows; OSError on ntdll syscall failure.
             self._log(f"  Error: {e}")
 
         time.sleep(0.5)
@@ -1441,7 +1466,8 @@ class App(ctk.CTkFrame):
                 if proc.info["name"] and proc.info["name"].lower() == "explorer.exe":
                     try:
                         explorer_mem += proc.info["memory_info"].rss
-                    except Exception:
+                    except (psutil.Error, AttributeError):
+                        # Process vanished mid-iter, or memory_info unavailable.
                         pass
 
             if explorer_mem:
@@ -1487,7 +1513,8 @@ class App(ctk.CTkFrame):
                 if proc.info["name"] and proc.info["name"].lower() == "explorer.exe":
                     try:
                         new_mem += proc.info["memory_info"].rss
-                    except Exception:
+                    except (psutil.Error, AttributeError):
+                        # Process vanished mid-iter, or memory_info unavailable.
                         pass
 
             if explorer_mem and new_mem:
@@ -1497,7 +1524,12 @@ class App(ctk.CTkFrame):
                     self._log(f"  RAM recovered: {format_size(saved)}")
             self._log("  Thumbnail and icon caches are now unlocked")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            # Thread-worker boundary: taskkill/explorer.exe spawn + psutil iter
+            # raise a wide surface (OSError, subprocess.SubprocessError,
+            # psutil.Error, AttributeError). Catch-all keeps the restart UX
+            # coherent and logs a full traceback for diagnosis.
+            log.exception("restart_explorer_worker failed")
             self._log(f"  Error: {e}")
 
         self.after(0, lambda: self._explorer_btn.configure(
@@ -1510,7 +1542,8 @@ class App(ctk.CTkFrame):
         self._is_ram_opt  = False
         try:
             self.parent.destroy()
-        except Exception:
+        except tk.TclError:
+            # Already destroyed.
             pass
 
 
