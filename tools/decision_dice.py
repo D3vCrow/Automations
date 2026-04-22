@@ -23,8 +23,12 @@ import tkinter as tk
 import customtkinter as ctk
 from datetime import datetime
 
+from tools._common.exceptions import narrow_excepts
+from tools._common.logging import get_logger
+
 TOOL_NAME = "Decision Dice"
 TOOL_DESCRIPTION = "Premium weighted RNG dice — custom profiles, 3D animation, decision journal"
+log = get_logger(__name__)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -44,7 +48,8 @@ def _beep_thread(freq, dur):
     if HAS_SOUND:
         try:
             winsound.Beep(freq, dur)
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
+            # winsound.Beep can raise on invalid frequency or audio subsystem absence.
             pass
 
 def play_sound(kind: str):
@@ -114,16 +119,22 @@ def load_profiles():
         try:
             with open(PROFILES_PATH, "r") as f:
                 return json.load(f)
-        except Exception:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            # Corrupt or unreadable file → fall back to defaults.
             pass
     return dict(DEFAULT_PROFILES)
 
+
+@narrow_excepts(OSError, TypeError)
 def save_profiles(profiles):
-    try:
-        with open(PROFILES_PATH, "w") as f:
-            json.dump(profiles, f, indent=2)
-    except Exception:
-        pass
+    """Persist dice profiles JSON; swallow write errors silently.
+
+    Caught: ``OSError`` (disk full, permission), ``TypeError`` (non-
+    serializable value slipped in). Profiles persistence is best-effort
+    and must not crash the UI thread.
+    """
+    with open(PROFILES_PATH, "w") as f:
+        json.dump(profiles, f, indent=2)
 
 
 # ─── Journal persistence ─────────────────────────────────────────────────────
@@ -133,16 +144,21 @@ def load_journal():
         try:
             with open(JOURNAL_PATH, "r") as f:
                 return json.load(f)
-        except Exception:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            # Corrupt or unreadable file → return empty history.
             pass
     return []
 
+
+@narrow_excepts(OSError, TypeError)
 def save_journal(entries):
-    try:
-        with open(JOURNAL_PATH, "w") as f:
-            json.dump(entries[-500:], f, indent=2)
-    except Exception:
-        pass
+    """Persist decision journal JSON; swallow write errors silently.
+
+    Same policy as :func:`save_profiles` — best-effort persistence that
+    must not crash the UI.
+    """
+    with open(JOURNAL_PATH, "w") as f:
+        json.dump(entries[-500:], f, indent=2)
 
 
 # ─── 3D Dice Renderer ────────────────────────────────────────────────────────
@@ -1105,7 +1121,8 @@ def run_tool():
         root.protocol("WM_DELETE_WINDOW", app.force_stop)
         if tk._default_root is None:
             root.mainloop()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: surface any startup fault to UI
+        log.exception("Decision Dice startup failed")
         from tkinter import messagebox
         messagebox.showerror("Decision Dice", f"Startup error:\n{e}")
 
