@@ -14,3 +14,4 @@ exports/
 *.log
 *.txt
 tools/OpenHardwareMonitor/
+security/poc/

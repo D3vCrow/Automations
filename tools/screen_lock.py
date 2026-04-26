@@ -865,21 +865,19 @@ class ScreenLockApp:
 
     # Key combos we actively swallow while the lock is up.
     # Critical combos: must all be blocked or lock is unsafe. Fail-fast on any failure.
+    # NOTE: block_key() only accepts single key names, not combo strings like "alt+tab".
+    # Combos are already suppressed by the suppress=True hook; only single keys go here.
     _CRITICAL_COMBOS = (
-        "alt+tab",
-        "alt+f4",
-        "ctrl+shift+esc",
         "left windows",
         "right windows",
     )
 
-    # Nice-to-have combos: best-effort. If these fail, lock still works.
+    # Nice-to-have combos: best-effort via block_key (single keys only) or rely on suppress hook.
+    # If these fail, lock still works because the suppress=True hook intercepts everything.
     _EXTRA_COMBOS = (
         "ctrl+esc",   # opens Start menu
         "alt+esc",    # cycles windows
-        "win",        # redundant on most keyboard library versions (covered by "left windows"/"right windows")
-                      # but kept as best-effort — some versions accept it, some don't. The two "<side> windows"
-                      # entries already cover both physical meta keys, so removal of "win" does not introduce a bypass.
+        "win",        # redundant with left/right windows but harmless to try
     )
 
     def _install_hook(self) -> bool:

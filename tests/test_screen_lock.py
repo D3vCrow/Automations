@@ -222,13 +222,14 @@ class TestInstallHook:
         import importlib
         import tkinter as tk
 
-        # Create a mock keyboard module where hook() succeeds but block_key("alt+tab") fails
+        # Create a mock keyboard module where hook() succeeds but block_key("left windows") fails.
+        # "left windows" is the first entry in the new _CRITICAL_COMBOS tuple.
         mock_hook = object()
         blocked_id_counter = [0]
         unhook_called = []
 
         def mock_block_key(combo):
-            if combo == "alt+tab":
+            if combo == "left windows":
                 raise ValueError(f"Unsupported key name: {combo}")
             blocked_id_counter[0] += 1
             return blocked_id_counter[0]
@@ -283,7 +284,7 @@ class TestInstallHook:
                 # Verify error messagebox was shown
                 assert len(showerror_calls) == 1
                 assert showerror_calls[0][0] == "Screen Lock"
-                assert "alt+tab" in showerror_calls[0][1]
+                assert "left windows" in showerror_calls[0][1]
             finally:
                 root.destroy()
         finally:
@@ -306,9 +307,10 @@ class TestInstallHook:
         unhook_calls = []
 
         def mock_block_key(combo):
-            # First 2 combos (alt+tab, alt+f4) succeed, 3rd (ctrl+shift+esc) fails
+            # 1st critical combo (left windows) succeeds, 2nd (right windows) fails.
+            # Tests the rollback path: previously-blocked IDs must be unblocked.
             blocked_counter[0] += 1
-            if blocked_counter[0] <= 2:
+            if blocked_counter[0] == 1:
                 return blocked_counter[0]  # return unique block ID
             raise ValueError(f"Unsupported key name: {combo}")
 
@@ -362,18 +364,18 @@ class TestInstallHook:
                 # Verify it failed
                 assert result is False
 
-                # Verify unblock_key was called for each of the 2 successful blocks
-                assert len(unblock_calls) == 2
-                assert set(unblock_calls) == {1, 2}
+                # Verify unblock_key was called for the 1 successful block (left windows)
+                assert len(unblock_calls) == 1
+                assert set(unblock_calls) == {1}
 
                 # Verify unhook was called once
                 assert len(unhook_calls) == 1
                 assert unhook_calls[0] is mock_hook
 
-                # Verify error messagebox was shown
+                # Verify error messagebox was shown for the failing 2nd critical combo
                 assert len(showerror_calls) == 1
                 assert showerror_calls[0][0] == "Screen Lock"
-                assert "ctrl+shift+esc" in showerror_calls[0][1]
+                assert "right windows" in showerror_calls[0][1]
             finally:
                 root.destroy()
         finally:
