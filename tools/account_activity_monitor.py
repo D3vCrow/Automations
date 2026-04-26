@@ -169,7 +169,7 @@ def safe_run(cmd: List[str], timeout: int = 15) -> Tuple[int, str, str]:
         cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                             timeout=timeout, shell=False, creationflags=_CNW)
         return cp.returncode, cp.stdout, cp.stderr
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
         return 1, "", str(e)
 
 def now_ts() -> str:
@@ -179,7 +179,7 @@ def is_admin() -> bool:
     try:
         import ctypes
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
+    except (ImportError, OSError, AttributeError):
         return False
 
 def fmt_time(dt_str: str) -> str:
@@ -196,7 +196,7 @@ def fmt_time(dt_str: str) -> str:
         else:
             dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
         return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
+    except (ValueError, AttributeError, IndexError):
         return dt_str[:19] if len(dt_str) >= 19 else dt_str
 
 
@@ -339,7 +339,7 @@ class ActivityMonitorEngine:
                     dt2 = datetime.strptime(t2, "%Y-%m-%dT%H:%M:%S")
                     if abs((dt1 - dt2).total_seconds()) > 300:
                         break
-                except Exception:
+                except (ValueError, AttributeError, TypeError):
                     break
                 count += 1
                 j += 1
@@ -403,7 +403,7 @@ class ActivityMonitorEngine:
                 if parsed:
                     events.append(parsed)
 
-        except Exception:
+        except (AttributeError, ValueError, TypeError):
             pass
 
         return events
@@ -438,7 +438,7 @@ class ActivityMonitorEngine:
             # Raw XML for detail popup
             try:
                 raw = ET.tostring(event_elem, encoding="unicode")
-            except Exception:
+            except (TypeError, ValueError):
                 raw = ""
 
             # Filter out known Windows-internal noise
@@ -459,7 +459,7 @@ class ActivityMonitorEngine:
                 raw_xml=raw,
                 parsed_data=parsed_data,
             )
-        except Exception:
+        except (AttributeError, ValueError, KeyError):
             return None
 
     def _is_internal_noise(self, eid: int, data: Dict) -> bool:
@@ -675,7 +675,7 @@ class ActivityMonitorEngine:
                 parsed = self._parse_event_xml(elem, ns)
                 if parsed:
                     events.append(parsed)
-            except Exception:
+            except (ET.ParseError, AttributeError, ValueError):
                 continue
         return events
 
@@ -702,7 +702,7 @@ class ActivityMonitorEngine:
                         "description": u.get("Description", ""),
                         "sid": str(u.get("SID", {}).get("Value", "")) if isinstance(u.get("SID"), dict) else str(u.get("SID", "")),
                     })
-        except Exception:
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
             pass
 
         # Enrich with net user details (creation date, groups)
@@ -725,7 +725,7 @@ class ActivityMonitorEngine:
                             acc["groups"] = groups
                         elif "Account expires" in line:
                             acc["expires"] = line.split(None, 2)[-1].strip() if len(line.split(None, 2)) > 2 else ""
-            except Exception:
+            except (IndexError, ValueError, AttributeError):
                 pass
 
             # SID analysis: SID-1001 = first user created during setup
@@ -917,7 +917,7 @@ class ActivityMonitorEngine:
                     "detail": "RDP is off. No one can remote desktop into this PC.",
                     "icon": "✓",
                 })
-        except Exception:
+        except OSError:
             pass
 
         # Remote Assistance
@@ -935,7 +935,7 @@ class ActivityMonitorEngine:
                               "Disable: System Properties → Remote → uncheck 'Allow Remote Assistance'",
                     "icon": "⚠",
                 })
-        except Exception:
+        except OSError:
             pass
 
         # Check for remote access software running
@@ -1003,7 +1003,7 @@ class ActivityMonitorEngine:
                                           "Could be created by an attacker for persistent access.",
                                 "icon": "⚠",
                             })
-        except Exception:
+        except (IndexError, AttributeError, ValueError):
             pass
 
         if not findings:
@@ -1037,7 +1037,7 @@ class ActivityMonitorEngine:
                     "detail": wp,
                     "icon": "🖼",
                 })
-        except Exception:
+        except OSError:
             pass
 
         # Check if screensaver has password protection
@@ -1058,7 +1058,7 @@ class ActivityMonitorEngine:
             except FileNotFoundError:
                 pass
             winreg.CloseKey(key)
-        except Exception:
+        except OSError:
             pass
 
         # Check auto-lock timeout
@@ -1086,7 +1086,7 @@ class ActivityMonitorEngine:
                     "icon": "⚠",
                 })
             winreg.CloseKey(key)
-        except Exception:
+        except OSError:
             pass
 
         return findings
@@ -1147,7 +1147,7 @@ class ActivityMonitorEngine:
                                     "fixable": "log_size",
                                     "fix_target": log_name,
                                 })
-            except Exception:
+            except (ValueError, IndexError, AttributeError):
                 pass
 
         return findings
@@ -1184,7 +1184,7 @@ class ActivityMonitorEngine:
                                 "icon": "⚠",
                             })
                             break
-        except Exception:
+        except (csv.Error, KeyError, AttributeError):
             pass
 
         return findings
@@ -1212,7 +1212,7 @@ class ActivityMonitorEngine:
                     })
                 except FileNotFoundError:
                     pass
-                except Exception:
+                except OSError:
                     pass
 
         return findings
@@ -1858,7 +1858,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                        and e.severity in sevs]
             self.engine.export_events(filtered, path)
             messagebox.showinfo("Export", f"Exported {len(filtered)} events to:\n{path}")
-        except Exception as e:
+        except (OSError, TypeError) as e:
             messagebox.showerror("Export Error", str(e))
 
     def _show_event_detail_hist(self, event):
@@ -2042,7 +2042,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                             if lines and lines[0].startswith("<?xml"):
                                 lines = lines[1:]
                             xml_text.insert("1.0", "\n".join(lines))
-                        except Exception:
+                        except Exception:  # noqa: BLE001 - boundary: xml prettifier fallback
                             xml_text.insert("1.0", match.raw_xml)
                         xml_text.configure(state="disabled")
 
@@ -2152,7 +2152,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
             snap = self._live_events.snapshot()
             self.engine.export_events(snap, path)
             messagebox.showinfo("Export", f"Exported {len(snap)} events to:\n{path}")
-        except Exception as e:
+        except (OSError, TypeError) as e:
             messagebox.showerror("Export Error", str(e))
 
     def _show_event_detail_live(self, event):
@@ -2257,7 +2257,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                 elif job[0] == "account_history":
                     events = self.engine.get_account_events_all_time()
                     self.result_q.put(("account_history", events))
-            except Exception:
+            except Exception:  # noqa: BLE001 - boundary: _worker_loop daemon
                 pass
 
     def _process_queue(self):
@@ -2309,7 +2309,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                     if len(children) > 5000:
                         for iid in children[5000:]:
                             self.live_tree.delete(iid)
-        except Exception:
+        except Exception:  # noqa: BLE001 - boundary: _process_queue UI
             pass
         if self.running:
             self.after(100, self._process_queue)
@@ -2344,7 +2344,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
         self.running = False
         try:
             self.parent.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
 
@@ -2372,7 +2372,7 @@ def run_tool():
 
         if tk._default_root == root:
             root.mainloop()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: run_tool entry point
         messagebox.showerror(TOOL_NAME, f"Startup error:\n{e}")
 
 
