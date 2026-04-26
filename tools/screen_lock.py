@@ -170,7 +170,7 @@ def _pid_alive(pid: int) -> bool:
                 return False
             ctypes.windll.kernel32.CloseHandle(handle)
             return True
-        except Exception:
+        except (OSError, AttributeError):
             return True  # err on the safe side — do not wrongly claim stale
     try:
         os.kill(pid, 0)
@@ -262,7 +262,7 @@ def get_virtual_screen_rect(fallback: tuple[int, int] = (1920, 1080)) -> tuple[i
             h = int(gsm(79))   # SM_CYVIRTUALSCREEN
             if w > 0 and h > 0:
                 return x, y, w, h
-        except Exception as exc:
+        except (OSError, AttributeError) as exc:
             print(f"[screen_lock] virtual-screen metrics failed: {exc!r}",
                   file=sys.stderr)
     fw, fh = fallback
@@ -376,7 +376,7 @@ class CardPhysics:
             if not self.canvas.winfo_exists():
                 self.alive = False
                 return
-        except Exception:
+        except tk.TclError:
             self.alive = False
             return
 
@@ -505,7 +505,7 @@ class ClickBurst:
             if not self.canvas.winfo_exists():
                 self.alive = False
                 return
-        except Exception:
+        except tk.TclError:
             self.alive = False
             return
 
@@ -756,7 +756,7 @@ class ScreenLockApp:
         try:
             if not canvas.winfo_exists():
                 return
-        except Exception:
+        except tk.TclError:
             return
         now = datetime.now()
         canvas.itemconfigure("hud_clock", text=now.strftime("%H:%M:%S"))
@@ -791,11 +791,11 @@ class ScreenLockApp:
         if self._overlay:
             try:
                 self._overlay.grab_release()
-            except Exception:
+            except tk.TclError:
                 pass
             try:
                 self._overlay.destroy()
-            except Exception:
+            except tk.TclError:
                 pass
             self._overlay = None
 
@@ -808,7 +808,7 @@ class ScreenLockApp:
         try:
             if not canvas.winfo_exists():
                 return
-        except Exception:
+        except tk.TclError:
             return
 
         # Prune dead peers
@@ -850,7 +850,7 @@ class ScreenLockApp:
         try:
             if not canvas.winfo_exists():
                 return
-        except Exception:
+        except tk.TclError:
             return
 
         # Prune dead peers to prevent memory leak
@@ -943,7 +943,7 @@ class ScreenLockApp:
             if canvas is not None:
                 try:
                     canvas.after(0, lambda n=event.name: app._spawn_card(n))
-                except Exception:
+                except tk.TclError:
                     pass
 
         # Attempt to install the suppressing hook. This fails if another
@@ -952,7 +952,7 @@ class ScreenLockApp:
         # every key still reached the OS — surface the error instead.
         try:
             hook = _kb.hook(_handler, suppress=True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - boundary: surface keyboard.hook failure to user
             errno = getattr(exc, "errno", "")
             print(
                 f"[screen_lock] keyboard.hook install failed: {exc!r} "
@@ -982,13 +982,13 @@ class ScreenLockApp:
                     for bid in blocked_ids:
                         try:
                             _kb.unblock_key(bid)
-                        except Exception as unblock_exc:
+                        except (OSError, ValueError) as unblock_exc:
                             print(
                                 f"[screen_lock] rollback unblock_key failed: {unblock_exc!r}",
                                 file=sys.stderr,
                             )
                     _kb.unhook(hook)
-                except Exception as unhook_exc:
+                except (OSError, ValueError) as unhook_exc:
                     print(
                         f"[screen_lock] unhook rollback failed: {unhook_exc!r}",
                         file=sys.stderr,
@@ -1011,7 +1011,7 @@ class ScreenLockApp:
                     f"[screen_lock] extra block_key({combo!r}) failed: {exc!r}",
                     file=sys.stderr,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - boundary: best-effort fallback after narrow types
                 print(
                     f"[screen_lock] extra block_key({combo!r}) unexpected: {exc!r}",
                     file=sys.stderr,
@@ -1034,13 +1034,13 @@ class ScreenLockApp:
         for bid in getattr(self, "_blocked_ids", []) or []:
             try:
                 _kb.unblock_key(bid)
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 print(f"[screen_lock] unblock_key failed: {exc!r}", file=sys.stderr)
         self._blocked_ids = []
         if self._hook is not None:
             try:
                 _kb.unhook(self._hook)
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 print(f"[screen_lock] unhook failed: {exc!r}", file=sys.stderr)
             self._hook = None
             print("[screen_lock] keyboard hook removed", file=sys.stderr)
@@ -1059,7 +1059,7 @@ def _schedule_unlock(app: ScreenLockApp):
             app._canvas.after(0, app.unlock)
         else:
             app.unlock()
-    except Exception:
+    except tk.TclError:
         pass
 
 
@@ -1092,12 +1092,12 @@ def run_tool():
         root.attributes("-topmost", True)
         root.after(250, lambda: root.attributes("-topmost", False))
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: surface any startup fault to UI
         messagebox.showerror("Screen Lock", f"Startup error:\n{e}")
         if root is not None:
             try:
                 root.destroy()
-            except Exception:
+            except tk.TclError:
                 pass
 
 
@@ -1114,7 +1114,7 @@ def _maybe_prompt_crash_recovery() -> None:
             "A previous Screen Lock session appears to have crashed.\n"
             "Clear the leftover overlay flag?",
         )
-    except Exception:
+    except tk.TclError:
         answer = True
     if answer:
         clear_lock_flag()
