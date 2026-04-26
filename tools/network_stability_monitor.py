@@ -85,7 +85,7 @@ def safe_run(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
         cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, shell=False,
                             creationflags=subprocess.CREATE_NO_WINDOW)
         return cp.returncode, cp.stdout, cp.stderr
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
         return 1, "", str(e)
 
 def parse_ipv4(s: str) -> List[str]:
@@ -164,7 +164,7 @@ def get_default_route_interface_ip() -> Tuple[str, str]:
                     if str(a.family) == "AddressFamily.AF_INET" or int(getattr(a.family, "value", 0) or 0) == 2:
                         if a.address == local_ip:
                             return local_ip, ifname
-        except Exception:
+        except (AttributeError, OSError):
             pass
 
     return local_ip, ""
@@ -256,7 +256,7 @@ def _trigger_wifi_scan():
             wlanapi.WlanScan(client_handle, ctypes.byref(guid_bytes), None, None, None)
 
         wlanapi.WlanCloseHandle(client_handle, None)
-    except Exception:
+    except (OSError, AttributeError, ctypes.ArgumentError):
         pass
 
 
@@ -357,7 +357,7 @@ def recommend_channel(networks: List[Dict], my_ssid: str = "") -> Dict:
 def parse_ts(ts: str) -> Optional[datetime]:
     try:
         return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
+    except (ValueError, AttributeError, TypeError):
         return None
 
 def duration_str(start_ts: str, end_ts: str) -> str:
@@ -495,7 +495,7 @@ class NetworkStabilityEngine:
             h, m = AUTO_EXPORT_TIME.split(":")
             self.export_hour = int(h)
             self.export_minute = int(m)
-        except Exception:
+        except (ValueError, IndexError, AttributeError):
             pass
         
         # Enhanced intelligence engine (if available)
@@ -515,7 +515,7 @@ class NetworkStabilityEngine:
                 data = json.load(f)
             self.baseline_gateway = data.get("baseline_gateway", "") or ""
             self.baseline_dns = data.get("baseline_dns", []) or []
-        except Exception:
+        except (json.JSONDecodeError, OSError, KeyError):
             pass
 
     def save_state(self):
@@ -527,7 +527,7 @@ class NetworkStabilityEngine:
             }
             with open(self.state_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
+        except (OSError, TypeError):
             pass
 
     # ---------- SQLite incident database ----------
@@ -576,7 +576,7 @@ class NetworkStabilityEngine:
             )
             con.commit()
             con.close()
-        except Exception:
+        except (sqlite3.Error, OSError):
             pass
 
     def _db_update_incident(self, inc: 'Incident'):
@@ -595,7 +595,7 @@ class NetworkStabilityEngine:
             )
             con.commit()
             con.close()
-        except Exception:
+        except (sqlite3.Error, OSError):
             pass
 
     def _db_load_incidents(self, limit: int = 500,
@@ -618,7 +618,7 @@ class NetworkStabilityEngine:
             rows = con.execute(query, params).fetchall()
             con.close()
             return [dict(r) for r in rows]
-        except Exception:
+        except (sqlite3.Error, OSError):
             return []
 
     def log_event(self, severity: str, category: str, title: str, details: Dict):
@@ -983,8 +983,8 @@ class NetworkStabilityEngine:
                 "incidents_count": len(export_data["incidents"]),
                 "events_count": len(export_data["events"])
             })
-            
-        except Exception as e:
+
+        except (OSError, TypeError, KeyError) as e:
             self.log_event("HIGH", "EXPORT", "Auto export failed", {"error": str(e)})
             
     def _prepare_export_data(self, current_time: datetime) -> Dict[str, Any]:
@@ -1171,7 +1171,7 @@ class NetworkStabilityEngine:
                     current_sample.anomaly_flags or AnomalyFlags(),
                     current_sample.root_cause or RootCauseProbability()
                 )
-            except Exception as e:
+            except (AttributeError, TypeError, KeyError) as e:
                 print(f"Intelligence export failed: {e}")
                 # Fall back to basic export
         
@@ -1235,7 +1235,7 @@ class App(AppBase):
         _h, _m = 23, 30
         try:
             _h, _m = int(AUTO_EXPORT_TIME.split(":")[0]), int(AUTO_EXPORT_TIME.split(":")[1])
-        except Exception:
+        except (ValueError, IndexError, AttributeError):
             pass
         self.auto_export_hour = tk.IntVar(value=_h)
         self.auto_export_minute = tk.IntVar(value=_m)
@@ -1466,7 +1466,7 @@ class App(AppBase):
         data = [(tree.set(k, col), k) for k in tree.get_children("")]
         try:
             data.sort(key=lambda t: t[0], reverse=reverse)
-        except Exception:
+        except (TypeError, ValueError):
             pass
         for idx, (_val, k) in enumerate(data):
             tree.move(k, "", idx)
@@ -2007,7 +2007,7 @@ class App(AppBase):
         try:
             if self.nb.get() == "Wi-Fi Analyzer":
                 self._request_wifi_scan()
-        except Exception:
+        except (tk.TclError, AttributeError):
             pass
         self.after(15000, self._wifi_auto_refresh)
 
@@ -2019,7 +2019,7 @@ class App(AppBase):
         self.running = False
         try:
             self.parent.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
     def set_baseline(self):
@@ -2158,7 +2158,7 @@ class App(AppBase):
             
             size_kb = len(str(ai_export))/1024
             messagebox.showinfo("AI Export", f"AI-friendly export saved:\n{path}\n\nSize: {size_kb:.1f} KB\n\nPerfect for ChatGPT analysis!")
-        except Exception as e:
+        except (OSError, json.JSONDecodeError) as e:
             messagebox.showerror("Export failed", f"AI Export failed:\n{str(e)}")
 
     def export_report(self):
@@ -2204,7 +2204,7 @@ class App(AppBase):
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(report, f, indent=2, ensure_ascii=False)
                 messagebox.showinfo("Export", f"Full report saved:\n{path}")
-            except Exception as e:
+            except (OSError, json.JSONDecodeError, TypeError) as e:
                 messagebox.showerror("Export failed", str(e))
         
         else:  # NO - AI-friendly export
@@ -2221,7 +2221,7 @@ class App(AppBase):
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(ai_export, f, indent=2, ensure_ascii=False)
                 messagebox.showinfo("Export", f"AI-friendly export saved:\n{path}\n\nSize: {len(str(ai_export))/1024:.1f} KB")
-            except Exception as e:
+            except (OSError, json.JSONDecodeError, TypeError, AttributeError) as e:
                 messagebox.showerror("Export failed", str(e))
 
     def tick(self):
@@ -2239,7 +2239,7 @@ class App(AppBase):
 
         try:
             self.work_q.put_nowait(("sample", sample_params))
-        except Exception:
+        except (queue.Full, TypeError):
             pass
 
         # Sync latency thresholds to engine
@@ -2292,7 +2292,7 @@ class App(AppBase):
             if isinstance(job, tuple) and job[0] == "sample":
                 try:
                     self._do_sample(job[1])
-                except Exception as e:
+                except (OSError, ValueError, KeyError, AttributeError) as e:
                     self.engine.log_event("WARN", "DEGRADED", "Sampling error", {"error": str(e)})
 
     def _do_sample(self, params: Dict[str, Any]):
@@ -2427,7 +2427,7 @@ class App(AppBase):
         if self.engine.intelligence:
             try:
                 s = self.engine.enhance_sample_with_intelligence(s)
-            except Exception as e:
+            except (AttributeError, TypeError, KeyError) as e:
                 # If intelligence fails, continue with basic analysis
                 print(f"Intelligence analysis failed: {e}")
         self.engine.add_sample(s)
@@ -2642,7 +2642,7 @@ class App(AppBase):
         iid = sel[0]
         try:
             inc_id = int(iid.split("-")[1])
-        except Exception:
+        except (ValueError, IndexError, AttributeError):
             return
 
         inc = None
@@ -2969,7 +2969,7 @@ Duration: {inc.duration or 'Still ongoing'}
             x = map_x(t_cur)
             try:
                 lbl = datetime.fromtimestamp(t_cur).strftime("%H:%M:%S")
-            except Exception:
+            except (OSError, ValueError, OverflowError):
                 lbl = ""
             canvas.create_text(x, mt + dh + 12, text=lbl,
                                fill="#888888", font=("Segoe UI", 7))
@@ -3203,7 +3203,7 @@ def run_tool():
                 win = tk.Toplevel()
             app = App(win)
             win.protocol("WM_DELETE_WINDOW", app.force_stop)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: run_tool entry point
         messagebox.showerror("Network Stability Monitor Pro", f"Startup error:\n{e}")
 
 
