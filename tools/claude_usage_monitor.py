@@ -12,12 +12,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import ttk
 
 try:
     from winotify import Notification as _WinotifyNotification  # type: ignore
     _HAS_TOAST = True
-except Exception:
+except ImportError:
     _WinotifyNotification = None  # type: ignore
     _HAS_TOAST = False
 
@@ -298,7 +299,7 @@ def _parse_session_file(filepath: str) -> dict:
                                 stats["est_tokens"] += out_tok
                                 stats["est_cost"] += _estimate_tool_cost(0, out_tok, pricing_for_turn)
 
-    except Exception:
+    except (OSError, KeyError, AttributeError, TypeError, ValueError):
         pass
 
     session["cold_turn_count"] = _cold_turn_count(session["turn_costs"])
@@ -313,7 +314,7 @@ def _parse_timestamp(ts_str: str) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
@@ -351,7 +352,7 @@ def _load_project_state() -> tuple[list[str], list[str], dict]:
         if not isinstance(notif, dict):
             notif = {}
         return order, collapsed, notif
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError):
         return [], [], {}
 
 
@@ -367,7 +368,7 @@ def _save_project_state(order: list[str], collapsed: list[str],
             }, indent=2),
             encoding="utf-8",
         )
-    except Exception:
+    except (OSError, TypeError):
         pass  # non-fatal
 
 # Back-compat wrappers so existing call sites continue to work during refactor.
@@ -824,7 +825,7 @@ def _get_active_session_ids() -> set:
             if pid and not _pid_alive(int(pid)):
                 continue  # process is gone — session is not live
             active.add(sid)
-        except Exception:
+        except (OSError, ValueError, json.JSONDecodeError, TypeError):
             pass
     return active
 
@@ -1420,7 +1421,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             return
         try:
             self.winfo_exists()
-        except Exception:
+        except tk.TclError:
             return
         self._start_load()
 
@@ -1747,7 +1748,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         # Belt-and-braces: save and restore outer scroll position (T7).
         try:
             saved_yview = self._sess_scroll._parent_canvas.yview()
-        except Exception:
+        except tk.TclError:
             saved_yview = None
 
         query = self._sess_search_var.get().strip().lower()
@@ -1828,7 +1829,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
             def _restore():
                 try:
                     self._sess_scroll._parent_canvas.yview_moveto(saved_yview[0])
-                except Exception:
+                except tk.TclError:
                     pass
             self.after_idle(_restore)
 
@@ -2064,7 +2065,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 tree.selection_set(survivors)
             if prior_focus and tree.exists(prior_focus):
                 tree.focus(prior_focus)
-        except Exception:
+        except tk.TclError:
             pass
 
     def _project_border_color(self, items: list[dict]) -> str:
@@ -2120,7 +2121,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         self._banner_target_sid = session_id
         try:
             self._banner.pack(fill="x", before=self._tabs)
-        except Exception:
+        except tk.TclError:
             # Fallback if _tabs isn't packed yet; banner simply won't show.
             pass
 
@@ -2140,7 +2141,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
         self._banner_target_sid = None
         try:
             self._banner.pack_forget()
-        except Exception:
+        except tk.TclError:
             pass
 
     def _fire_toast(self, level: str, proj: str, explanation: str) -> None:
@@ -2155,7 +2156,7 @@ class ClaudeUsageMonitor(ctk.CTkToplevel):
                 msg=explanation,
             )
             toast.show()
-        except Exception:
+        except Exception:  # noqa: BLE001 - boundary: never let a flaky toast crash the refresh loop
             # Never let a flaky toast crash the refresh loop.
             pass
 
