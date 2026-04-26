@@ -40,7 +40,9 @@ def test_age_days_recent_file_is_near_zero(tmp_path):
     f = tmp_path / "fresh.txt"
     f.write_text("x")
     # Newly-written file: age is well under a day.
-    assert 0 <= sa._age_days(str(f)) < 0.01
+    # abs() tolerates Windows clock jitter that can produce tiny
+    # negative values (~1e-12) when reads outpace the timer tick.
+    assert abs(sa._age_days(str(f))) < 0.01
 
 
 def test_age_days_missing_path_returns_sentinel(tmp_path):
