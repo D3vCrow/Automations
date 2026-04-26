@@ -88,7 +88,7 @@ def try_load_scapy():
         sniff = scapy_all.sniff
         HAS_SCAPY = True
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 - boundary: optional scapy dep import (init may raise OSError/RuntimeError on missing libs)
         HAS_SCAPY = False
         return False
 
@@ -116,7 +116,7 @@ def safe_run(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
             creationflags=_CREATE_NO_WINDOW,
         )
         return cp.returncode, cp.stdout, cp.stderr
-    except Exception as e:
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
         return 1, "", str(e)
 
 
@@ -269,7 +269,7 @@ def get_ip_geolocation(ip: str) -> Dict[str, str]:
                 }
                 _ip_geo_cache[ip] = result
                 return result
-    except Exception:
+    except (requests.RequestException, ValueError, KeyError):
         pass
     result = {"country": "Unknown", "region": "", "city": "", "org": "", "trust": "unknown"}
     _ip_geo_cache[ip] = result
@@ -310,7 +310,7 @@ def is_private_ip(ip: str) -> bool:
         if first == 169 and second == 254:      # APIPA / link-local
             return True
         return False
-    except Exception:
+    except (ValueError, AttributeError, IndexError):
         return False
 
 
@@ -409,7 +409,7 @@ class IPReputationChecker:
                 data = json.load(f)
             self._vt_key = data.get("virustotal_key", "").strip()
             self._abuse_key = data.get("abuseipdb_key", "").strip()
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             pass
 
     def save_keys(self, vt_key: str, abuse_key: str):
@@ -418,7 +418,7 @@ class IPReputationChecker:
         try:
             with open(_API_KEYS_PATH, "w") as f:
                 json.dump({"virustotal_key": self._vt_key, "abuseipdb_key": self._abuse_key}, f, indent=2)
-        except Exception:
+        except (OSError, TypeError):
             pass
 
     @property
@@ -461,7 +461,7 @@ class IPReputationChecker:
                     "vt_undetected": int(stats.get("undetected", 0)),
                     "vt_reputation": int(attrs.get("reputation", 0)),
                 }
-        except Exception:
+        except (requests.RequestException, ValueError, KeyError, TypeError):
             pass
         return {}
 
@@ -486,7 +486,7 @@ class IPReputationChecker:
                     "abuse_domain":  str(d.get("domain", "")),
                     "abuse_country": str(d.get("countryCode", "")),
                 }
-        except Exception:
+        except (requests.RequestException, ValueError, KeyError, TypeError):
             pass
         return {}
 
@@ -607,7 +607,7 @@ class ConnectionTrustManager:
                     data = json.load(f)
                     self.trusted_ips = data.get("trusted_ips", {})
                     self.trusted_domains = data.get("trusted_domains", {})
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             pass
 
     def save(self):
@@ -617,7 +617,7 @@ class ConnectionTrustManager:
                     {"trusted_ips": self.trusted_ips, "trusted_domains": self.trusted_domains},
                     f, indent=2, ensure_ascii=False,
                 )
-        except Exception:
+        except (OSError, TypeError):
             pass
 
     def trust_ip(self, ip: str, label: str = "", notes: str = ""):
@@ -644,7 +644,7 @@ def is_admin_windows() -> bool:
     try:
         import ctypes
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
+    except (ImportError, OSError, AttributeError):
         return False
 
 
@@ -726,7 +726,7 @@ def scapy_arp_scan(cidr: str, timeout_s: int = 2) -> Dict[str, str]:
         pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=cidr)
         ans, _ = srp(pkt, timeout=timeout_s, verbose=False)
         return {str(rcv.psrc): str(rcv.hwsrc).lower() for _, rcv in ans if rcv.psrc and rcv.hwsrc}
-    except Exception:
+    except (OSError, RuntimeError, AttributeError):
         return {}
 
 
@@ -735,7 +735,7 @@ def local_ipv4() -> Optional[str]:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
-    except Exception:
+    except OSError:
         return None
 
 
@@ -788,7 +788,7 @@ def get_mac_manufacturer(mac: str) -> str:
             mfr = resp.text.strip()
             MAC_MANUFACTURERS[prefix] = mfr
             return mfr
-    except Exception:
+    except (requests.RequestException, ValueError):
         pass
     return "Unknown"
 
@@ -923,7 +923,7 @@ class NetworkMonitor:
             self.known_devices = data.get("known_devices", {}) or {}
             self.baseline_gateway_ip = data.get("baseline_gateway_ip", "") or ""
             self.baseline_gateway_mac = data.get("baseline_gateway_mac", "") or ""
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             pass
 
     def save_state(self):
@@ -937,7 +937,7 @@ class NetworkMonitor:
             }
             with open(self.state_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception:
+        except (OSError, TypeError):
             pass
 
     # ── Alert logging ─────────────────────────────────────────────────────────
@@ -1090,7 +1090,7 @@ class NetworkMonitor:
         conns_out: List[Dict] = []
         try:
             conns = psutil.net_connections(kind="inet")
-        except Exception:
+        except psutil.Error:
             return conns_out
 
         for c in conns:
@@ -1106,9 +1106,9 @@ class NetworkMonitor:
                         pname = proc.name()
                         try:
                             exe_path = proc.exe()
-                        except Exception:
+                        except psutil.Error:
                             exe_path = ""
-                except Exception:
+                except psutil.Error:
                     pname = "?"
 
                 la = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else ""
@@ -1156,7 +1156,7 @@ class NetworkMonitor:
                     "service": svc_name,
                     "service_desc": svc_desc,
                 })
-            except Exception:
+            except (psutil.Error, AttributeError, ValueError, TypeError):
                 continue
 
         trust_order = {"safe": 0, "known": 1, "unknown": 2, "suspicious": 3, "dangerous": 4}
@@ -1238,7 +1238,7 @@ class NetworkMonitor:
                     "Flipper Zero or suspicious USB HID device detected",
                     {"details": out2.strip()[:300], "action": "Physical inspection recommended"},
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 - boundary: sub-detector swallow; must never crash advanced-threat scan loop
             pass
 
     def _detect_tor_activity(self, conns: List[Dict]):
@@ -1269,9 +1269,9 @@ class NetworkMonitor:
                         self.log("WARN", "SYSTEM",
                                  "Tor process running on system",
                                  {"process": name})
-                except Exception:
+                except (psutil.Error, AttributeError, KeyError):
                     pass
-        except Exception:
+        except psutil.Error:
             pass
 
     def _detect_audio_spying(self):
@@ -1299,9 +1299,9 @@ class NetworkMonitor:
                                  "Suspicious audio-capable process detected",
                                  {"process": name, "pid": proc.info["pid"],
                                   "exe": proc.info.get("exe", "")})
-                except Exception:
+                except (psutil.Error, AttributeError, KeyError):
                     pass
-        except Exception:
+        except psutil.Error:
             pass
 
     # ── DNS monitoring ────────────────────────────────────────────────────────
@@ -1332,7 +1332,7 @@ class NetworkMonitor:
                                          "Query to suspicious domain detected",
                                          {"domain": domain, "pattern": pattern})
                                 break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - boundary: DNS detector top-level; logs error and keeps scan loop alive
             self.log("WARN", "SYSTEM", "DNS monitoring error", {"error": str(e)})
 
     # ── Process monitoring ────────────────────────────────────────────────────
@@ -1380,7 +1380,7 @@ class NetworkMonitor:
                     time.strptime(v["first_seen"], "%Y-%m-%d %H:%M:%S")
                 ) <= 3600
             }
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - boundary: process monitor top-level; logs error and keeps scan loop alive
             self.log("WARN", "SYSTEM", "Process monitoring error", {"error": str(e)})
 
     # ── File monitoring ───────────────────────────────────────────────────────
@@ -1408,7 +1408,7 @@ class NetworkMonitor:
                                                 "old_hash": monitor_ref.monitored_files[filepath][:16],
                                                 "new_hash": fhash[:16]})
                         monitor_ref.monitored_files[filepath] = fhash
-                    except Exception:
+                    except OSError:
                         pass
 
             critical_paths = [
@@ -1424,11 +1424,11 @@ class NetworkMonitor:
                     try:
                         with open(path, "rb") as f:
                             self.monitored_files[path] = hashlib.sha256(f.read()).hexdigest()
-                    except Exception:
+                    except OSError:
                         pass
             self.file_observer.start()
             self.log("INFO", "SYSTEM", "File monitoring started", {"paths": len(critical_paths)})
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - boundary: watchdog setup; logs error and continues without file monitoring
             self.log("WARN", "SYSTEM", "File monitoring setup failed", {"error": str(e)})
 
     def stop_file_monitoring(self):
@@ -1474,7 +1474,7 @@ class NetworkMonitor:
                                      "Observed ARP reply claiming to be gateway with different MAC",
                                      {"gateway_ip": psrc, "claimed_mac": hwsrc,
                                       "baseline_mac": self.baseline_gateway_mac})
-            except Exception:
+            except Exception:  # noqa: BLE001 - boundary: scapy ARP packet handler; must never break the sniff loop
                 pass
             try:
                 if pkt.haslayer("IP") and pkt.haslayer("TCP"):
@@ -1501,7 +1501,7 @@ class NetworkMonitor:
                                           "sample_ports": sorted(list(rec["ports"]))[:25]})
                                 rec["ports"].clear()
                                 rec["ts"] = t
-            except Exception:
+            except Exception:  # noqa: BLE001 - boundary: scapy TCP packet handler; must never break the sniff loop
                 pass
 
         try:
@@ -1511,7 +1511,7 @@ class NetworkMonitor:
                 store=False,
                 stop_filter=lambda _p: self.sniff_stop.is_set(),
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - boundary: scapy sniff() raises broad set (Npcap/permission/runtime); logs and exits sniff thread
             self.log("WARN", "SYSTEM",
                      "Passive sniff failed (Npcap/Admin likely missing)", {"error": str(e)})
 
@@ -1527,7 +1527,7 @@ class NetworkMonitor:
         for a in self.alerts:
             try:
                 ts = time.mktime(time.strptime(a["timestamp"], "%Y-%m-%d %H:%M:%S"))
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 continue
             if ts < cutoff:
                 continue
@@ -1551,7 +1551,7 @@ class NetworkMonitor:
         for a in self.alerts:
             try:
                 ts = time.mktime(time.strptime(a["timestamp"], "%Y-%m-%d %H:%M:%S"))
-            except Exception:
+            except (ValueError, KeyError, TypeError):
                 continue
             if ts >= cutoff and a.get("severity") in ("HIGH", "WARN"):
                 threats.append(a)
@@ -1776,7 +1776,7 @@ class ConnectionDetailPopup:
                 ["explorer", "/select,", exe_path],
                 creationflags=_CREATE_NO_WINDOW,
             )
-        except Exception as e:
+        except OSError as e:
             messagebox.showerror("Open Location", str(e), parent=self.win)
 
     def _block_ip(self):
@@ -1822,7 +1822,7 @@ class ConnectionDetailPopup:
                              {"process": pname, "pid": pid})
                 self.on_refresh()
                 self.win.destroy()
-            except Exception as e:
+            except psutil.Error as e:
                 messagebox.showerror("Kill Process", str(e), parent=self.win)
 
     def _show_rep_results(self, rep: Dict):
@@ -1895,7 +1895,7 @@ class ConnectionDetailPopup:
                 try:
                     if not self.win.winfo_exists():
                         return
-                except Exception:
+                except (tk.TclError, AttributeError):
                     return
                 self._show_rep_results(result)
                 self._check_rep_btn.configure(state="normal")
@@ -1903,7 +1903,7 @@ class ConnectionDetailPopup:
 
             try:
                 self.win.after(0, _update_ui)
-            except Exception:
+            except (tk.TclError, AttributeError):
                 pass
 
         threading.Thread(target=_bg, daemon=True).start()
@@ -2214,7 +2214,7 @@ class App(ctk.CTkFrame):
         iid = sel[0]
         try:
             idx = int(iid.split("-")[1])
-        except Exception:
+        except (ValueError, IndexError):
             return
 
         # Resolve the index against the currently displayed (filtered) list
@@ -2442,7 +2442,7 @@ class App(ctk.CTkFrame):
     def scan_now(self):
         try:
             self.worker_q.put_nowait("scan")
-        except Exception:
+        except queue.Full:
             pass
 
     def force_stop(self):
@@ -2450,7 +2450,7 @@ class App(ctk.CTkFrame):
         self.mon.stop_passive_sniff()
         try:
             self.parent.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
     def export_report(self):
@@ -2482,7 +2482,7 @@ class App(ctk.CTkFrame):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             messagebox.showinfo("Export", f"Saved:\n{path}")
-        except Exception as e:
+        except (OSError, TypeError) as e:
             messagebox.showerror("Export failed", str(e))
 
     # ── Connection History persistence ──────────────────────────────────────
@@ -2492,14 +2492,14 @@ class App(ctk.CTkFrame):
             if os.path.exists(self._history_path):
                 with open(self._history_path, "r", encoding="utf-8") as f:
                     self._conn_history = json.load(f)
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             self._conn_history = {}
 
     def _save_history(self):
         try:
             with open(self._history_path, "w", encoding="utf-8") as f:
                 json.dump(self._conn_history, f, indent=2, ensure_ascii=False)
-        except Exception:
+        except (OSError, TypeError):
             pass
 
     def _update_history(self, conns: List[Dict]):
@@ -2659,7 +2659,7 @@ class App(ctk.CTkFrame):
             return None
         try:
             idx = int(sel[0].split("-")[1])
-        except Exception:
+        except (ValueError, IndexError):
             return None
         filtered = self._filtered_conns(self.conn_filter.get())
         if idx < len(filtered):
@@ -2714,7 +2714,7 @@ class App(ctk.CTkFrame):
             return None
         try:
             idx = int(sel[0].split("-")[1])
-        except Exception:
+        except (ValueError, IndexError):
             return None
         threats = self.mon.get_active_threats()
         if idx < len(threats):
@@ -2735,7 +2735,7 @@ class App(ctk.CTkFrame):
             return
         try:
             pid_val = int(pid_val)
-        except Exception:
+        except (ValueError, TypeError):
             messagebox.showinfo("Kill Process", "Invalid PID.")
             return
 
@@ -2747,7 +2747,7 @@ class App(ctk.CTkFrame):
                 self.mon.log("HIGH", "SYSTEM", "Process killed via Threats tab",
                              {"process": proc_name, "pid": pid_val})
                 self.refresh_threats()
-            except Exception as e:
+            except psutil.Error as e:
                 messagebox.showerror("Kill Process", str(e))
 
     def threats_block_ip(self):
@@ -2822,7 +2822,7 @@ class App(ctk.CTkFrame):
                     # Background reputation checks (hybrid: unknown/suspicious/dangerous)
                     self.mon.check_reputations_background(conns)
 
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - boundary: scan worker top-level; logs error and keeps daemon thread alive
                     self.mon.log("WARN", "SYSTEM", "Scan error", {"error": str(e)})
 
     def _ensure_passive(self):
@@ -2946,7 +2946,7 @@ class App(ctk.CTkFrame):
             return
         try:
             idx = int(sel[0].split("-")[1])
-        except Exception:
+        except (ValueError, IndexError):
             return
         recent = list(reversed(self.mon.alerts[-800:]))
         filtered = [a for a in recent if self.alert_passes_filter(a)]
@@ -3055,10 +3055,10 @@ def run_tool():
             win = ctk.CTkToplevel(tk._default_root)
             app = App(win)
             win.protocol("WM_DELETE_WINDOW", app.force_stop)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: tool entry point; surfaces any startup failure to the user via dialog
         try:
             messagebox.showerror("Network Intrusion Detector Pro", f"Startup error:\n{e}")
-        except Exception:
+        except tk.TclError:
             pass
 
 
