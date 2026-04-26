@@ -29,8 +29,10 @@ except ImportError:
 
 try:
     import psutil
+    _PSUTIL_OR_OS: tuple = (psutil.Error, OSError, AttributeError)
 except ImportError:
     psutil = None
+    _PSUTIL_OR_OS = (OSError, AttributeError)
 
 try:
     import winreg
@@ -117,14 +119,14 @@ def safe_run(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
         cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                             timeout=timeout, shell=False, creationflags=_CNW)
         return cp.returncode, cp.stdout, cp.stderr
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         return 1, "", str(e)
 
 def is_admin() -> bool:
     try:
         import ctypes
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
+    except (OSError, AttributeError):
         return False
 
 # ─────────────────────────────────────────────
@@ -232,7 +234,7 @@ class SystemHealthEngine:
                     }
                 except (PermissionError, OSError):
                     pass
-        except Exception:
+        except _PSUTIL_OR_OS:
             pass
 
         # Disk I/O delta
@@ -242,7 +244,7 @@ class SystemHealthEngine:
                 s.disk_read_speed = (dio.read_bytes - self._prev_disk_io.read_bytes) / dt
                 s.disk_write_speed = (dio.write_bytes - self._prev_disk_io.write_bytes) / dt
             self._prev_disk_io = dio
-        except Exception:
+        except _PSUTIL_OR_OS:
             pass
 
         # Network I/O delta
@@ -252,7 +254,7 @@ class SystemHealthEngine:
                 s.net_down_speed = (nio.bytes_recv - self._prev_net_io.bytes_recv) / dt
                 s.net_up_speed = (nio.bytes_sent - self._prev_net_io.bytes_sent) / dt
             self._prev_net_io = nio
-        except Exception:
+        except _PSUTIL_OR_OS:
             pass
 
         # GPU
@@ -265,7 +267,7 @@ class SystemHealthEngine:
         # Uptime
         try:
             s.uptime_seconds = now - psutil.boot_time()
-        except Exception:
+        except _PSUTIL_OR_OS:
             pass
 
         self.samples.append(s)
@@ -288,7 +290,7 @@ class SystemHealthEngine:
                     self._gpu_name = name
                     self._gpu_fail_count = 0
                     return temp, usage, name
-        except Exception:
+        except (ValueError, IndexError, OSError, AttributeError):
             pass
         self._gpu_fail_count += 1
         if self._gpu_fail_count >= 3:
@@ -336,7 +338,7 @@ class SystemHealthEngine:
                 val = float(out.strip().splitlines()[0])
                 if 0 < val < 150:
                     return val
-        except Exception:
+        except (ValueError, IndexError, OSError):
             pass
         return None
 
@@ -351,7 +353,7 @@ class SystemHealthEngine:
             if rc == 0 and out.strip():
                 raw = float(out.strip())
                 return convert_wmi_temp(raw)
-        except Exception:
+        except (ValueError, IndexError, OSError):
             pass
         return None
 
@@ -519,7 +521,7 @@ class SystemHealthEngine:
                 winreg.CloseKey(key)
                 self._save_disabled_startup(disabled)
                 return f"Enabled: {name}"
-            except Exception as e:
+            except OSError as e:
                 return f"Failed to enable: {e}"
         else:
             # Disable: remove from registry, store in JSON
@@ -538,7 +540,7 @@ class SystemHealthEngine:
                                   "reg_path": item.get("reg_path", "")}
                 self._save_disabled_startup(disabled)
                 return f"Disabled: {name}"
-            except Exception as e:
+            except OSError as e:
                 return f"Failed to disable: {e}"
 
     def _disabled_startup_path(self) -> str:
@@ -638,7 +640,7 @@ class SystemHealthEngine:
             info["gpu_name"] = self._gpu_name or "N/A"
             info["os_version"] = f"{platform.system()} {platform.release()} ({platform.version()})"
             info["boot_time"] = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
+        except _PSUTIL_OR_OS:
             pass
         return info
 
@@ -920,7 +922,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
             psutil.Process(pid).kill()
             messagebox.showinfo("Process Killed", f"{name} (PID {pid}) has been killed.")
             self._request_processes()
-        except Exception as e:
+        except _PSUTIL_OR_OS as e:
             messagebox.showerror("Error", f"Could not kill process:\n{e}")
 
     def _open_proc_location(self):
@@ -1292,7 +1294,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                 elif job[0] == "startup":
                     items = self.engine.get_startup_items()
                     self.result_q.put(("startup", items))
-            except Exception:
+            except _PSUTIL_OR_OS:
                 pass
 
     def _tick(self):
@@ -1305,7 +1307,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
             try:
                 if self.nb.get() == "Processes":
                     self.work_q.put_nowait(("processes",))
-            except Exception:
+            except tk.TclError:
                 pass
         self.after(self._refresh_ms, self._tick)
 
@@ -1326,7 +1328,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
                     self._on_temp_sizes(msg[1])
                 elif msg[0] == "startup":
                     self._populate_startup(msg[1])
-        except Exception:
+        except tk.TclError:
             pass
         if self.running:
             self.after(100, self._process_queue)
@@ -1506,7 +1508,7 @@ class App(ctk.CTkFrame if HAS_CTK else tk.Frame):
         self.running = False
         try:
             self.parent.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
 
@@ -1534,7 +1536,7 @@ def run_tool():
 
         if tk._default_root == root:
             root.mainloop()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - boundary: surface any startup fault to UI
         messagebox.showerror(TOOL_NAME, f"Startup error:\n{e}")
 
 
