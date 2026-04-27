@@ -73,7 +73,8 @@ _DROP_KEYS = frozenset({
 
 _MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
 _CRED_RE = re.compile(
-    r"\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+",
+    r'\b(?P<key>api[_-]?key|token|password|secret|bearer)\b"?\s*[:=]\s*(?:"[^"]*"|\S+)'
+    r'|\b(?P<bearer>bearer)\s+\S+',
     re.IGNORECASE,
 )
 
@@ -88,13 +89,25 @@ def _home_paths() -> list[str]:
     return candidates
 
 
-def _scrub_string(text: str) -> str:
+def _redact_cred(m: re.Match[str]) -> str:
+    """Replacement function for :data:`_CRED_RE`."""
+    if m.group("key"):
+        return f"{m.group('key')}=<REDACTED>"
+    return f"{m.group('bearer')} <REDACTED>"
+
+
+def _scrub_string(text: str, homes: list[str]) -> str:
     """Apply all string-level redactions to ``text``."""
-    for home in _home_paths():
-        if home and home in text:
-            text = text.replace(home, "<HOME>")
+    for home in homes:
+        if home:
+            text = re.sub(
+                re.escape(home) + r"(?=[\\/]|$|\s)",
+                "<HOME>",
+                text,
+                flags=re.IGNORECASE,
+            )
     text = _MAC_RE.sub("<MAC>", text)
-    text = _CRED_RE.sub(lambda m: f"{m.group(1)}=<REDACTED>", text)
+    text = _CRED_RE.sub(_redact_cred, text)
     return text
 
 
@@ -105,6 +118,7 @@ def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
     entirely; rewrites strings via :func:`_scrub_string`; recurses into
     nested dicts and lists.
     """
+    homes = _home_paths()
 
     def _walk(node: Any) -> Any:
         if isinstance(node, dict):
@@ -112,7 +126,7 @@ def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(node, list):
             return [_walk(v) for v in node]
         if isinstance(node, str):
-            return _scrub_string(node)
+            return _scrub_string(node, homes)
         return node
 
     return _walk(payload)

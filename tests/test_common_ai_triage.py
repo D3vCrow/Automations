@@ -82,6 +82,70 @@ class TestSanitize:
         assert out["context"]["country"] == "RU"
 
 
+class TestSanitizeHardening:
+    def test_strips_json_quoted_credentials(self) -> None:
+        from tools._common.ai_triage import _sanitize
+
+        payload = {"alert": {"details": {"raw": '{"api_key": "sk-abc123", "token": "xyz"}'}}}
+        out = _sanitize(payload)
+        raw = out["alert"]["details"]["raw"]
+        assert "sk-abc123" not in raw
+        assert "xyz" not in raw
+        assert "<REDACTED>" in raw
+
+    def test_strips_bearer_authorization_header(self) -> None:
+        from tools._common.ai_triage import _sanitize
+
+        jwt = "eyJhbGciOiJIUzI1NiJ9.payload.signature"
+        payload = {"alert": {"details": {"raw": f"Authorization: Bearer {jwt}"}}}
+        out = _sanitize(payload)
+        raw = out["alert"]["details"]["raw"]
+        assert jwt not in raw
+        assert "<REDACTED>" in raw
+
+    def test_strips_mixed_case_home_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tools._common.ai_triage import _sanitize
+
+        monkeypatch.setenv("USERPROFILE", r"C:\Users\christophoros")
+        monkeypatch.delenv("HOME", raising=False)
+        payload = {"context": {"detail": r"opened C:\USERS\Christophoros\secrets.txt"}}
+        out = _sanitize(payload)
+        detail = out["context"]["detail"]
+        assert "Christophoros" not in detail
+        assert "USERS" not in detail
+        assert "<HOME>" in detail
+
+    def test_home_prefix_does_not_match_unrelated_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tools._common.ai_triage import _sanitize
+
+        monkeypatch.setenv("USERPROFILE", r"C:\Users\chris")
+        monkeypatch.delenv("HOME", raising=False)
+        payload = {"context": {"detail": r"opened C:\Users\christophoros\secrets.txt"}}
+        out = _sanitize(payload)
+        detail = out["context"]["detail"]
+        assert "<HOME>tophoros" not in detail
+        assert r"C:\Users\christophoros\secrets.txt" in detail
+
+    def test_does_not_mutate_input(self) -> None:
+        from tools._common.ai_triage import _sanitize
+
+        payload = {
+            "alert": {"details": {"raw": "api_key=sk-abc123"}},
+            "context": {"tags": ["aa:bb:cc:dd:ee:ff"]},
+        }
+        out = _sanitize(payload)
+        assert out is not payload
+        assert out["alert"] is not payload["alert"]
+        assert out["context"]["tags"] is not payload["context"]["tags"]
+
+        out["alert"]["details"]["raw"] = "MUTATED"
+        out["context"]["tags"].append("MUTATED")
+        assert payload["alert"]["details"]["raw"] == "api_key=sk-abc123"
+        assert payload["context"]["tags"] == ["aa:bb:cc:dd:ee:ff"]
+
+
 class TestCache:
     def test_cache_miss_returns_none(self, tmp_path) -> None:
         from tools._common.ai_triage import _Cache
