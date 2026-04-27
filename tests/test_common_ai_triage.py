@@ -245,3 +245,25 @@ class TestParseResponse:
 
         with pytest.raises(json.JSONDecodeError):
             _parse_response("not json at all", model="m")
+
+    def test_handles_braces_inside_string_values(self) -> None:
+        from tools._common.ai_triage import _parse_response
+
+        raw = '{"severity_human": "high", "why_it_matters": "score}went up"}'
+        result = _parse_response(raw, model="m")
+        assert result.severity_human == "high"
+        assert result.why_it_matters == "score}went up"
+
+    def test_null_likelihood_falls_back_to_default(self) -> None:
+        from tools._common.ai_triage import _parse_response
+
+        raw = '{"severity_human": "low", "false_positive_likelihood": null}'
+        result = _parse_response(raw, model="m")
+        assert result.false_positive_likelihood == 0.5  # safe default
+
+    def test_string_evidence_becomes_single_item_list(self) -> None:
+        from tools._common.ai_triage import _parse_response
+
+        raw = '{"severity_human": "low", "evidence": "single string"}'
+        result = _parse_response(raw, model="m")
+        assert result.evidence == ["single string"]

@@ -281,22 +281,45 @@ class _Budget:
 def _extract_first_json_object(text: str) -> dict[str, Any]:
     """Return the first ``{...}`` JSON object found in ``text``.
 
-    Raises :class:`json.JSONDecodeError` on no object or invalid JSON.
+    Uses :class:`json.JSONDecoder` so that braces inside string values
+    are handled correctly. Raises :class:`json.JSONDecodeError` if no
+    object is found, the JSON is malformed, or the parsed value is not
+    a dict.
     """
     start = text.find("{")
     if start == -1:
         raise json.JSONDecodeError("no JSON object found", text, 0)
+    decoder = json.JSONDecoder()
+    obj, _end = decoder.raw_decode(text, start)
+    if not isinstance(obj, dict):
+        raise json.JSONDecodeError("expected a JSON object", text, start)
+    return obj
 
-    depth = 0
-    for idx in range(start, len(text)):
-        ch = text[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start : idx + 1])
-    raise json.JSONDecodeError("unterminated JSON object", text, start)
+
+def _safe_float(value: Any, *, default: float) -> float:
+    """Coerce ``value`` to ``float`` defensively.
+
+    Returns ``default`` when ``value`` is ``None`` or cannot be coerced.
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_evidence(value: Any) -> list[str]:
+    """Coerce a model-supplied ``evidence`` field to ``list[str]``.
+
+    A list passes through (each element ``str()``-coerced). A bare string
+    becomes a single-element list. Anything else returns an empty list.
+    """
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return [value]
+    return []
 
 
 def _parse_response(raw: str, *, model: str) -> TriageResult:
@@ -313,8 +336,10 @@ def _parse_response(raw: str, *, model: str) -> TriageResult:
         why_it_matters=str(obj.get("why_it_matters", "unknown")),
         suggested_action=str(obj.get("suggested_action", "investigate")),
         suggested_action_reason=str(obj.get("suggested_action_reason", "")),
-        false_positive_likelihood=float(obj.get("false_positive_likelihood", 0.5)),
-        evidence=list(obj.get("evidence", [])),
+        false_positive_likelihood=_safe_float(
+            obj.get("false_positive_likelihood"), default=0.5
+        ),
+        evidence=_coerce_evidence(obj.get("evidence", [])),
         model=model,
         cached=False,
         triaged_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
