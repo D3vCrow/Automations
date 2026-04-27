@@ -22,9 +22,13 @@ an AI affordance.
 
 from __future__ import annotations
 
+import json
 import os
 import re
-from dataclasses import dataclass
+import sqlite3
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -110,3 +114,57 @@ def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 __all__ = ["TriageResult"]
+
+
+class _Cache:
+    """SQLite-backed 24h cache for :class:`TriageResult` rows.
+
+    Schema is single-table; lookup evicts expired rows lazily on access.
+    Concurrent processes are serialized by SQLite's own locking.
+    """
+
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS ai_triage_cache (
+            key        TEXT PRIMARY KEY,
+            payload    TEXT NOT NULL,
+            stored_at  REAL NOT NULL,
+            expires_at REAL NOT NULL
+        )
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = Path(db_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as cx:
+            cx.execute(self._SCHEMA)
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self._path)
+
+    def get(self, key: str) -> "TriageResult | None":
+        with self._connect() as cx:
+            row = cx.execute(
+                "SELECT payload, expires_at FROM ai_triage_cache WHERE key=?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload_json, expires_at = row
+        if time.time() >= expires_at:
+            with self._connect() as cx:
+                cx.execute("DELETE FROM ai_triage_cache WHERE key=?", (key,))
+            return None
+        data = json.loads(payload_json)
+        data["cached"] = True
+        return TriageResult(**data)
+
+    def put(self, key: str, result: "TriageResult", ttl_hours: float) -> None:
+        now = time.time()
+        expires = now + (ttl_hours * 3600.0)
+        payload_json = json.dumps(asdict(result))
+        with self._connect() as cx:
+            cx.execute(
+                "INSERT OR REPLACE INTO ai_triage_cache "
+                "(key, payload, stored_at, expires_at) VALUES (?, ?, ?, ?)",
+                (key, payload_json, now, expires),
+            )
