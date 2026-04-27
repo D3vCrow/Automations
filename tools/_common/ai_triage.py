@@ -276,3 +276,46 @@ class _Budget:
         data["used"] = used + tokens
         self._save(data)
         return True
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any]:
+    """Return the first ``{...}`` JSON object found in ``text``.
+
+    Raises :class:`json.JSONDecodeError` on no object or invalid JSON.
+    """
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("no JSON object found", text, 0)
+
+    depth = 0
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start : idx + 1])
+    raise json.JSONDecodeError("unterminated JSON object", text, start)
+
+
+def _parse_response(raw: str, *, model: str) -> TriageResult:
+    """Extract and validate a JSON triage object from a model response.
+
+    Tolerates leading/trailing prose (the model sometimes adds a sentence
+    before the JSON). Missing fields fall back to safe defaults. Raises
+    :class:`json.JSONDecodeError` if no JSON object is found at all.
+    """
+    obj = _extract_first_json_object(raw)
+
+    return TriageResult(
+        severity_human=str(obj.get("severity_human", "unknown")),
+        why_it_matters=str(obj.get("why_it_matters", "unknown")),
+        suggested_action=str(obj.get("suggested_action", "investigate")),
+        suggested_action_reason=str(obj.get("suggested_action_reason", "")),
+        false_positive_likelihood=float(obj.get("false_positive_likelihood", 0.5)),
+        evidence=list(obj.get("evidence", [])),
+        model=model,
+        cached=False,
+        triaged_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+    )

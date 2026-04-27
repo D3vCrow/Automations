@@ -204,3 +204,44 @@ class TestIsAvailable:
         ok, reason = mod.is_available()
         assert ok is True
         assert reason == "subscription"
+
+
+class TestParseResponse:
+    def test_parses_well_formed_json(self) -> None:
+        from tools._common.ai_triage import _parse_response
+
+        raw = """
+        {"severity_human": "high", "why_it_matters": "Bad IP.",
+         "suggested_action": "block", "suggested_action_reason": "VT 18/89.",
+         "false_positive_likelihood": 0.1, "evidence": ["VT 18/89"]}
+        """
+        result = _parse_response(raw, model="claude-haiku-4-5-20251001")
+        assert result.severity_human == "high"
+        assert result.suggested_action == "block"
+        assert result.false_positive_likelihood == 0.1
+        assert result.evidence == ["VT 18/89"]
+        assert result.cached is False
+
+    def test_partial_fields_default_to_unknown(self) -> None:
+        from tools._common.ai_triage import _parse_response
+
+        raw = '{"severity_human": "low"}'
+        result = _parse_response(raw, model="m")
+        assert result.severity_human == "low"
+        assert result.why_it_matters == "unknown"
+        assert result.suggested_action == "investigate"  # safe default
+        assert result.evidence == []
+
+    def test_extracts_json_from_surrounding_prose(self) -> None:
+        from tools._common.ai_triage import _parse_response
+
+        raw = 'Sure, here is the analysis: {"severity_human": "medium"}\nThanks.'
+        result = _parse_response(raw, model="m")
+        assert result.severity_human == "medium"
+
+    def test_bad_json_raises(self) -> None:
+        import json
+        from tools._common.ai_triage import _parse_response
+
+        with pytest.raises(json.JSONDecodeError):
+            _parse_response("not json at all", model="m")
