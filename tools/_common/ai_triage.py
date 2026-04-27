@@ -23,14 +23,18 @@ an AI affordance.
 from __future__ import annotations
 
 import datetime as _dt
+import importlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from tools._common.config import get_bool, get_config
 
 
 @dataclass
@@ -169,6 +173,53 @@ class _Cache:
                 "(key, payload, stored_at, expires_at) VALUES (?, ?, ?, ?)",
                 (key, payload_json, now, expires),
             )
+
+
+def _sdk_importable() -> bool:
+    """Return True if ``claude_agent_sdk`` can be imported."""
+    try:
+        importlib.import_module("claude_agent_sdk")
+        return True
+    except ImportError:
+        return False
+
+
+def _detect_auth_mode() -> tuple[str, str]:
+    """Return ``(mode, source)``.
+
+    ``mode`` is ``"subscription"`` (Claude Code OAuth on this machine),
+    ``"api_key"`` (``ANTHROPIC_API_KEY`` set), or ``"none"``. ``source``
+    is a short tag for tooltips.
+    """
+    forced = (get_config("AUTOMATIONS_AI_AUTH_MODE") or "").strip().lower()
+    if forced == "api_key" and get_config("ANTHROPIC_API_KEY"):
+        return ("api_key", "ANTHROPIC_API_KEY")
+    if forced == "subscription" and shutil.which("claude") is not None:
+        return ("subscription", "claude-cli")
+
+    # Auto-detect: prefer subscription if claude CLI is on PATH.
+    if shutil.which("claude") is not None:
+        return ("subscription", "claude-cli")
+    if get_config("ANTHROPIC_API_KEY"):
+        return ("api_key", "ANTHROPIC_API_KEY")
+    return ("none", "")
+
+
+def is_available() -> tuple[bool, str]:
+    """Return ``(enabled, reason)`` for UI gating.
+
+    ``reason`` values: ``"disabled"``, ``"sdk_missing"``, ``"no_auth"``,
+    ``"budget_exhausted"``, ``"subscription"``, ``"api_key"``. Callers
+    use the reason as a tooltip key.
+    """
+    if not get_bool("AUTOMATIONS_AI_ENABLED", default=False):
+        return (False, "disabled")
+    if not _sdk_importable():
+        return (False, "sdk_missing")
+    mode, _source = _detect_auth_mode()
+    if mode == "none":
+        return (False, "no_auth")
+    return (True, mode)
 
 
 def _today() -> _dt.date:

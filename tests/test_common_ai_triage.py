@@ -165,3 +165,42 @@ class TestBudget:
 
         monkeypatch.setattr(mod, "_today", _Day2.today)
         assert b.remaining() == 1000  # rolled over
+
+
+class TestIsAvailable:
+    def test_disabled_when_env_flag_off(self, monkeypatch) -> None:
+        from tools._common import ai_triage as mod
+
+        monkeypatch.delenv("AUTOMATIONS_AI_ENABLED", raising=False)
+        ok, reason = mod.is_available()
+        assert ok is False
+        assert reason == "disabled"
+
+    def test_disabled_when_sdk_missing(self, monkeypatch) -> None:
+        from tools._common import ai_triage as mod
+
+        monkeypatch.setenv("AUTOMATIONS_AI_ENABLED", "1")
+        monkeypatch.setattr(mod, "_sdk_importable", lambda: False)
+        ok, reason = mod.is_available()
+        assert ok is False
+        assert reason == "sdk_missing"
+
+    def test_disabled_when_no_auth(self, monkeypatch) -> None:
+        from tools._common import ai_triage as mod
+
+        monkeypatch.setenv("AUTOMATIONS_AI_ENABLED", "1")
+        monkeypatch.setattr(mod, "_sdk_importable", lambda: True)
+        monkeypatch.setattr(mod, "_detect_auth_mode", lambda: ("none", ""))
+        ok, reason = mod.is_available()
+        assert ok is False
+        assert reason == "no_auth"
+
+    def test_available_when_subscription_authed(self, monkeypatch) -> None:
+        from tools._common import ai_triage as mod
+
+        monkeypatch.setenv("AUTOMATIONS_AI_ENABLED", "1")
+        monkeypatch.setattr(mod, "_sdk_importable", lambda: True)
+        monkeypatch.setattr(mod, "_detect_auth_mode", lambda: ("subscription", "claude-cli"))
+        ok, reason = mod.is_available()
+        assert ok is True
+        assert reason == "subscription"
