@@ -22,6 +22,7 @@ an AI affordance.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import re
@@ -168,3 +169,59 @@ class _Cache:
                 "(key, payload, stored_at, expires_at) VALUES (?, ?, ?, ?)",
                 (key, payload_json, now, expires),
             )
+
+
+def _today() -> _dt.date:
+    """Indirection so tests can monkeypatch ``date.today``."""
+    return _dt.date.today()
+
+
+class _Budget:
+    """Persistent daily token budget.
+
+    Stores ``{"date": "YYYY-MM-DD", "used": int}`` in a JSON file. On a
+    new local day, ``used`` resets to 0 on first read. Single-process.
+    """
+
+    def __init__(self, state_path: Path, daily_cap: int) -> None:
+        self._path = Path(state_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._cap = int(daily_cap)
+
+    def _load(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return {"date": _today().isoformat(), "used": 0}
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"date": _today().isoformat(), "used": 0}
+        if data.get("date") != _today().isoformat():
+            return {"date": _today().isoformat(), "used": 0}
+        return data
+
+    def _save(self, data: dict[str, Any]) -> None:
+        self._path.write_text(json.dumps(data), encoding="utf-8")
+
+    def remaining(self) -> int:
+        """Return tokens remaining in today's budget."""
+        data = self._load()
+        return max(0, self._cap - int(data.get("used", 0)))
+
+    def try_consume(self, tokens: int) -> bool:
+        """Attempt to consume ``tokens`` from today's budget.
+
+        Args:
+            tokens: Number of tokens to consume.
+
+        Returns:
+            ``True`` if tokens were consumed; ``False`` if the cap would
+            be exceeded (no tokens are consumed in that case).
+        """
+        data = self._load()
+        used = int(data.get("used", 0))
+        if used + tokens > self._cap:
+            self._save(data)  # persist any date-rollover
+            return False
+        data["used"] = used + tokens
+        self._save(data)
+        return True

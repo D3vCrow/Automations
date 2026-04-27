@@ -125,3 +125,43 @@ class TestCache:
 
         fake_now[0] = 1_000_000.0 + 3700  # past 1h TTL
         assert cache.get("k1") is None
+
+
+class TestBudget:
+    def test_fresh_day_allows_call(self, tmp_path) -> None:
+        from tools._common.ai_triage import _Budget
+
+        b = _Budget(tmp_path / "b.json", daily_cap=10_000)
+        assert b.try_consume(1500) is True
+        assert b.remaining() == 8500
+
+    def test_exhaustion_blocks_further_calls(self, tmp_path) -> None:
+        from tools._common.ai_triage import _Budget
+
+        b = _Budget(tmp_path / "b.json", daily_cap=2000)
+        assert b.try_consume(1500) is True
+        assert b.try_consume(1000) is False  # would exceed cap
+        assert b.remaining() == 500
+
+    def test_resets_at_midnight_local(self, tmp_path, monkeypatch) -> None:
+        import datetime as _dt
+        from tools._common import ai_triage as mod
+
+        b = mod._Budget(tmp_path / "b.json", daily_cap=1000)
+
+        class _Day1:
+            @staticmethod
+            def today() -> _dt.date:
+                return _dt.date(2026, 4, 27)
+
+        class _Day2:
+            @staticmethod
+            def today() -> _dt.date:
+                return _dt.date(2026, 4, 28)
+
+        monkeypatch.setattr(mod, "_today", _Day1.today)
+        b.try_consume(1000)
+        assert b.remaining() == 0
+
+        monkeypatch.setattr(mod, "_today", _Day2.today)
+        assert b.remaining() == 1000  # rolled over
