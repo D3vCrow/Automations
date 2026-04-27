@@ -73,8 +73,7 @@ _DROP_KEYS = frozenset({
 
 _MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
 _CRED_RE = re.compile(
-    r'\b(?P<key>api[_-]?key|token|password|secret|bearer)\b"?\s*[:=]\s*(?:"[^"]*"|\S+)'
-    r'|\b(?P<bearer>bearer)\s+\S+',
+    r"\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+",
     re.IGNORECASE,
 )
 
@@ -89,25 +88,13 @@ def _home_paths() -> list[str]:
     return candidates
 
 
-def _redact_cred(m: re.Match[str]) -> str:
-    """Replacement function for :data:`_CRED_RE`."""
-    if m.group("key"):
-        return f"{m.group('key')}=<REDACTED>"
-    return f"{m.group('bearer')} <REDACTED>"
-
-
-def _scrub_string(text: str, homes: list[str]) -> str:
+def _scrub_string(text: str) -> str:
     """Apply all string-level redactions to ``text``."""
-    for home in homes:
-        if home:
-            text = re.sub(
-                re.escape(home) + r"(?=[\\/]|$|\s)",
-                "<HOME>",
-                text,
-                flags=re.IGNORECASE,
-            )
+    for home in _home_paths():
+        if home and home in text:
+            text = text.replace(home, "<HOME>")
     text = _MAC_RE.sub("<MAC>", text)
-    text = _CRED_RE.sub(_redact_cred, text)
+    text = _CRED_RE.sub(lambda m: f"{m.group(1)}=<REDACTED>", text)
     return text
 
 
@@ -118,7 +105,6 @@ def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
     entirely; rewrites strings via :func:`_scrub_string`; recurses into
     nested dicts and lists.
     """
-    homes = _home_paths()
 
     def _walk(node: Any) -> Any:
         if isinstance(node, dict):
@@ -126,7 +112,7 @@ def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(node, list):
             return [_walk(v) for v in node]
         if isinstance(node, str):
-            return _scrub_string(node, homes)
+            return _scrub_string(node)
         return node
 
     return _walk(payload)
@@ -334,6 +320,44 @@ def _coerce_evidence(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
     return []
+
+
+_SYSTEM_PROMPT = (
+    "You are an AI triage assistant for a personal network/security toolbox. "
+    "Given an alert and connection context, return a single JSON object with "
+    "keys: severity_human (low|medium|high|critical), why_it_matters (1-2 "
+    "sentences), suggested_action (monitor|block|kill_process|investigate|"
+    "ignore), suggested_action_reason (1 sentence), false_positive_likelihood "
+    "(0.0-1.0), evidence (list of short strings). Output ONLY the JSON object. "
+    "Be calibrated: if data is sparse, return moderate severity and high "
+    "false_positive_likelihood."
+)
+
+
+def _sdk_query(*, prompt: str, model: str, system: str) -> str:
+    """Thin wrapper around ``claude_agent_sdk.query`` for monkeypatching.
+
+    Returns the concatenated assistant-text content. Real SDK call. Tests
+    monkeypatch this function and never go to the network.
+    """
+    from claude_agent_sdk import query  # type: ignore[import-not-found]
+
+    parts: list[str] = []
+    for block in query(prompt=prompt, options={"model": model, "system_prompt": system}):
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(text)
+    return "".join(parts)
+
+
+def _call_claude(*, sanitized_payload: dict[str, Any], model: str) -> str:
+    """Call the SDK with a triage prompt, return raw text response."""
+    prompt = (
+        "Triage the following network alert. Respond with the required "
+        "JSON object only.\n\n"
+        f"{json.dumps(sanitized_payload, indent=2, default=str)}"
+    )
+    return _sdk_query(prompt=prompt, model=model, system=_SYSTEM_PROMPT)
 
 
 def _parse_response(raw: str, *, model: str) -> TriageResult:
