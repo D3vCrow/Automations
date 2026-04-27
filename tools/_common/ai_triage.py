@@ -22,7 +22,10 @@ an AI affordance.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -51,6 +54,59 @@ class TriageResult:
     model: str
     cached: bool
     triaged_at: str
+
+
+# Drop these keys entirely — too risky to send.
+_DROP_KEYS = frozenset({
+    "process_cmdline", "cmdline", "command_line",
+    "hostname", "wifi_ssid", "ssid", "username",
+})
+
+_MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
+_CRED_RE = re.compile(
+    r"\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+",
+    re.IGNORECASE,
+)
+
+
+def _home_paths() -> list[str]:
+    """Return all path prefixes that look like the current user's home."""
+    candidates: list[str] = []
+    for var in ("USERPROFILE", "HOME"):
+        value = os.environ.get(var)
+        if value:
+            candidates.append(value)
+    return candidates
+
+
+def _scrub_string(text: str) -> str:
+    """Apply all string-level redactions to ``text``."""
+    for home in _home_paths():
+        if home and home in text:
+            text = text.replace(home, "<HOME>")
+    text = _MAC_RE.sub("<MAC>", text)
+    text = _CRED_RE.sub(lambda m: f"{m.group(1)}=<REDACTED>", text)
+    return text
+
+
+def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied payload with PII / credentials stripped.
+
+    The original payload is left untouched. Drops keys in :data:`_DROP_KEYS`
+    entirely; rewrites strings via :func:`_scrub_string`; recurses into
+    nested dicts and lists.
+    """
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {k: _walk(v) for k, v in node.items() if k not in _DROP_KEYS}
+        if isinstance(node, list):
+            return [_walk(v) for v in node]
+        if isinstance(node, str):
+            return _scrub_string(node)
+        return node
+
+    return _walk(payload)
 
 
 __all__ = ["TriageResult"]
