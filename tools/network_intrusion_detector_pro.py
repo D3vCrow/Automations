@@ -1165,6 +1165,26 @@ class NetworkMonitor:
         )
         return conns_out
 
+    def recent_for_ip(self, ip: str, limit: int = 5) -> list:
+        """Return the last ``limit`` outbound connections to ``ip``.
+
+        Ordered newest-first. Used by AI triage to give the model
+        recent context for the same remote endpoint.
+        """
+        if not ip:
+            return []
+        with self._alert_lock:
+            # Reuse whatever connection history the monitor already keeps.
+            # If a `self._conn_history` deque exists, draw from there;
+            # otherwise fall back to the active alerts table filtered by IP.
+            history = list(getattr(self, "_conn_history", []))
+        return [
+            {"ts": h.get("ts", ""), "port": h.get("port", 0),
+             "process_name": h.get("process_name", "")}
+            for h in reversed(history)
+            if h.get("ip") == ip
+        ][:limit]
+
     # ── Background reputation checks (hybrid auto-check) ─────────────────────
 
     def check_reputations_background(self, conns: List[Dict]):
@@ -1765,6 +1785,21 @@ class ConnectionDetailPopup:
             fg_color="#bf3a3a", hover_color="#942b2b", width=110,
         ).pack(side="left", padx=4)
 
+        # AI triage button — gated on availability.
+        from tools._common import ai_triage as _ai
+
+        ok, reason = _ai.is_available()
+        triage_btn = ctk.CTkButton(
+            btn_frame,
+            text="🤖 Triage" if ok else f"🤖 Triage ({reason})",
+            state=("normal" if ok else "disabled"),
+            command=self._on_triage,
+            width=130,
+        )
+        triage_btn.pack(side="left", padx=4)
+        self._triage_btn = triage_btn
+        self._triage_panel: "ctk.CTkFrame | None" = None
+
         ctk.CTkButton(
             scroll, text="Close",
             command=self.win.destroy, width=80,
@@ -1824,6 +1859,91 @@ class ConnectionDetailPopup:
                 self.win.destroy()
             except psutil.Error as e:
                 messagebox.showerror("Kill Process", str(e), parent=self.win)
+
+    def _on_triage(self) -> None:
+        """Build payload, call AI triage, render result in a side panel."""
+        from tools._common import ai_triage as _ai
+
+        payload = {
+            "alert": {
+                "severity": self.conn.get("severity", "INFO"),
+                "category": self.conn.get("category", "outbound"),
+                "title": self.conn.get("title") or "Connection detail",
+                "details": dict(self.conn.get("details", {})),
+            },
+            "context": {
+                "classification": self.conn.get("trust", "UNKNOWN"),
+                "ip": self.conn.get("remote_ip", ""),
+                "port": int(self.conn.get("remote_port", 0) or 0),
+                "country": self.conn.get("country", ""),
+                "org": self.conn.get("org", ""),
+                "process_name": self.conn.get("process", ""),
+                "geo": dict(self.conn.get("geo", {})),
+                "reputation": dict(self.conn.get("reputation", {})),
+                "recent_same_ip": list(self.mon.recent_for_ip(
+                    self.conn.get("remote_ip", ""), limit=5
+                )),
+            },
+        }
+
+        try:
+            result = _ai.triage_alert(payload)
+        except _ai.BudgetExhausted:
+            self._show_triage_error("AI budget exhausted — resets midnight.")
+            return
+        except Exception as exc:  # noqa: BLE001 — final defensive boundary
+            self._show_triage_error(f"AI triage failed: {type(exc).__name__}")
+            return
+
+        self._render_triage_panel(result)
+
+    def _show_triage_error(self, message: str) -> None:
+        """Show a small error label in place of the side panel."""
+        self._render_triage_panel(None, error=message)
+
+    def _render_triage_panel(
+        self, result, error: "str | None" = None
+    ) -> None:
+        """Render or refresh the triage side panel inside the scrollable frame."""
+        if self._triage_panel is not None:
+            self._triage_panel.destroy()
+        panel = ctk.CTkFrame(self.win)
+        panel.pack(fill="x", padx=12, pady=(0, 8))
+        self._triage_panel = panel
+
+        if error:
+            ctk.CTkLabel(panel, text=error, text_color="#c44").pack(anchor="w", padx=8, pady=4)
+            return
+
+        assert result is not None
+        from tools._common import ai_triage as _ai
+
+        cached = " (cached)" if result.cached else ""
+        ctk.CTkLabel(
+            panel,
+            text=f"AI: {result.severity_human.upper()}{cached}",
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(anchor="w", padx=8, pady=(8, 0))
+        ctk.CTkLabel(panel, text=result.why_it_matters, wraplength=500, anchor="w").pack(
+            anchor="w", padx=8, pady=(4, 8)
+        )
+        ctk.CTkLabel(
+            panel,
+            text=f"Suggested: {result.suggested_action} — {result.suggested_action_reason}",
+            wraplength=500,
+            anchor="w",
+        ).pack(anchor="w", padx=8)
+        ctk.CTkLabel(
+            panel,
+            text=f"FP likelihood: {result.false_positive_likelihood:.0%}",
+            anchor="w",
+        ).pack(anchor="w", padx=8, pady=(8, 0))
+        if result.evidence:
+            ctk.CTkLabel(panel, text="Evidence:", font=ctk.CTkFont(size=9, weight="bold"), anchor="w").pack(
+                anchor="w", padx=8, pady=(8, 0)
+            )
+            for ev in result.evidence:
+                ctk.CTkLabel(panel, text=f"• {ev}", wraplength=500, anchor="w").pack(anchor="w", padx=16)
 
     def _show_rep_results(self, rep: Dict):
         """Display reputation results in the popup."""
