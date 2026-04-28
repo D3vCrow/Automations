@@ -336,15 +336,27 @@ def _sdk_query(*, prompt: str, model: str, system: str) -> str:
 
     Returns the concatenated assistant-text content. Real SDK call. Tests
     monkeypatch this function and never go to the network.
-    """
-    from claude_agent_sdk import query  # type: ignore[import-not-found]
 
-    parts: list[str] = []
-    for block in query(prompt=prompt, options={"model": model, "system_prompt": system}):
-        text = getattr(block, "text", None)
-        if text:
-            parts.append(text)
-    return "".join(parts)
+    ``claude_agent_sdk.query`` is an async generator, so we drive it with
+    ``asyncio.run``.  Each yielded ``Message`` may be an ``AssistantMessage``
+    whose ``.content`` is a list of ``ContentBlock``; we extract only the
+    ``TextBlock`` items (which carry a ``.text`` attribute).
+    """
+    import asyncio
+    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, query  # type: ignore[import-not-found]
+
+    async def _collect() -> str:
+        opts = ClaudeAgentOptions(model=model, system_prompt=system)
+        parts: list[str] = []
+        async for message in query(prompt=prompt, options=opts):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    text = getattr(block, "text", None)
+                    if text:
+                        parts.append(text)
+        return "".join(parts)
+
+    return asyncio.run(_collect())
 
 
 def _call_claude(*, sanitized_payload: dict[str, Any], model: str) -> str:
