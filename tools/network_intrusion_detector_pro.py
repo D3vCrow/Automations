@@ -1165,25 +1165,15 @@ class NetworkMonitor:
         )
         return conns_out
 
-    def recent_for_ip(self, ip: str, limit: int = 5) -> list:
+    def recent_for_ip(self, ip: str, limit: int = 5) -> list[dict]:
         """Return the last ``limit`` outbound connections to ``ip``.
 
-        Ordered newest-first. Used by AI triage to give the model
-        recent context for the same remote endpoint.
+        Pilot stub: NetworkMonitor does not yet keep per-IP history
+        (App holds a ``_conn_history`` dict but with a different key
+        schema). AI triage works on the current alert alone for now;
+        wire history through here when it earns its keep.
         """
-        if not ip:
-            return []
-        with self._alert_lock:
-            # Reuse whatever connection history the monitor already keeps.
-            # If a `self._conn_history` deque exists, draw from there;
-            # otherwise fall back to the active alerts table filtered by IP.
-            history = list(getattr(self, "_conn_history", []))
-        return [
-            {"ts": h.get("ts", ""), "port": h.get("port", 0),
-             "process_name": h.get("process_name", "")}
-            for h in reversed(history)
-            if h.get("ip") == ip
-        ][:limit]
+        return []
 
     # ── Background reputation checks (hybrid auto-check) ─────────────────────
 
@@ -1659,6 +1649,7 @@ class ConnectionDetailPopup:
         # Scrollable container for all content
         scroll = ctk.CTkScrollableFrame(self.win, corner_radius=0)
         scroll.pack(fill="both", expand=True, padx=0, pady=0)
+        self._scroll = scroll  # exposed so _render_triage_panel can parent into it
 
         header = ctk.CTkFrame(scroll, fg_color=("#1e1e2e", "#1e1e2e"), corner_radius=8)
         header.pack(fill="x", padx=12, pady=(12, 4))
@@ -1902,12 +1893,12 @@ class ConnectionDetailPopup:
         self._render_triage_panel(None, error=message)
 
     def _render_triage_panel(
-        self, result, error: "str | None" = None
+        self, result: "_ai.TriageResult | None", error: "str | None" = None
     ) -> None:
         """Render or refresh the triage side panel inside the scrollable frame."""
         if self._triage_panel is not None:
             self._triage_panel.destroy()
-        panel = ctk.CTkFrame(self.win)
+        panel = ctk.CTkFrame(self._scroll)
         panel.pack(fill="x", padx=12, pady=(0, 8))
         self._triage_panel = panel
 
@@ -1915,8 +1906,8 @@ class ConnectionDetailPopup:
             ctk.CTkLabel(panel, text=error, text_color="#c44").pack(anchor="w", padx=8, pady=4)
             return
 
-        assert result is not None
-        from tools._common import ai_triage as _ai
+        if result is None:
+            raise ValueError("_render_triage_panel called with result=None and no error")
 
         cached = " (cached)" if result.cached else ""
         ctk.CTkLabel(
