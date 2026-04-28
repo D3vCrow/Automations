@@ -31,8 +31,17 @@ from tools._common.paths import (
 from tools._common.subprocess import CREATE_NO_WINDOW, popen_hidden, run_hidden
 from tools._common.ui_theme import apply_dark_treeview_style
 
+from tools._common.ai_triage import (  # noqa: F401
+    BudgetExhausted,
+    TriageResult,
+    is_available,
+    remaining_budget_tokens,
+    triage_alert,
+)
+
 __all__ = [
     "AUDITS_DIR",
+    "BudgetExhausted",
     "COMMON_DIR",
     "CREATE_NO_WINDOW",
     "PLANS_DIR",
@@ -40,12 +49,16 @@ __all__ = [
     "REPO_ROOT",
     "TESTS_DIR",
     "TOOLS_DIR",
+    "TriageResult",
     "apply_dark_treeview_style",
     "get_bool",
     "get_config",
     "get_path",
+    "is_available",
     "narrow_excepts",
     "popen_hidden",
+    "remaining_budget_tokens",
     "run_hidden",
     "suppress_and_log",
+    "triage_alert",
 ]

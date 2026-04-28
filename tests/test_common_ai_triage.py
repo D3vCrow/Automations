@@ -293,3 +293,105 @@ class TestCallClaude:
         assert seen["model"] == "claude-haiku-4-5-20251001"
         assert "alert" in seen["prompt"]
         assert "AI triage" in seen["system"]
+
+
+class TestTriageAlert:
+    @pytest.fixture
+    def patched_paths(self, tmp_path, monkeypatch):
+        from tools._common import ai_triage as mod
+
+        monkeypatch.setattr(mod, "_cache_db_path", lambda: tmp_path / "c.db")
+        monkeypatch.setattr(mod, "_budget_state_path", lambda: tmp_path / "b.json")
+        monkeypatch.setenv("AUTOMATIONS_AI_ENABLED", "1")
+        monkeypatch.setenv("AUTOMATIONS_AI_DAILY_TOKENS", "10000")
+        monkeypatch.setattr(mod, "_sdk_importable", lambda: True)
+        monkeypatch.setattr(
+            mod, "_detect_auth_mode", lambda: ("subscription", "claude-cli")
+        )
+        return mod
+
+    def test_triage_alert_calls_sdk_and_caches(
+        self, patched_paths, monkeypatch
+    ) -> None:
+        mod = patched_paths
+        monkeypatch.setattr(
+            mod,
+            "_sdk_query",
+            lambda **kw: '{"severity_human": "high", "suggested_action": "block"}',
+        )
+
+        payload = {
+            "alert": {"severity": "WARN", "category": "outbound", "title": "X",
+                      "details": {}},
+            "context": {"ip": "1.2.3.4", "port": 443, "process_name": "x.exe"},
+        }
+        result = mod.triage_alert(payload)
+        assert result.severity_human == "high"
+        assert result.cached is False
+
+        # Second call → cache hit, no SDK call.
+        def boom(**kw):
+            raise AssertionError("SDK should not be called on cache hit")
+
+        monkeypatch.setattr(mod, "_sdk_query", boom)
+        result2 = mod.triage_alert(payload)
+        assert result2.cached is True
+        assert result2.severity_human == "high"
+
+    def test_triage_alert_blocks_when_budget_exhausted(
+        self, patched_paths, monkeypatch
+    ) -> None:
+        mod = patched_paths
+        monkeypatch.setenv("AUTOMATIONS_AI_DAILY_TOKENS", "100")  # tiny cap
+
+        called = {"n": 0}
+
+        def fake_sdk(**kw):
+            called["n"] += 1
+            return '{"severity_human": "low"}'
+
+        monkeypatch.setattr(mod, "_sdk_query", fake_sdk)
+
+        payload_a = {
+            "alert": {"category": "outbound", "title": "A", "details": {}},
+            "context": {"ip": "1.1.1.1", "port": 80, "process_name": "a.exe"},
+        }
+        # First call consumes the cap (estimate=1200 > 100 → blocked immediately).
+        with pytest.raises(mod.BudgetExhausted):
+            mod.triage_alert(payload_a)
+        assert called["n"] == 0
+
+    def test_triage_alert_falls_through_when_cache_construction_fails(
+        self, patched_paths, monkeypatch
+    ) -> None:
+        """If _Cache(...) raises sqlite3.OperationalError, triage degrades to SDK."""
+        import sqlite3
+
+        mod = patched_paths
+
+        def boom_cache(*a, **kw):
+            raise sqlite3.OperationalError("simulated corrupt DB")
+
+        monkeypatch.setattr(mod, "_Cache", boom_cache)
+        monkeypatch.setattr(
+            mod, "_sdk_query",
+            lambda **kw: '{"severity_human": "low"}',
+        )
+
+        payload = {
+            "alert": {"severity": "INFO", "category": "outbound", "title": "X",
+                      "details": {}},
+            "context": {"ip": "9.9.9.9", "port": 53, "process_name": "x.exe"},
+        }
+        result = mod.triage_alert(payload)
+        assert result.severity_human == "low"
+        assert result.cached is False
+
+
+class TestRemainingBudget:
+    def test_remaining_budget_returns_int(self, tmp_path, monkeypatch) -> None:
+        from tools._common import ai_triage as mod
+
+        monkeypatch.setattr(mod, "_budget_state_path", lambda: tmp_path / "b.json")
+        monkeypatch.setenv("AUTOMATIONS_AI_DAILY_TOKENS", "5000")
+        assert mod.remaining_budget_tokens() == 5000

@@ -118,9 +118,6 @@ def _sanitize(payload: dict[str, Any]) -> dict[str, Any]:
     return _walk(payload)
 
 
-__all__ = ["TriageResult"]
-
-
 class _Cache:
     """SQLite-backed 24h cache for :class:`TriageResult` rows.
 
@@ -382,3 +379,115 @@ def _parse_response(raw: str, *, model: str) -> TriageResult:
         cached=False,
         triaged_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 8: triage_alert() orchestrator + helpers + public API
+# ---------------------------------------------------------------------------
+
+import hashlib
+import warnings
+
+from tools._common.paths import REPO_ROOT
+
+
+class BudgetExhausted(RuntimeError):
+    """Raised by :func:`triage_alert` when the daily token cap blocks the call."""
+
+
+_DEFAULT_DAILY_CAP = 50_000
+_DEFAULT_FAST_MODEL = "claude-haiku-4-5-20251001"
+_DEFAULT_DEEP_MODEL = "claude-opus-4-7"
+_TOKEN_ESTIMATE_PER_CALL = 1_200  # ~800 in + 400 out
+
+
+def _cache_db_path() -> Path:
+    return REPO_ROOT / "tools" / "_common" / "ai_triage_cache.db"
+
+
+def _budget_state_path() -> Path:
+    return REPO_ROOT / "tools" / "_common" / "ai_triage_budget.json"
+
+
+def _daily_cap() -> int:
+    raw = get_config("AUTOMATIONS_AI_DAILY_TOKENS")
+    if not raw:
+        return _DEFAULT_DAILY_CAP
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_DAILY_CAP
+
+
+def _cache_key(payload: dict[str, Any]) -> str:
+    """Stable key over (ip, port, process_name, category, title)."""
+    ctx = payload.get("context", {}) or {}
+    alert = payload.get("alert", {}) or {}
+    parts = [
+        str(ctx.get("ip", "")),
+        str(ctx.get("port", "")),
+        str(ctx.get("process_name", "")),
+        str(alert.get("category", "")),
+        str(alert.get("title", "")),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def remaining_budget_tokens() -> int:
+    """Return tokens remaining in today's budget. Used by UI tooltips."""
+    return _Budget(_budget_state_path(), daily_cap=_daily_cap()).remaining()
+
+
+def triage_alert(payload: dict[str, Any], *, deep: bool = False) -> TriageResult:
+    """Run the AI triage pipeline on ``payload``.
+
+    Args:
+        payload: ``{"alert": {...}, "context": {...}}`` produced by the
+            calling tool. Sanitized before send.
+        deep: ``True`` routes to the deep model (Opus). Default fast (Haiku).
+
+    Returns:
+        :class:`TriageResult` from cache or the model.
+
+    Raises:
+        BudgetExhausted: When the daily cap blocks the call.
+        json.JSONDecodeError: When the model returns no parseable JSON
+            (caller should display an error toast).
+    """
+    key = _cache_key(payload)
+    cache: _Cache | None = None
+    try:
+        cache = _Cache(_cache_db_path())
+        cached = cache.get(key)
+    except sqlite3.OperationalError:
+        cached = None
+    if cached is not None:
+        return cached
+
+    budget = _Budget(_budget_state_path(), daily_cap=_daily_cap())
+    if not budget.try_consume(_TOKEN_ESTIMATE_PER_CALL):
+        raise BudgetExhausted("daily AI token cap reached")
+
+    sanitized = _sanitize(payload)
+    model = (
+        get_config("AUTOMATIONS_AI_MODEL_DEEP", _DEFAULT_DEEP_MODEL)
+        if deep
+        else get_config("AUTOMATIONS_AI_MODEL_FAST", _DEFAULT_FAST_MODEL)
+    )
+    raw = _call_claude(sanitized_payload=sanitized, model=model or _DEFAULT_FAST_MODEL)
+    result = _parse_response(raw, model=model or _DEFAULT_FAST_MODEL)
+    if cache is not None:
+        try:
+            cache.put(key, result, ttl_hours=24.0)
+        except sqlite3.OperationalError as exc:
+            warnings.warn(f"ai_triage cache write failed: {exc}")
+    return result
+
+
+__all__ = [
+    "BudgetExhausted",
+    "TriageResult",
+    "is_available",
+    "remaining_budget_tokens",
+    "triage_alert",
+]
