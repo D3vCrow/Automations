@@ -22,6 +22,7 @@ an AI affordance.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import importlib
 import json
@@ -341,8 +342,12 @@ def _sdk_query(*, prompt: str, model: str, system: str) -> str:
     ``asyncio.run``.  Each yielded ``Message`` may be an ``AssistantMessage``
     whose ``.content`` is a list of ``ContentBlock``; we extract only the
     ``TextBlock`` items (which carry a ``.text`` attribute).
+
+    Constraint: must NOT be called from inside a running event loop —
+    ``asyncio.run`` would raise ``RuntimeError``. Today all callers run on
+    worker threads (NID dispatches triage via ``threading.Thread``), so
+    this is safe. Revisit if an async caller is added.
     """
-    import asyncio
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, query  # type: ignore[import-not-found]
 
     async def _collect() -> str:
