@@ -3152,7 +3152,7 @@ class App(ctk.CTkFrame):
 
     # ── Alert-tree right-click context menu ───────────────────────────────────
 
-    def _on_alert_tree_right_click(self, event) -> None:
+    def _on_alert_tree_right_click(self, event: tk.Event) -> None:
         """Show context menu on right-click over the alerts table."""
         iid = self.alert_tree.identify_row(event.y)
         if iid:
@@ -3233,7 +3233,7 @@ class App(ctk.CTkFrame):
             return filtered[idx]
         return None
 
-    def _show_triage_dialog(self, alert: dict, result: "object") -> None:
+    def _show_triage_dialog(self, alert: dict, result: "_ai.TriageResult") -> None:
         """Render the triage result in a small CTkToplevel dialog."""
         dlg = ctk.CTkToplevel(self.parent)
         dlg.title(f"AI Triage — {alert.get('title', '')}")
@@ -3241,6 +3241,7 @@ class App(ctk.CTkFrame):
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
         dlg.after(100, lambda: dlg.attributes("-topmost", False))
+        dlg.after(100, dlg.focus_set)
 
         cached_suffix = " (cached)" if result.cached else ""
         ctk.CTkLabel(
