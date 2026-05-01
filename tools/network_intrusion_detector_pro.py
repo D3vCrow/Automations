@@ -2454,6 +2454,7 @@ class App(ctk.CTkFrame):
             self.alert_tree.column(c, width=w, stretch=(c == "title"))
         self.alert_tree.pack(fill="both", expand=True, padx=8, pady=8)
         self.alert_tree.bind("<<TreeviewSelect>>", lambda _e: self.show_alert_details())
+        self.alert_tree.bind("<Button-3>", self._on_alert_tree_right_click)
 
         box = ctk.CTkFrame(f, corner_radius=10)
         box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -3148,6 +3149,122 @@ class App(ctk.CTkFrame):
         self.threat_tree.tag_configure("HIGH", foreground="#FF4444")
         self.threat_tree.tag_configure("WARN", foreground="#FFA500")
         self.threat_tree.tag_configure("INFO", foreground="#90EE90")
+
+    # ── Alert-tree right-click context menu ───────────────────────────────────
+
+    def _on_alert_tree_right_click(self, event) -> None:
+        """Show context menu on right-click over the alerts table."""
+        iid = self.alert_tree.identify_row(event.y)
+        if iid:
+            self.alert_tree.selection_set(iid)
+
+        from tools._common import ai_triage as _ai
+        ok, _ = _ai.is_available()
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="🤖 Triage this alert",
+            command=self._on_triage_selected_alert,
+            state=("normal" if ok else "disabled"),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_triage_selected_alert(self) -> None:
+        """Triage the alert under the right-click cursor."""
+        from tools._common import ai_triage as _ai
+
+        selection = self.alert_tree.selection()
+        if not selection:
+            return
+        alert = self._alert_for_tree_item(selection[0])
+        if alert is None:
+            return
+
+        details = alert.get("details", {})
+        payload = {
+            "alert": {
+                "severity": alert.get("severity", "INFO"),
+                "category": alert.get("category", ""),
+                "title": alert.get("title", ""),
+                "details": dict(details),
+            },
+            "context": {
+                "ip": (
+                    details.get("ip", "")
+                    or details.get("remote_ip", "")
+                    or details.get("gateway_ip", "")
+                    or details.get("raddr", "")
+                ),
+                "port": int(details.get("port", details.get("remote_port", 0)) or 0),
+                "country": details.get("country", ""),
+                "process_name": details.get("process", details.get("process_name", "")),
+            },
+        }
+
+        try:
+            result = _ai.triage_alert(payload)
+        except _ai.BudgetExhausted:
+            messagebox.showwarning("AI Triage", "Daily token budget exhausted.")
+            return
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("AI Triage", f"Failed: {type(exc).__name__}")
+            return
+
+        self._show_triage_dialog(alert, result)
+
+    def _alert_for_tree_item(self, item_id: str) -> "dict | None":
+        """Look up the alert dict whose tree-row id is ``item_id``.
+
+        Mirrors the index logic in ``show_alert_details``: the tree is
+        populated from a filtered slice of ``self.mon.alerts`` (reversed,
+        last 800), so we recover the alert by extracting the filtered index
+        from the iid (format ``"a-<idx>"``).
+        """
+        try:
+            idx = int(item_id.split("-")[1])
+        except (ValueError, IndexError):
+            return None
+        recent = list(reversed(self.mon.alerts[-800:]))
+        filtered = [a for a in recent if self.alert_passes_filter(a)]
+        if 0 <= idx < len(filtered):
+            return filtered[idx]
+        return None
+
+    def _show_triage_dialog(self, alert: dict, result: "object") -> None:
+        """Render the triage result in a small CTkToplevel dialog."""
+        dlg = ctk.CTkToplevel(self.parent)
+        dlg.title(f"AI Triage — {alert.get('title', '')}")
+        dlg.geometry("480x280")
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.after(100, lambda: dlg.attributes("-topmost", False))
+
+        cached_suffix = " (cached)" if result.cached else ""
+        ctk.CTkLabel(
+            dlg,
+            text=f"{result.severity_human.upper()}{cached_suffix}",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=14, pady=(14, 4))
+        ctk.CTkLabel(
+            dlg, text=result.why_it_matters, wraplength=440, anchor="w"
+        ).pack(anchor="w", padx=14, pady=4)
+        ctk.CTkLabel(
+            dlg,
+            text=f"Action: {result.suggested_action} — {result.suggested_action_reason}",
+            wraplength=440,
+            anchor="w",
+        ).pack(anchor="w", padx=14, pady=4)
+        ctk.CTkLabel(
+            dlg,
+            text=f"FP likelihood: {result.false_positive_likelihood:.0%}",
+            anchor="w",
+        ).pack(anchor="w", padx=14, pady=(4, 0))
+        ctk.CTkButton(dlg, text="Close", command=dlg.destroy, width=80).pack(
+            pady=(12, 14)
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
