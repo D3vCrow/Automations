@@ -207,8 +207,9 @@ def is_available() -> tuple[bool, str]:
     """Return ``(enabled, reason)`` for UI gating.
 
     ``reason`` values: ``"disabled"``, ``"sdk_missing"``, ``"no_auth"``,
-    ``"budget_exhausted"``, ``"subscription"``, ``"api_key"``. Callers
-    use the reason as a tooltip key.
+    ``"subscription"``, ``"api_key"``. Callers use the reason as a
+    tooltip key. Budget exhaustion is surfaced at call time via
+    :class:`BudgetExhausted` from :func:`triage_alert`, not here.
     """
     if not get_bool("AUTOMATIONS_AI_ENABLED", default=False):
         return (False, "disabled")
@@ -344,9 +345,13 @@ def _sdk_query(*, prompt: str, model: str, system: str) -> str:
     ``TextBlock`` items (which carry a ``.text`` attribute).
 
     Constraint: must NOT be called from inside a running event loop —
-    ``asyncio.run`` would raise ``RuntimeError``. Today all callers run on
-    worker threads (NID dispatches triage via ``threading.Thread``), so
-    this is safe. Revisit if an async caller is added.
+    ``asyncio.run`` would raise ``RuntimeError``. Today's callers
+    (NID's ``_on_triage`` button cmd, ``_on_triage_selected_alert``
+    menu cmd) run synchronously on the Tkinter UI thread, which does
+    not own an asyncio loop, so ``asyncio.run`` works. Caveat: cache
+    misses block the UI for the full SDK round-trip (~2-5s on Haiku).
+    Future work should wrap NID call sites in ``threading.Thread`` to
+    keep the UI responsive. Async callers must dispatch off-loop.
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, query  # type: ignore[import-not-found]
 
