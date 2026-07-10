@@ -30,6 +30,12 @@ from typing import Dict, List, Optional, Tuple, Any
 from tools._common.config import get_bool, get_config
 from tools._common.threadsafe import BoundedDeque
 from tools._common.atomic_io import atomic_write_json, read_json, sweep_stale_tmp
+from tools._common.verdict import (
+    Verdict,
+    VerdictState,
+    arbitrate,
+    enforce_confidence_floor,
+)
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -403,6 +409,8 @@ class Sample:
 
     status: str     # OK | DEGRADED | DOWN
     reason: str     # summary
+    severity: str = ""   # HIGH | WARN | INFO (from classify)
+    category: str = ""   # LINK|GATEWAY|ISP|DNS|DEGRADED (from classify)
 
     # Wi-Fi details
     wifi_bssid: str = ""
@@ -440,6 +448,223 @@ class Incident:
     cause: str                # reason
     details: Dict
     cause_timeline: List[Dict] = None  # New field for tracking cause changes
+
+# =========================
+# Plain-language verdict adapter
+# =========================
+# Maps the NSM classifier (status + category) plus the intelligence engine's
+# suspicion signals onto the shared five-state Verdict vocabulary in
+# tools._common.verdict. See plans/2026-07-10-network-tools-audit.md §6 and §8.
+#
+# The classifier answers "what broke" (LINK/GATEWAY/ISP/DNS/DEGRADED); the
+# intelligence engine answers "does this look like an attack." arbitrate() lets
+# the dangerous reading win when both fire, and enforce_confidence_floor() keeps
+# the reassuring BLUE "not your fault" from standing on weak evidence.
+#
+# Wording mirrors the tone of _get_friendly_explanation (the incident-details
+# explainer), condensed to one banner line per slot.
+
+# Normalized possible_malicious_activity probability at/above which we call it a
+# possible attack (RED) versus merely worth-a-look (AMBER). RED is mainly driven
+# by a HIGH suspicion_level; this threshold is a secondary trigger. Tuned high —
+# RED must be earned (plan §8.3).
+_MALICIOUS_RED = 0.5
+_MALICIOUS_AMBER = 0.25
+
+# BLUE confidence used when the intelligence engine has no probability to offer.
+# Deliberately below DEFAULT_CONFIDENCE_FLOOR so a bare "ISP outage" reading with
+# no corroboration degrades to AMBER rather than reassuring the user outright.
+_ISP_CONFIDENCE_NO_INTEL = 0.5
+
+
+def _nsm_base_verdict(status: str, category: str, *, isp_confidence: float) -> Verdict:
+    """Map the plain classifier reading (status + category) to a base Verdict.
+
+    Covers only the connectivity/performance story; the attack signal is layered
+    on separately by :func:`_nsm_security_verdict`.
+
+    Args:
+        status: Classifier status — ``OK`` / ``DOWN`` / ``DEGRADED``.
+        category: Classifier category — ``LINK`` / ``GATEWAY`` / ``ISP`` /
+            ``DNS`` / ``DEGRADED``.
+        isp_confidence: 0..1 certainty that a DOWN+ISP reading really is the
+            provider; gates the BLUE "not your fault" verdict.
+
+    Returns:
+        The base :class:`Verdict` before security arbitration and the confidence
+        floor are applied.
+    """
+    status = (status or "").upper()
+    category = (category or "").upper()
+
+    if status == "OK":
+        return Verdict(
+            state=VerdictState.GREEN,
+            headline="Your network looks healthy — nothing needs you.",
+            evidence="All connectivity checks are passing.",
+        )
+
+    if status == "DOWN":
+        if category == "ISP":
+            return Verdict(
+                state=VerdictState.BLUE,
+                headline="Looks like an internet-provider outage — not your fault.",
+                evidence="Your router answers, but the internet beyond it does not.",
+                action="Nothing to fix on your side — check for a provider outage or wait it out.",
+                confidence=isp_confidence,
+            )
+        if category == "LINK":
+            return Verdict(
+                state=VerdictState.AMBER,
+                headline="Your PC lost its connection to the router or Wi-Fi.",
+                evidence="No working link to the local network.",
+                action="Check Wi-Fi on your phone, then restart the router (unplug 30s).",
+            )
+        if category == "GATEWAY":
+            return Verdict(
+                state=VerdictState.AMBER,
+                headline="Your router isn't responding.",
+                evidence="The router (gateway) is unreachable and so is the internet.",
+                action="Restart the router (unplug 30s) and check that its lights are normal.",
+            )
+        # Unknown DOWN category — still a real outage, stay benign-first.
+        return Verdict(
+            state=VerdictState.AMBER,
+            headline="Your connection is down.",
+            evidence="Connectivity checks are failing.",
+            action="Restart the router (unplug 30s).",
+        )
+
+    if status == "DEGRADED":
+        if category == "DNS":
+            return Verdict(
+                state=VerdictState.AMBER,
+                headline="Website-name lookups are failing or slow.",
+                evidence="The internet is reachable but DNS isn't resolving cleanly.",
+                action="Usually self-heals; if it lingers, restart the router.",
+            )
+        return Verdict(
+            state=VerdictState.AMBER,
+            headline="Internet works, but it's slow or flaky right now.",
+            evidence="Elevated latency or packet loss on the internet path.",
+            action="Restart the router, or check for a heavy download or stream.",
+        )
+
+    # Unknown/blank status — we can't say yet.
+    return Verdict(
+        state=VerdictState.GRAY,
+        headline="Checking your network…",
+    )
+
+
+def _nsm_security_verdict(suspicion_level: str, malicious_prob: float) -> Optional[Verdict]:
+    """Build a security-signal Verdict, or ``None`` when nothing looks off.
+
+    A HIGH suspicion level (or a strong malicious-activity probability) is RED —
+    a possible attack. A weaker but present signal is AMBER ("worth a look").
+    The RED wording mirrors the ``security`` branch of _get_friendly_explanation.
+
+    Args:
+        suspicion_level: ``NONE`` / ``LOW`` / ``MEDIUM`` / ``HIGH`` from the
+            intelligence engine's :meth:`SuspiciousIndicators.suspicion_level`.
+        malicious_prob: 0..1 normalized ``possible_malicious_activity`` from the
+            root-cause probabilities.
+
+    Returns:
+        A RED or AMBER :class:`Verdict`, or ``None`` when the signal is quiet.
+    """
+    level = (suspicion_level or "NONE").upper()
+    detail = f"Suspicion level {level}; malicious-activity probability {malicious_prob:.0%}."
+
+    if level == "HIGH" or malicious_prob >= _MALICIOUS_RED:
+        return Verdict(
+            state=VerdictState.RED,
+            headline="Something looks like it's impersonating your router — possible attack.",
+            evidence="Your gateway or DNS changed in a way a normal network doesn't.",
+            action="Disconnect Wi-Fi, switch to mobile data, and verify before trusting this network.",
+            detail=detail,
+            confidence=1.0,
+        )
+    if level == "MEDIUM" or malicious_prob >= _MALICIOUS_AMBER:
+        return Verdict(
+            state=VerdictState.AMBER,
+            headline="Your network settings shifted unexpectedly — worth a look.",
+            evidence="A gateway, DNS, or subnet change was detected recently.",
+            action="Confirm the change was you (a reboot or new router), not someone else.",
+            detail=detail,
+        )
+    return None
+
+
+def build_nsm_verdict(status: str, category: str, *, severity: str = "",
+                      suspicion_level: str = "NONE",
+                      isp_confidence: Optional[float] = None,
+                      malicious_prob: float = 0.0,
+                      capability_note: str = "") -> Verdict:
+    """Combine the connectivity reading and the security signal into one Verdict.
+
+    The base connectivity verdict is confidence-floored (a weak BLUE degrades to
+    AMBER), then arbitrated against any security signal so a possible attack
+    (RED) outranks a reassuring outage (BLUE) — the load-bearing safety rule.
+
+    Args:
+        status: Classifier status (``OK`` / ``DOWN`` / ``DEGRADED``).
+        category: Classifier category (``LINK`` / ``GATEWAY`` / ``ISP`` /
+            ``DNS`` / ``DEGRADED``).
+        severity: Classifier severity; accepted for parity, not currently used
+            in the mapping.
+        suspicion_level: Intelligence-engine suspicion level.
+        isp_confidence: 0..1 certainty a DOWN+ISP reading is the provider.
+            ``None`` means "no intelligence" and falls back to a below-floor
+            value so BLUE degrades to AMBER.
+        malicious_prob: 0..1 normalized malicious-activity probability.
+        capability_note: What the tool currently can't check; surfaced on the
+            winning verdict so GREEN never silently means "blind".
+
+    Returns:
+        The single arbitrated :class:`Verdict` for the banner.
+    """
+    if isp_confidence is None:
+        isp_confidence = _ISP_CONFIDENCE_NO_INTEL
+    base = enforce_confidence_floor(
+        _nsm_base_verdict(status, category, isp_confidence=isp_confidence)
+    )
+    candidates = [base]
+    security = _nsm_security_verdict(suspicion_level, malicious_prob)
+    if security is not None:
+        candidates.insert(0, security)  # list security first so a tie favors it
+    verdict = arbitrate(candidates)
+    if capability_note:
+        verdict.capability_note = capability_note
+    return verdict
+
+
+def verdict_from_sample(sample: "Sample", *, capability_note: str = "") -> Verdict:
+    """Derive a banner :class:`Verdict` from a live :class:`Sample`.
+
+    Pulls the confidence and attack signals from the sample's intelligence
+    enrichment when present; degrades gracefully when it's absent.
+
+    Args:
+        sample: The most recent :class:`Sample`.
+        capability_note: Optional coverage caveat to surface on the verdict.
+
+    Returns:
+        The arbitrated :class:`Verdict`.
+    """
+    rc = sample.root_cause
+    isp_confidence = rc.isp_issue if rc is not None else None
+    malicious_prob = rc.possible_malicious_activity if rc is not None else 0.0
+    return build_nsm_verdict(
+        sample.status,
+        sample.category,
+        severity=sample.severity,
+        suspicion_level=sample.suspicion_level or "NONE",
+        isp_confidence=isp_confidence,
+        malicious_prob=malicious_prob,
+        capability_note=capability_note,
+    )
+
 
 # =========================
 
@@ -1312,6 +1537,9 @@ class App(AppBase):
         ctk.CTkButton(btn_frame, text="AI Export", command=self.ai_export, width=70, height=26).pack(side="left", padx=2)
         ctk.CTkButton(btn_frame, text="Export", command=self.export_report, width=60, height=26).pack(side="left", padx=2)
 
+        # --- Plain-language verdict banner (the single top-line answer) ---
+        self._build_verdict_banner()
+
         nb = ctk.CTkTabview(self)
         nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -1328,6 +1556,91 @@ class App(AppBase):
         self._build_wifi_analyzer()
 
         self.pack(fill="both", expand=True)
+
+    # ---------------------
+    # Plain-language verdict banner
+    # ---------------------
+
+    @staticmethod
+    def _verdict_text_color(hex_color: str) -> str:
+        """Pick black or white for legible text on *hex_color*.
+
+        Uses perceptual luminance so the state colour and its text always meet a
+        readable contrast (colour is never the only signal — icon + label carry
+        the meaning too).
+        """
+        h = hex_color.lstrip("#")
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except (ValueError, IndexError):
+            return "#ffffff"
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        return "#000000" if luminance > 135 else "#ffffff"
+
+    def _build_verdict_banner(self):
+        """Build the top verdict banner — one colour, one line, always visible."""
+        banner = ctk.CTkFrame(self, corner_radius=8)
+        banner.pack(fill="x", padx=6, pady=(0, 4))
+        self.verdict_banner = banner
+        self._verdict_detail_visible = False
+
+        head = ctk.CTkFrame(banner, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(8, 2))
+
+        self.verdict_state_label = ctk.CTkLabel(
+            head, text="…  Checking", font=("Segoe UI", 13, "bold"))
+        self.verdict_state_label.pack(side="left")
+
+        self.verdict_detail_btn = ctk.CTkButton(
+            head, text="Why?", width=54, height=24,
+            command=self._toggle_verdict_detail)
+        self.verdict_detail_btn.pack(side="right")
+
+        self.verdict_headline_label = ctk.CTkLabel(
+            head, text="Checking your network…", font=("Segoe UI", 13),
+            anchor="w", justify="left", wraplength=1000)
+        self.verdict_headline_label.pack(side="left", padx=(12, 8))
+
+        self.verdict_action_label = ctk.CTkLabel(
+            banner, text="", font=("Segoe UI", 11),
+            anchor="w", justify="left", wraplength=1180)
+        self.verdict_action_label.pack(fill="x", padx=12, pady=(0, 8))
+
+        # Detail row is packed only while toggled open.
+        self.verdict_detail_label = ctk.CTkLabel(
+            banner, text="", font=("Segoe UI", 10),
+            anchor="w", justify="left", wraplength=1180)
+
+    def _toggle_verdict_detail(self):
+        """Show or hide the "why we think this" detail row."""
+        if self._verdict_detail_visible:
+            self.verdict_detail_label.pack_forget()
+            self.verdict_detail_btn.configure(text="Why?")
+        else:
+            self.verdict_detail_label.pack(fill="x", padx=12, pady=(0, 8))
+            self.verdict_detail_btn.configure(text="Hide")
+        self._verdict_detail_visible = not self._verdict_detail_visible
+
+    def _update_verdict_banner(self, verdict: Verdict):
+        """Repaint the banner from *verdict* (state colour, icon, five slots)."""
+        color = verdict.color
+        text_color = self._verdict_text_color(color)
+        self.verdict_banner.configure(fg_color=color)
+
+        self.verdict_state_label.configure(
+            text=f"{verdict.icon}  {verdict.short_label}", text_color=text_color)
+        self.verdict_headline_label.configure(
+            text=verdict.headline, text_color=text_color)
+
+        action = verdict.action
+        if verdict.capability_note:
+            note = f"Note: {verdict.capability_note}"
+            action = f"{action}    {note}" if action else note
+        self.verdict_action_label.configure(text=action, text_color=text_color)
+
+        detail_bits = [b for b in (verdict.evidence, verdict.detail) if b]
+        self.verdict_detail_label.configure(
+            text="\n".join(detail_bits), text_color=text_color)
 
     def _build_overview(self):
         f = self.tab_overview
@@ -2414,6 +2727,8 @@ class App(AppBase):
             dns_raw_hint=short(dns_raw, 260),
             status=status,
             reason=reason,
+            severity=sev,
+            category=cat,
             wifi_bssid=wifi_bssid,
             wifi_channel=wifi_channel,
             wifi_radio=wifi_radio,
@@ -2467,6 +2782,9 @@ class App(AppBase):
 
         self.status_label.configure(text=f"Status: {s.status}")
         self.reason_label.configure(text=s.reason)
+
+        # Repaint the top plain-language verdict banner from this sample.
+        self._update_verdict_banner(verdict_from_sample(s))
 
         self.kv["wifi"].configure(text=s.wifi_state or "(unknown)")
         self.kv["signal"].configure(text=s.wifi_signal or "—")
