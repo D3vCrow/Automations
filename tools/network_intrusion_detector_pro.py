@@ -991,6 +991,35 @@ class NetworkMonitor:
                     self._alert_index[k] = i
                     self._alert_last_seen[k] = now
 
+    def snapshot_alerts(self) -> List[Dict]:
+        """Return a point-in-time copy of the alert list (thread-safe).
+
+        Readers must iterate this snapshot, never ``self.alerts`` directly: the
+        worker thread appends (and periodically rebinds) the list under
+        ``_alert_lock``, so a bare iteration races with it and raises
+        ``RuntimeError: list changed size during iteration`` on busy hosts.
+
+        Returns:
+            A shallow copy of the current alerts; the dicts inside are shared
+            with the live list, so treat them as read-only.
+        """
+        with self._alert_lock:
+            return list(self.alerts)
+
+    def clear_alerts(self) -> None:
+        """Clear the alert list and its dedup bookkeeping (thread-safe).
+
+        Must be used instead of clearing ``self.alerts`` from the UI thread:
+        the worker maintains the list and its index/last-seen/rate-limit maps
+        together under ``_alert_lock``, so a bare ``.clear()`` from another
+        thread races the worker's ``log()``.
+        """
+        with self._alert_lock:
+            self.alerts.clear()
+            self._alert_index.clear()
+            self._alert_last_seen.clear()
+            self._rate_limit.clear()
+
     # ── Trust management ──────────────────────────────────────────────────────
 
     def trust_mac(self, mac: str, label: str):
@@ -1534,7 +1563,7 @@ class NetworkMonitor:
         cutoff = time.time() - 3600
         high_count = 0
         warn_count = 0
-        for a in self.alerts:
+        for a in self.snapshot_alerts():
             try:
                 ts = time.mktime(time.strptime(a["timestamp"], "%Y-%m-%d %H:%M:%S"))
             except (ValueError, KeyError, TypeError):
@@ -1558,7 +1587,7 @@ class NetworkMonitor:
         """Return HIGH-severity alerts from the last hour."""
         cutoff = time.time() - 3600
         threats = []
-        for a in self.alerts:
+        for a in self.snapshot_alerts():
             try:
                 ts = time.mktime(time.strptime(a["timestamp"], "%Y-%m-%d %H:%M:%S"))
             except (ValueError, KeyError, TypeError):
@@ -2115,8 +2144,12 @@ class App(ctk.CTkFrame):
         self._last_conns: List[Dict] = []
         self._last_scan_ts: str = ""
 
-        # Connection history — accumulates all unknown/suspicious/dangerous IPs
+        # Connection history — accumulates all unknown/suspicious/dangerous IPs.
+        # Mutated in place by the scan worker (_update_history) while the UI
+        # thread iterates it (refresh_history / export); guard every access with
+        # this lock so readers never see a mid-mutation dict.
         self._history_path = self.state_path.replace("nid_state.json", "nid_conn_history.json")
+        self._history_lock = threading.Lock()
         self._conn_history: Dict[str, Dict] = {}   # keyed by remote_ip
         self._load_history()
 
@@ -2400,7 +2433,8 @@ class App(ctk.CTkFrame):
         iid = sel[0]
         ip = self.hist_tree.set(iid, "remote_ip")
         # Find matching entry in history and build a fake conn dict for the detail popup
-        entry = self._conn_history.get(ip)
+        with self._history_lock:
+            entry = self._conn_history.get(ip)
         if not entry:
             return
         conn_data = {
@@ -2586,7 +2620,7 @@ class App(ctk.CTkFrame):
                 "ip": self.mon.baseline_gateway_ip,
                 "mac": self.mon.baseline_gateway_mac,
             },
-            "alerts": self.mon.alerts,
+            "alerts": self.mon.snapshot_alerts(),
             "connections_snapshot": self._last_conns,
             "threat_level": self.mon.compute_threat_level(),
         }
@@ -2600,11 +2634,17 @@ class App(ctk.CTkFrame):
     # ── Connection History persistence ──────────────────────────────────────
 
     def _load_history(self):
-        self._conn_history = read_json(self._history_path, default={}) or {}
+        data = read_json(self._history_path, default={}) or {}
+        with self._history_lock:
+            self._conn_history = data
 
     def _save_history(self):
+        # Copy under the lock, then write outside it: slow disk I/O must never
+        # block the scan worker's in-memory history updates.
+        with self._history_lock:
+            data = dict(self._conn_history)
         try:
-            atomic_write_json(self._history_path, self._conn_history)
+            atomic_write_json(self._history_path, data)
         except (OSError, TypeError):
             pass
 
@@ -2612,50 +2652,53 @@ class App(ctk.CTkFrame):
         """Add unknown/suspicious/dangerous connections to persistent history."""
         dominated = {"unknown", "suspicious", "dangerous"}
         changed = False
-        for c in conns:
-            trust = c.get("trust", "unknown")
-            if trust not in dominated:
-                continue
-            ip = c.get("remote_ip", "")
-            if not ip:
-                continue
-            if ip in self._conn_history:
-                entry = self._conn_history[ip]
-                entry["last_seen"] = now_ts()
-                entry["times_seen"] = entry.get("times_seen", 1) + 1
-                # upgrade severity level if worse
-                order = {"unknown": 0, "suspicious": 1, "dangerous": 2}
-                if order.get(trust, 0) > order.get(entry.get("trust", "unknown"), 0):
-                    entry["trust"] = trust
-                # update other fields
-                entry["process"] = c.get("process", entry.get("process", "?"))
-                entry["service"] = c.get("service", entry.get("service", ""))
-                entry["country"] = c.get("country", entry.get("country", ""))
-                entry["org"] = c.get("org", entry.get("org", ""))
-                entry["rep"] = c.get("rep", entry.get("rep", ""))
-                entry["raddr"] = c.get("raddr", entry.get("raddr", ""))
-                entry["laddr"] = c.get("laddr", entry.get("laddr", ""))
-                entry["status"] = c.get("status", entry.get("status", ""))
-                changed = True
-            else:
-                self._conn_history[ip] = {
-                    "remote_ip": ip,
-                    "trust": trust,
-                    "process": c.get("process", "?"),
-                    "service": c.get("service", ""),
-                    "laddr": c.get("laddr", ""),
-                    "raddr": c.get("raddr", ""),
-                    "country": c.get("country", ""),
-                    "org": c.get("org", ""),
-                    "rep": c.get("rep", ""),
-                    "status": c.get("status", ""),
-                    "first_seen": now_ts(),
-                    "last_seen": now_ts(),
-                    "times_seen": 1,
-                    "remote_port": c.get("remote_port", 0),
-                    "exe": c.get("exe", ""),
-                }
-                changed = True
+        # Hold the lock for the whole in-memory pass (no I/O here) so a
+        # concurrent refresh_history never iterates a mid-mutation dict.
+        with self._history_lock:
+            for c in conns:
+                trust = c.get("trust", "unknown")
+                if trust not in dominated:
+                    continue
+                ip = c.get("remote_ip", "")
+                if not ip:
+                    continue
+                if ip in self._conn_history:
+                    entry = self._conn_history[ip]
+                    entry["last_seen"] = now_ts()
+                    entry["times_seen"] = entry.get("times_seen", 1) + 1
+                    # upgrade severity level if worse
+                    order = {"unknown": 0, "suspicious": 1, "dangerous": 2}
+                    if order.get(trust, 0) > order.get(entry.get("trust", "unknown"), 0):
+                        entry["trust"] = trust
+                    # update other fields
+                    entry["process"] = c.get("process", entry.get("process", "?"))
+                    entry["service"] = c.get("service", entry.get("service", ""))
+                    entry["country"] = c.get("country", entry.get("country", ""))
+                    entry["org"] = c.get("org", entry.get("org", ""))
+                    entry["rep"] = c.get("rep", entry.get("rep", ""))
+                    entry["raddr"] = c.get("raddr", entry.get("raddr", ""))
+                    entry["laddr"] = c.get("laddr", entry.get("laddr", ""))
+                    entry["status"] = c.get("status", entry.get("status", ""))
+                    changed = True
+                else:
+                    self._conn_history[ip] = {
+                        "remote_ip": ip,
+                        "trust": trust,
+                        "process": c.get("process", "?"),
+                        "service": c.get("service", ""),
+                        "laddr": c.get("laddr", ""),
+                        "raddr": c.get("raddr", ""),
+                        "country": c.get("country", ""),
+                        "org": c.get("org", ""),
+                        "rep": c.get("rep", ""),
+                        "status": c.get("status", ""),
+                        "first_seen": now_ts(),
+                        "last_seen": now_ts(),
+                        "times_seen": 1,
+                        "remote_port": c.get("remote_port", 0),
+                        "exe": c.get("exe", ""),
+                    }
+                    changed = True
         if changed:
             self._save_history()
 
@@ -2664,7 +2707,8 @@ class App(ctk.CTkFrame):
                                    "Delete all connection history entries?",
                                    parent=self.parent):
             return
-        self._conn_history.clear()
+        with self._history_lock:
+            self._conn_history.clear()
         self._save_history()
         self.refresh_history()
 
@@ -2738,10 +2782,7 @@ class App(ctk.CTkFrame):
         self.refresh_trust()
 
     def clear_alerts(self):
-        self.mon.alerts.clear()
-        self.mon._alert_index.clear()
-        self.mon._alert_last_seen.clear()
-        self.mon._rate_limit.clear()
+        self.mon.clear_alerts()
         for i in self.alert_tree.get_children():
             self.alert_tree.delete(i)
         self.alert_details.configure(state="normal")
@@ -3032,7 +3073,7 @@ class App(ctk.CTkFrame):
     def refresh_alerts(self):
         for i in self.alert_tree.get_children():
             self.alert_tree.delete(i)
-        recent = list(reversed(self.mon.alerts[-800:]))
+        recent = list(reversed(self.mon.snapshot_alerts()[-800:]))
         idx = 0
         for a in recent:
             if not self.alert_passes_filter(a):
@@ -3054,7 +3095,7 @@ class App(ctk.CTkFrame):
             idx = int(sel[0].split("-")[1])
         except (ValueError, IndexError):
             return
-        recent = list(reversed(self.mon.alerts[-800:]))
+        recent = list(reversed(self.mon.snapshot_alerts()[-800:]))
         filtered = [a for a in recent if self.alert_passes_filter(a)]
         if idx < 0 or idx >= len(filtered):
             return
@@ -3069,8 +3110,10 @@ class App(ctk.CTkFrame):
             self.hist_tree.delete(i)
         filt = self.hist_filter.get().lower()
         trust_order = {"dangerous": 0, "suspicious": 1, "unknown": 2}
+        with self._history_lock:
+            hist_values = list(self._conn_history.values())
         entries = sorted(
-            self._conn_history.values(),
+            hist_values,
             key=lambda e: (trust_order.get(e.get("trust", "unknown"), 2), e.get("last_seen", "")),
         )
         for idx, e in enumerate(entries):
@@ -3125,7 +3168,7 @@ class App(ctk.CTkFrame):
         self.threat_level_label.configure(text=level, text_color=color)
 
         susp = sum(1 for c in self._last_conns if c.get("trust") in ("suspicious", "dangerous"))
-        high_alerts = sum(1 for a in self.mon.alerts[-200:] if a.get("severity") == "HIGH")
+        high_alerts = sum(1 for a in self.mon.snapshot_alerts()[-200:] if a.get("severity") == "HIGH")
         self.threat_stats_label.configure(
             text=f"Suspicious/Dangerous connections: {susp}  |  "
                  f"HIGH alerts (recent): {high_alerts}  |  "
@@ -3221,7 +3264,7 @@ class App(ctk.CTkFrame):
             idx = int(item_id.split("-")[1])
         except (ValueError, IndexError):
             return None
-        recent = list(reversed(self.mon.alerts[-800:]))
+        recent = list(reversed(self.mon.snapshot_alerts()[-800:]))
         filtered = [a for a in recent if self.alert_passes_filter(a)]
         if 0 <= idx < len(filtered):
             return filtered[idx]
