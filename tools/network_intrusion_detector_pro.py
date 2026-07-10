@@ -48,6 +48,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set
 
 from tools._common.threadsafe import SnapshotDict
+from tools._common.alert_store import AlertStore
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -905,6 +906,11 @@ class NetworkMonitor:
 
         self.conn_trust = ConnectionTrustManager(state_path)
 
+        # Durable threat/alert history (survives app close) — own DB file per
+        # tool; see plans/2026-07-10-network-tools-audit.md.
+        db_dir = os.path.dirname(self.state_path) or "."
+        self.alert_store = AlertStore(os.path.join(db_dir, "nid_incidents.db"))
+
         # Advanced scan rate limiter
         self._adv_scan_counter: int = 0
         self._adv_last_ts: float = 0.0
@@ -972,6 +978,7 @@ class NetworkMonitor:
                     d["_last_seen_ts"] = now_ts()
                     d["_last_details"] = details
                     a["details"] = d
+                    self.alert_store.update_seen(a.get("_db_id"), d["_count"], d["_last_seen_ts"])
                     self._alert_last_seen[key] = now
                 return
 
@@ -981,6 +988,7 @@ class NetworkMonitor:
             self.alerts.append(a)
             self._alert_index[key] = len(self.alerts) - 1
             self._alert_last_seen[key] = now
+            a["_db_id"] = self.alert_store.insert(a, ts_epoch=now)
 
             if len(self.alerts) > 1500:
                 self.alerts = self.alerts[-1200:]
