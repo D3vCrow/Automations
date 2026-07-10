@@ -37,6 +37,14 @@ from tools._common.paths import (
 )
 from tools._common.subprocess import CREATE_NO_WINDOW, popen_hidden, run_hidden
 from tools._common.ui_theme import apply_dark_treeview_style
+from tools._common.verdict import (
+    DEFAULT_CONFIDENCE_FLOOR,
+    Verdict,
+    VerdictState,
+    arbitrate,
+    enforce_confidence_floor,
+    state_style,
+)
 
 from tools._common.ai_triage import (  # noqa: F401
     BudgetExhausted,
@@ -51,15 +59,20 @@ __all__ = [
     "BudgetExhausted",
     "COMMON_DIR",
     "CREATE_NO_WINDOW",
+    "DEFAULT_CONFIDENCE_FLOOR",
     "PLANS_DIR",
     "PORTABLE_DIR",
     "REPO_ROOT",
     "TESTS_DIR",
     "TOOLS_DIR",
     "TriageResult",
+    "Verdict",
+    "VerdictState",
     "apply_dark_treeview_style",
+    "arbitrate",
     "atomic_write",
     "atomic_write_json",
+    "enforce_confidence_floor",
     "get_bool",
     "get_config",
     "get_path",
@@ -69,6 +82,7 @@ __all__ = [
     "read_json",
     "remaining_budget_tokens",
     "run_hidden",
+    "state_style",
     "suppress_and_log",
     "sweep_stale_tmp",
     "triage_alert",
