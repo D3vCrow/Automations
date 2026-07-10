@@ -49,7 +49,7 @@ except ImportError:
     psutil = None
 
 try:
-    from network_intelligence_engine import (
+    from tools._common.network_intelligence_engine import (
         NetworkIntelligenceEngine,
         RootCauseProbability,
         SuspiciousIndicators,
