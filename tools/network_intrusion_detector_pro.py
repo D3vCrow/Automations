@@ -50,6 +50,12 @@ from typing import Dict, List, Optional, Tuple, Set
 from tools._common.threadsafe import SnapshotDict
 from tools._common.alert_store import AlertStore
 from tools._common.atomic_io import atomic_write_json, read_json, sweep_stale_tmp
+from tools._common.verdict import (
+    Verdict,
+    VerdictState,
+    arbitrate,
+    contrast_text_color,
+)
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -863,6 +869,207 @@ def make_alert(severity: str, category: str, title: str, details: Optional[Dict]
         "title": title,
         "details": details or {},
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plain-language verdict adapter
+# ─────────────────────────────────────────────────────────────────────────────
+# Maps recent alerts onto the shared five-state Verdict vocabulary in
+# tools._common.verdict. See plans/2026-07-10-network-tools-audit.md §6 and §8.
+#
+# The load-bearing rule (plan §6): attack-vs-noise comes from the alert
+# CATEGORY, not a raw HIGH count. A burst of "new device" alerts is benign even
+# at HIGH severity; a single ARP-spoof (MITM) is an attack. compute_threat_level
+# counts severities and so cries wolf on benign bursts — this banner does not.
+
+# A HIGH here is a possible attack (RED); a WARN is worth-a-look (AMBER).
+_NID_ATTACK_CATEGORIES = {"MITM", "SCAN", "DNS"}
+# Usually benign — worth-a-look (AMBER) at most, never RED on their own.
+_NID_BENIGN_CATEGORIES = {"DEVICE", "OUTBOUND"}
+# SYSTEM alerts are tool/status noise and carry no threat verdict.
+
+# "Recent" window — matches compute_threat_level()'s one hour.
+_NID_RECENT_WINDOW_S = 3600
+
+
+def _parse_alert_epoch(ts: str) -> Optional[float]:
+    """Parse an alert timestamp (``%Y-%m-%d %H:%M:%S``) to epoch seconds or None."""
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def summarize_nid_alerts(alerts: List[Dict], now_epoch: float,
+                         window_s: float = _NID_RECENT_WINDOW_S) -> Dict[str, object]:
+    """Bucket recent HIGH/WARN alerts into attack vs benign, with dominant category.
+
+    INFO alerts and non-threat categories (``SYSTEM``) are ignored — they don't
+    move the verdict.
+
+    Args:
+        alerts: Alert dicts (``severity`` / ``category`` / ``timestamp``).
+        now_epoch: Current time, epoch seconds — the window anchor.
+        window_s: How far back "recent" reaches.
+
+    Returns:
+        A dict with ``attack_high`` / ``attack_warn`` / ``benign_high`` /
+        ``benign_warn`` counts plus ``dominant_attack`` / ``dominant_benign``
+        category labels (``""`` when none).
+    """
+    cutoff = now_epoch - window_s
+    attack_high = attack_warn = benign_high = benign_warn = 0
+    attack_cats: Dict[str, int] = {}
+    benign_cats: Dict[str, int] = {}
+    for a in alerts:
+        epoch = _parse_alert_epoch(a.get("timestamp", ""))
+        if epoch is None or epoch < cutoff:
+            continue
+        sev = (a.get("severity") or "").upper()
+        if sev not in ("HIGH", "WARN"):
+            continue
+        cat = (a.get("category") or "").upper()
+        if cat in _NID_ATTACK_CATEGORIES:
+            attack_cats[cat] = attack_cats.get(cat, 0) + 1
+            if sev == "HIGH":
+                attack_high += 1
+            else:
+                attack_warn += 1
+        elif cat in _NID_BENIGN_CATEGORIES:
+            benign_cats[cat] = benign_cats.get(cat, 0) + 1
+            if sev == "HIGH":
+                benign_high += 1
+            else:
+                benign_warn += 1
+    return {
+        "attack_high": attack_high,
+        "attack_warn": attack_warn,
+        "benign_high": benign_high,
+        "benign_warn": benign_warn,
+        "dominant_attack": max(attack_cats, key=attack_cats.get) if attack_cats else "",
+        "dominant_benign": max(benign_cats, key=benign_cats.get) if benign_cats else "",
+    }
+
+
+def _nid_attack_red(dominant_cat: str, count: int) -> Verdict:
+    """RED verdict for a high-severity attack-shaped alert, phrased by category."""
+    wording = {
+        "MITM": (
+            "Something is impersonating your router or a device — possible attack.",
+            "A gateway/MAC change or ARP-spoof pattern was detected.",
+            "Disconnect Wi-Fi, switch to mobile data, and verify this network before trusting it.",
+        ),
+        "SCAN": (
+            "A device on your network is scanning the others — possible intruder.",
+            "Port-scan or sweep activity was detected on your LAN.",
+            "Find the device on the Devices tab, disconnect it, and change your Wi-Fi password.",
+        ),
+        "DNS": (
+            "Suspicious DNS activity — possible data theft or redirection.",
+            "Unusual DNS queries were detected.",
+            "Disconnect the affected device and check your DNS settings.",
+        ),
+    }
+    headline, evidence, action = wording.get(dominant_cat, (
+        "Something on your network looks like an attack.",
+        "One or more high-severity threat alerts fired.",
+        "Open the Threats tab and disconnect anything you don't recognize.",
+    ))
+    return Verdict(
+        state=VerdictState.RED,
+        headline=headline,
+        evidence=evidence,
+        action=action,
+        detail=f"{count} high-severity {dominant_cat or 'threat'} alert(s) in the last hour.",
+        confidence=1.0,
+    )
+
+
+def _nid_attack_amber(dominant_cat: str, count: int) -> Verdict:
+    """AMBER verdict for lower-severity suspicious (attack-shaped) activity."""
+    return Verdict(
+        state=VerdictState.AMBER,
+        headline="Some suspicious network activity — worth a look.",
+        evidence="Lower-severity threat signals fired recently.",
+        action="Open the Threats tab to see what triggered it.",
+        detail=f"{count} warning-level {dominant_cat or 'threat'} alert(s) in the last hour.",
+    )
+
+
+def _nid_benign_amber(dominant_cat: str, count: int) -> Verdict:
+    """AMBER verdict for usually-benign activity (new device / unusual outbound)."""
+    wording = {
+        "DEVICE": (
+            "A new device joined your network — worth a look.",
+            "An unrecognized device appeared on the LAN.",
+            "Open the Devices tab and confirm you recognize it.",
+        ),
+        "OUTBOUND": (
+            "Unusual outgoing traffic — worth a look.",
+            "A device sent more data than usual.",
+            "Check which app or device is sending a lot of data.",
+        ),
+    }
+    headline, evidence, action = wording.get(dominant_cat, (
+        "Some unusual but likely-benign activity — worth a look.",
+        "A low-risk alert fired recently.",
+        "Open the Alerts tab for details.",
+    ))
+    return Verdict(
+        state=VerdictState.AMBER,
+        headline=headline,
+        evidence=evidence,
+        action=action,
+        detail=f"{count} {dominant_cat or 'benign'} alert(s) in the last hour.",
+    )
+
+
+def _nid_green() -> Verdict:
+    """GREEN verdict — no recent threat signals."""
+    return Verdict(
+        state=VerdictState.GREEN,
+        headline="No threats detected — your network looks clean.",
+        evidence="No suspicious alerts in the last hour.",
+    )
+
+
+def build_nid_verdict(alerts: List[Dict], now_epoch: float, *,
+                      capability_note: str = "",
+                      window_s: float = _NID_RECENT_WINDOW_S) -> Verdict:
+    """Derive the banner :class:`Verdict` from recent alerts.
+
+    A high-severity attack-shaped alert (MITM/SCAN/DNS) is RED and, via
+    :func:`arbitrate`, outranks any benign "worth a look" — the safety rule that
+    a possible attack must never be masked by reassuring noise. Benign-category
+    alerts (new device / outbound) are AMBER at most, never RED on their own.
+
+    Args:
+        alerts: Alert dicts to weigh (the monitor's alert list).
+        now_epoch: Current time, epoch seconds.
+        capability_note: What the tool currently can't see (no admin / no
+            passive capture); surfaced on the winning verdict so GREEN never
+            silently means "blind".
+        window_s: "Recent" window in seconds.
+
+    Returns:
+        The single arbitrated :class:`Verdict` for the banner.
+    """
+    s = summarize_nid_alerts(alerts, now_epoch, window_s)
+    candidates: List[Verdict] = []
+    if s["attack_high"]:
+        candidates.append(_nid_attack_red(s["dominant_attack"], s["attack_high"]))
+    elif s["attack_warn"]:
+        candidates.append(_nid_attack_amber(s["dominant_attack"], s["attack_warn"]))
+    if s["benign_high"] or s["benign_warn"]:
+        candidates.append(
+            _nid_benign_amber(s["dominant_benign"], s["benign_high"] + s["benign_warn"])
+        )
+    if not candidates:
+        candidates.append(_nid_green())
+    verdict = arbitrate(candidates)
+    if capability_note:
+        verdict.capability_note = capability_note
+    return verdict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2214,6 +2421,9 @@ class App(ctk.CTkFrame):
         ctk.CTkButton(top, text="⚙ API Keys", command=lambda: APIKeySettingsDialog(self.parent),
                       fg_color="#565b5e", hover_color="#6e7377", width=90).pack(side="left", padx=6)
 
+        # --- Plain-language verdict banner (the single top-line answer) ---
+        self._build_verdict_banner()
+
         self.nb = ctk.CTkTabview(self)
         nb = self.nb
         nb.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -2235,6 +2445,93 @@ class App(ctk.CTkFrame):
         self._build_threats()
 
         self.pack(fill="both", expand=True)
+
+    # ── Plain-language verdict banner ─────────────────────────────────────────
+
+    def _build_verdict_banner(self):
+        """Build the top verdict banner — one colour, one line, always visible."""
+        banner = ctk.CTkFrame(self, corner_radius=8)
+        banner.pack(fill="x", padx=10, pady=(0, 6))
+        self.verdict_banner = banner
+        self._verdict_detail_visible = False
+
+        head = ctk.CTkFrame(banner, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(8, 2))
+
+        self.verdict_state_label = ctk.CTkLabel(
+            head, text="…  Checking", font=("Segoe UI", 13, "bold"))
+        self.verdict_state_label.pack(side="left")
+
+        self.verdict_detail_btn = ctk.CTkButton(
+            head, text="Why?", width=54, height=24,
+            command=self._toggle_verdict_detail)
+        self.verdict_detail_btn.pack(side="right")
+
+        self.verdict_headline_label = ctk.CTkLabel(
+            head, text="Checking your network…", font=("Segoe UI", 13),
+            anchor="w", justify="left", wraplength=1000)
+        self.verdict_headline_label.pack(side="left", padx=(12, 8))
+
+        self.verdict_action_label = ctk.CTkLabel(
+            banner, text="", font=("Segoe UI", 11),
+            anchor="w", justify="left", wraplength=1180)
+        self.verdict_action_label.pack(fill="x", padx=12, pady=(0, 8))
+
+        # Detail row is packed only while toggled open.
+        self.verdict_detail_label = ctk.CTkLabel(
+            banner, text="", font=("Segoe UI", 10),
+            anchor="w", justify="left", wraplength=1180)
+
+    def _toggle_verdict_detail(self):
+        """Show or hide the "why we think this" detail row."""
+        if self._verdict_detail_visible:
+            self.verdict_detail_label.pack_forget()
+            self.verdict_detail_btn.configure(text="Why?")
+        else:
+            self.verdict_detail_label.pack(fill="x", padx=12, pady=(0, 8))
+            self.verdict_detail_btn.configure(text="Hide")
+        self._verdict_detail_visible = not self._verdict_detail_visible
+
+    def _verdict_capability_note(self) -> str:
+        """Describe what the detector currently can't see, for the banner.
+
+        Passive attack detection (ARP-spoof/MITM and scan patterns) needs both
+        Administrator rights and a working packet capture (Npcap + scapy). When
+        either is missing, say so, so a GREEN "all clear" never over-claims.
+        """
+        gaps = []
+        if not is_admin_windows():
+            gaps.append("not running as Administrator")
+        if not HAS_SCAPY:
+            gaps.append("passive capture off (install Npcap + scapy)")
+        if not gaps:
+            return ""
+        return "Limited visibility — " + "; ".join(gaps) + "."
+
+    def _update_verdict_banner(self):
+        """Repaint the banner from the current alerts (state colour + five slots)."""
+        verdict = build_nid_verdict(
+            self.mon.snapshot_alerts(), time.time(),
+            capability_note=self._verdict_capability_note(),
+        )
+        color = verdict.color
+        text_color = contrast_text_color(color)
+        self.verdict_banner.configure(fg_color=color)
+
+        self.verdict_state_label.configure(
+            text=f"{verdict.icon}  {verdict.short_label}", text_color=text_color)
+        self.verdict_headline_label.configure(
+            text=verdict.headline, text_color=text_color)
+
+        action = verdict.action
+        if verdict.capability_note:
+            note = f"Note: {verdict.capability_note}"
+            action = f"{action}    {note}" if action else note
+        self.verdict_action_label.configure(text=action, text_color=text_color)
+
+        detail_bits = [b for b in (verdict.evidence, verdict.detail) if b]
+        self.verdict_detail_label.configure(
+            text="\n".join(detail_bits), text_color=text_color)
 
     # ── Dashboard tab ─────────────────────────────────────────────────────────
 
@@ -3028,7 +3325,8 @@ class App(ctk.CTkFrame):
     # ─────────────────────────────────────────────────────────────────────────
 
     def refresh_all(self, force: bool = False):
-        # Always refresh the summary dashboard
+        # Always refresh the top verdict banner and the summary dashboard
+        self._update_verdict_banner()
         self._update_live_text()
 
         if force:

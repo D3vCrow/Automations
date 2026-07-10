@@ -85,6 +85,31 @@ def state_style(state: VerdictState) -> Tuple[str, str, str]:
     return _STATE_STYLE[state]
 
 
+def contrast_text_color(hex_color: str, *, threshold: float = 135.0) -> str:
+    """Return black or white — whichever stays legible on *hex_color*.
+
+    Uses perceptual luminance (ITU-R BT.601 weights). Colour is never the only
+    signal on the banner (an icon and label carry the meaning too), but the text
+    painted on the state swatch must still be readable, so both banners pick
+    their text colour from the background this way.
+
+    Args:
+        hex_color: ``#rrggbb`` (leading ``#`` optional).
+        threshold: Luminance (0..255) above which black text wins; the default
+            keeps mid-grey and amber on black, and green/blue/red on white.
+
+    Returns:
+        ``"#000000"`` or ``"#ffffff"``. Malformed input falls back to white.
+    """
+    h = hex_color.lstrip("#")
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except (ValueError, IndexError):
+        return "#ffffff"
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return "#000000" if luminance > threshold else "#ffffff"
+
+
 @dataclass
 class Verdict:
     """One plain-language verdict — the five banner slots plus confidence.
@@ -196,6 +221,7 @@ __all__ = [
     "Verdict",
     "VerdictState",
     "arbitrate",
+    "contrast_text_color",
     "enforce_confidence_floor",
     "state_style",
 ]

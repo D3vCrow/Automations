@@ -34,6 +34,7 @@ from tools._common.verdict import (
     Verdict,
     VerdictState,
     arbitrate,
+    contrast_text_color,
     enforce_confidence_floor,
 )
 
@@ -1561,22 +1562,6 @@ class App(AppBase):
     # Plain-language verdict banner
     # ---------------------
 
-    @staticmethod
-    def _verdict_text_color(hex_color: str) -> str:
-        """Pick black or white for legible text on *hex_color*.
-
-        Uses perceptual luminance so the state colour and its text always meet a
-        readable contrast (colour is never the only signal — icon + label carry
-        the meaning too).
-        """
-        h = hex_color.lstrip("#")
-        try:
-            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        except (ValueError, IndexError):
-            return "#ffffff"
-        luminance = 0.299 * r + 0.587 * g + 0.114 * b
-        return "#000000" if luminance > 135 else "#ffffff"
-
     def _build_verdict_banner(self):
         """Build the top verdict banner — one colour, one line, always visible."""
         banner = ctk.CTkFrame(self, corner_radius=8)
@@ -1624,7 +1609,7 @@ class App(AppBase):
     def _update_verdict_banner(self, verdict: Verdict):
         """Repaint the banner from *verdict* (state colour, icon, five slots)."""
         color = verdict.color
-        text_color = self._verdict_text_color(color)
+        text_color = contrast_text_color(color)
         self.verdict_banner.configure(fg_color=color)
 
         self.verdict_state_label.configure(

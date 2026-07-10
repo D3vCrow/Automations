@@ -12,6 +12,7 @@ from tools._common.verdict import (
     Verdict,
     VerdictState,
     arbitrate,
+    contrast_text_color,
     enforce_confidence_floor,
     state_style,
 )
@@ -113,3 +114,29 @@ def test_verdict_defaults():
     v = Verdict(state=VerdictState.GREEN, headline="all good")
     assert v.evidence == "" and v.action == "" and v.detail == ""
     assert v.confidence == 1.0 and v.capability_note == ""
+
+
+# ── contrast_text_color: banner text stays legible on the state swatch ───────
+
+def test_contrast_picks_legible_text_for_every_state():
+    # Dark states (green/blue/red) -> white; light states (gray/amber) -> black.
+    expected = {
+        VerdictState.GRAY: "#000000",
+        VerdictState.GREEN: "#ffffff",
+        VerdictState.BLUE: "#ffffff",
+        VerdictState.AMBER: "#000000",
+        VerdictState.RED: "#ffffff",
+    }
+    for state, text in expected.items():
+        color, _, _ = state_style(state)
+        assert contrast_text_color(color) == text, f"{state} on {color}"
+
+
+def test_contrast_accepts_missing_hash():
+    assert contrast_text_color("000000") == "#ffffff"
+    assert contrast_text_color("ffffff") == "#000000"
+
+
+def test_contrast_malformed_input_falls_back_to_white():
+    assert contrast_text_color("nope") == "#ffffff"
+    assert contrast_text_color("") == "#ffffff"
