@@ -2151,6 +2151,12 @@ class App(ctk.CTkFrame):
         self._history_path = self.state_path.replace("nid_state.json", "nid_conn_history.json")
         self._history_lock = threading.Lock()
         self._conn_history: Dict[str, Dict] = {}   # keyed by remote_ip
+        # Debounce + cap the 1.5 MB whole-file rewrite: write at most once per
+        # interval, keep only the most-recently-seen entries, store compact.
+        self._history_dirty = False
+        self._history_last_write = 0.0
+        self._HISTORY_WRITE_INTERVAL = 30.0   # seconds between disk writes
+        self._HISTORY_MAX_ENTRIES = 5000      # cap, pruned by last_seen
         self._load_history()
 
         self._build_ui()
@@ -2594,6 +2600,8 @@ class App(ctk.CTkFrame):
     def force_stop(self):
         self.running = False
         self.mon.stop_passive_sniff()
+        # Flush any history changes deferred by the write debounce.
+        self._flush_history()
         try:
             self.parent.destroy()
         except tk.TclError:
@@ -2639,14 +2647,42 @@ class App(ctk.CTkFrame):
             self._conn_history = data
 
     def _save_history(self):
-        # Copy under the lock, then write outside it: slow disk I/O must never
-        # block the scan worker's in-memory history updates.
+        # Prune to the most-recently-seen entries and copy under the lock, then
+        # write compact JSON outside it: slow disk I/O must never block the
+        # scan worker's in-memory history updates.
         with self._history_lock:
+            if len(self._conn_history) > self._HISTORY_MAX_ENTRIES:
+                kept = sorted(
+                    self._conn_history.items(),
+                    key=lambda kv: kv[1].get("last_seen", ""),
+                    reverse=True,
+                )[: self._HISTORY_MAX_ENTRIES]
+                self._conn_history = dict(kept)
             data = dict(self._conn_history)
         try:
-            atomic_write_json(self._history_path, data)
+            atomic_write_json(self._history_path, data, indent=None)
+            self._history_last_write = time.time()
+            self._history_dirty = False
         except (OSError, TypeError):
             pass
+
+    def _save_history_debounced(self):
+        """Persist history at most once per ``_HISTORY_WRITE_INTERVAL``.
+
+        The scan worker calls this every scan; without the debounce it rewrites
+        the whole (up to ~1.5 MB) file many times a minute. Changes inside the
+        window are marked dirty and flushed by the next past-window call, by
+        :meth:`_clear_history`, or by :meth:`_flush_history` on close.
+        """
+        if (time.time() - self._history_last_write) >= self._HISTORY_WRITE_INTERVAL:
+            self._save_history()
+        else:
+            self._history_dirty = True
+
+    def _flush_history(self):
+        """Force-write any pending (debounced) history changes."""
+        if self._history_dirty:
+            self._save_history()
 
     def _update_history(self, conns: List[Dict]):
         """Add unknown/suspicious/dangerous connections to persistent history."""
@@ -2700,7 +2736,7 @@ class App(ctk.CTkFrame):
                     }
                     changed = True
         if changed:
-            self._save_history()
+            self._save_history_debounced()
 
     def _clear_history(self):
         if not messagebox.askyesno("Clear History",
