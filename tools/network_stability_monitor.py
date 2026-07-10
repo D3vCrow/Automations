@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from tools._common.config import get_bool, get_config
 from tools._common.threadsafe import BoundedDeque
+from tools._common.atomic_io import atomic_write_json, read_json, sweep_stale_tmp
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -506,17 +507,15 @@ class NetworkStabilityEngine:
 
         self._init_db()
         self._load_state()
+        # Clear temp files left by an atomic write that crashed mid-rename.
+        sweep_stale_tmp(os.path.dirname(self.state_path) or ".")
 
     def _load_state(self):
-        if not os.path.exists(self.state_path):
+        data = read_json(self.state_path, default=None)
+        if not data:
             return
-        try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.baseline_gateway = data.get("baseline_gateway", "") or ""
-            self.baseline_dns = data.get("baseline_dns", []) or []
-        except (json.JSONDecodeError, OSError, KeyError):
-            pass
+        self.baseline_gateway = data.get("baseline_gateway", "") or ""
+        self.baseline_dns = data.get("baseline_dns", []) or []
 
     def save_state(self):
         try:
@@ -525,8 +524,7 @@ class NetworkStabilityEngine:
                 "baseline_dns": self.baseline_dns,
                 "saved_at": now_ts(),
             }
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            atomic_write_json(self.state_path, data)
         except (OSError, TypeError):
             pass
 
@@ -969,11 +967,10 @@ class NetworkStabilityEngine:
             
             # Prepare export data
             export_data = self._prepare_export_data(current_time)
-            
-            # Write export file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(export_data, f, indent=2, ensure_ascii=False)
-                
+
+            # Write export file (atomic: temp + fsync + os.replace)
+            atomic_write_json(filepath, export_data)
+
             # Update last export timestamp
             self.last_export_timestamp = current_time
             

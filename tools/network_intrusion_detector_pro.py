@@ -49,6 +49,7 @@ from typing import Dict, List, Optional, Tuple, Set
 
 from tools._common.threadsafe import SnapshotDict
 from tools._common.alert_store import AlertStore
+from tools._common.atomic_io import atomic_write_json, read_json, sweep_stale_tmp
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -405,20 +406,18 @@ class IPReputationChecker:
     # ── Key management ──────────────────────────────────────────────────────
 
     def _load_keys(self):
-        try:
-            with open(_API_KEYS_PATH, "r") as f:
-                data = json.load(f)
-            self._vt_key = data.get("virustotal_key", "").strip()
-            self._abuse_key = data.get("abuseipdb_key", "").strip()
-        except (OSError, json.JSONDecodeError):
-            pass
+        data = read_json(_API_KEYS_PATH, default={})
+        self._vt_key = (data.get("virustotal_key", "") or "").strip()
+        self._abuse_key = (data.get("abuseipdb_key", "") or "").strip()
 
     def save_keys(self, vt_key: str, abuse_key: str):
         self._vt_key = vt_key.strip()
         self._abuse_key = abuse_key.strip()
         try:
-            with open(_API_KEYS_PATH, "w") as f:
-                json.dump({"virustotal_key": self._vt_key, "abuseipdb_key": self._abuse_key}, f, indent=2)
+            atomic_write_json(
+                _API_KEYS_PATH,
+                {"virustotal_key": self._vt_key, "abuseipdb_key": self._abuse_key},
+            )
         except (OSError, TypeError):
             pass
 
@@ -602,22 +601,16 @@ class ConnectionTrustManager:
         self._load()
 
     def _load(self):
-        try:
-            if os.path.exists(self.state_path):
-                with open(self.state_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.trusted_ips = data.get("trusted_ips", {})
-                    self.trusted_domains = data.get("trusted_domains", {})
-        except (OSError, json.JSONDecodeError):
-            pass
+        data = read_json(self.state_path, default={})
+        self.trusted_ips = data.get("trusted_ips", {}) or {}
+        self.trusted_domains = data.get("trusted_domains", {}) or {}
 
     def save(self):
         try:
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"trusted_ips": self.trusted_ips, "trusted_domains": self.trusted_domains},
-                    f, indent=2, ensure_ascii=False,
-                )
+            atomic_write_json(
+                self.state_path,
+                {"trusted_ips": self.trusted_ips, "trusted_domains": self.trusted_domains},
+            )
         except (OSError, TypeError):
             pass
 
@@ -911,6 +904,10 @@ class NetworkMonitor:
         db_dir = os.path.dirname(self.state_path) or "."
         self.alert_store = AlertStore(os.path.join(db_dir, "nid_incidents.db"))
 
+        # Clear any temp files left behind by an atomic write that crashed
+        # mid-rename (see tools/_common/atomic_io.py).
+        sweep_stale_tmp(db_dir)
+
         # Advanced scan rate limiter
         self._adv_scan_counter: int = 0
         self._adv_last_ts: float = 0.0
@@ -920,17 +917,13 @@ class NetworkMonitor:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _load_state(self):
-        if not os.path.exists(self.state_path):
+        data = read_json(self.state_path, default=None)
+        if not data:
             return
-        try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.trusted = data.get("trusted", {}) or {}
-            self.known_devices = data.get("known_devices", {}) or {}
-            self.baseline_gateway_ip = data.get("baseline_gateway_ip", "") or ""
-            self.baseline_gateway_mac = data.get("baseline_gateway_mac", "") or ""
-        except (OSError, json.JSONDecodeError):
-            pass
+        self.trusted = data.get("trusted", {}) or {}
+        self.known_devices = data.get("known_devices", {}) or {}
+        self.baseline_gateway_ip = data.get("baseline_gateway_ip", "") or ""
+        self.baseline_gateway_mac = data.get("baseline_gateway_mac", "") or ""
 
     def save_state(self):
         try:
@@ -941,8 +934,7 @@ class NetworkMonitor:
                 "baseline_gateway_mac": self.baseline_gateway_mac,
                 "saved_at": now_ts(),
             }
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            atomic_write_json(self.state_path, data)
         except (OSError, TypeError):
             pass
 
@@ -2608,17 +2600,11 @@ class App(ctk.CTkFrame):
     # ── Connection History persistence ──────────────────────────────────────
 
     def _load_history(self):
-        try:
-            if os.path.exists(self._history_path):
-                with open(self._history_path, "r", encoding="utf-8") as f:
-                    self._conn_history = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            self._conn_history = {}
+        self._conn_history = read_json(self._history_path, default={}) or {}
 
     def _save_history(self):
         try:
-            with open(self._history_path, "w", encoding="utf-8") as f:
-                json.dump(self._conn_history, f, indent=2, ensure_ascii=False)
+            atomic_write_json(self._history_path, self._conn_history)
         except (OSError, TypeError):
             pass
 

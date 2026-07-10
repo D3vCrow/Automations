@@ -4,6 +4,7 @@ Submodules
 ----------
 logging     Configured rotating-file loggers + ``get_log_dir()``.
 threadsafe  ``BoundedDeque`` and ``SnapshotDict`` primitives.
+atomic_io   Crash-safe ``atomic_write`` / ``read_json`` (quarantine on corrupt).
 paths       Repo-layout path constants (``REPO_ROOT`` etc.).
 subprocess  Hidden-window subprocess helpers (``run_hidden`` etc.).
 ui_theme    Shared ttk dark-theme styling.
@@ -17,6 +18,12 @@ and are preferred when a caller only needs one or two names from a
 single module.
 """
 
+from tools._common.atomic_io import (
+    atomic_write,
+    atomic_write_json,
+    read_json,
+    sweep_stale_tmp,
+)
 from tools._common.config import get_bool, get_config, get_path
 from tools._common.exceptions import narrow_excepts, suppress_and_log
 from tools._common.paths import (
@@ -51,14 +58,18 @@ __all__ = [
     "TOOLS_DIR",
     "TriageResult",
     "apply_dark_treeview_style",
+    "atomic_write",
+    "atomic_write_json",
     "get_bool",
     "get_config",
     "get_path",
     "is_available",
     "narrow_excepts",
     "popen_hidden",
+    "read_json",
     "remaining_budget_tokens",
     "run_hidden",
     "suppress_and_log",
+    "sweep_stale_tmp",
     "triage_alert",
 ]
