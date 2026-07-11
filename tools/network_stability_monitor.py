@@ -1794,11 +1794,12 @@ class App(AppBase):
         self._build_category_bar(f, self.refresh_incidents)
         self._build_severity_bar(f, self.refresh_incidents)
 
-        style = ttk.Style(self)
-        style.configure("Treeview", background="#2b2b2b", foreground="white",
-                         fieldbackground="#2b2b2b", borderwidth=0)
-        style.configure("Treeview.Heading", background="#565b5e", foreground="white",
-                         relief="flat", font=("Segoe UI", 9, "bold"))
+        # ttk Treeviews render white on Windows unless the theme is switched to
+        # "clam" first (the native vista theme ignores background config). The
+        # shared helper does that switch; we then keep the Segoe UI heading font
+        # and the selection colours. This styles every Treeview in the app.
+        style = ui_theme.apply_dark_treeview_style(self)
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
         style.map("Treeview",
                   background=[('selected', '#1f538d')],
                   foreground=[('selected', 'white')])
