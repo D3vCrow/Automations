@@ -1884,7 +1884,13 @@ class App(AppBase):
                                           highlightthickness=0)
         self.inc_graph_canvas.pack(fill="x", padx=5, pady=(2, 4))
 
-        self.inc_details = ctk.CTkTextbox(right_frame, height=10, wrap="word")
+        self.inc_details = ctk.CTkTextbox(
+            right_frame, height=10, wrap="word",
+            fg_color=ui_theme.SURFACE, text_color=ui_theme.TEXT,
+            border_color=ui_theme.BORDER, border_width=1, corner_radius=10,
+            font=(ui_theme.FONT_FAMILY, 11),
+            scrollbar_button_color=ui_theme.TEXT_FAINT,
+            scrollbar_button_hover_color=ui_theme.TEXT_MUTED)
         self.inc_details.pack(fill="both", expand=True, padx=5, pady=(0, 5))
         self.inc_details.configure(state="disabled")
 
@@ -1944,7 +1950,13 @@ class App(AppBase):
         right_frame.pack(side="right", fill="both", expand=True, padx=(5, 0))
         
         ctk.CTkLabel(right_frame, text="Event Details", font=("Segoe UI", 12, "bold")).pack(pady=(5, 5))
-        self.event_details = ctk.CTkTextbox(right_frame, height=15, wrap="word")
+        self.event_details = ctk.CTkTextbox(
+            right_frame, height=15, wrap="word",
+            fg_color=ui_theme.SURFACE, text_color=ui_theme.TEXT,
+            border_color=ui_theme.BORDER, border_width=1, corner_radius=10,
+            font=(ui_theme.FONT_FAMILY, 11),
+            scrollbar_button_color=ui_theme.TEXT_FAINT,
+            scrollbar_button_hover_color=ui_theme.TEXT_MUTED)
         self.event_details.pack(fill="both", expand=True, padx=5, pady=5)
         self.event_details.configure(state="disabled")
 
