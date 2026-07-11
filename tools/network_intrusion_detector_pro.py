@@ -47,7 +47,7 @@ import requests
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set
 
-from tools._common.threadsafe import SnapshotDict
+from tools._common.threadsafe import BoundedDeque, SnapshotDict
 from tools._common.alert_store import AlertStore
 from tools._common.atomic_io import atomic_write_json, read_json, sweep_stale_tmp
 from tools._common.verdict import (
@@ -56,6 +56,7 @@ from tools._common.verdict import (
     arbitrate,
     contrast_text_color,
 )
+from tools._common import ui_theme
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -2351,6 +2352,11 @@ class App(ctk.CTkFrame):
         self._last_conns: List[Dict] = []
         self._last_scan_ts: str = ""
 
+        # Rolling (epoch, active_count, flagged_count) samples for the Summary
+        # activity chart. One sample per UI tick; 200 caps ~10 min at the 3.5 s
+        # default refresh, so the "last 5 minutes" window is always covered.
+        self._activity_history: BoundedDeque = BoundedDeque(maxlen=200)
+
         # Connection history — accumulates all unknown/suspicious/dangerous IPs.
         # Mutated in place by the scan worker (_update_history) while the UI
         # thread iterates it (refresh_history / export); guard every access with
@@ -2535,52 +2541,213 @@ class App(ctk.CTkFrame):
 
     # ── Dashboard tab ─────────────────────────────────────────────────────────
 
-    def _build_dashboard(self):
-        box = ctk.CTkFrame(self.tab_dashboard, corner_radius=10)
-        box.pack(fill="both", expand=True, padx=8, pady=8)
-        self.live_text = ctk.CTkTextbox(
-            box, wrap="word", font=ctk.CTkFont(family="Consolas", size=13)
-        )
-        self.live_text.pack(fill="both", expand=True, padx=10, pady=10)
-        self.live_text.configure(state="disabled")
-        self._update_live_text()
+    # Plain label first; the technical term rides underneath so a non-technical
+    # reader isn't met with jargon. Keys drive _update_dashboard / _paint_card.
+    _DASH_CARDS = [
+        ("Devices", "on your network", "devices"),
+        ("New devices", "not on trust list", "new_devices"),
+        ("Router check", "gateway identity", "gateway"),
+        ("Connections", "active now", "connections"),
+        ("Flagged", "suspicious or dangerous", "flagged"),
+        ("Recent alerts", "last hour", "alerts"),
+    ]
 
-    def _update_live_text(self):
-        threat_level = self.mon.compute_threat_level()
-        susp_conns = sum(
-            1 for c in self._last_conns if c.get("trust") in ("suspicious", "dangerous")
-        )
-        lines = [
-            f"  Threat level : {threat_level}",
-            f"  Suspicious connections : {susp_conns}",
-            f"  Active connections : {len(self._last_conns)}",
-            f"  Last scan : {self._last_scan_ts or '(pending)'}",
-            "",
-            "What matters most:",
-            "  - New/untrusted device on LAN",
-            "  - Gateway MAC changes vs baseline (possible MITM)",
-            "  - IP->MAC mapping flips (strong ARP spoof indicator)",
-            "  - Possible port scan (passive sniff)",
-            "  - SUSPICIOUS / DANGEROUS outbound connections",
-            "",
-            "Noise reduction:",
-            "  - Multicast/broadcast MACs filtered",
-            "  - Alerts deduped + rate-limited",
-            "",
-            "Status:",
-            f"  scapy={'YES' if HAS_SCAPY else 'NO'} | watchdog={'YES' if HAS_WATCHDOG else 'NO'} | admin={'YES' if is_admin_windows() else 'NO'}",
-            f"  active={'ON' if self.active_scan.get() else 'OFF'} | passive={'ON' if self.passive_scan.get() else 'OFF'}",
-            f"  Gateway baseline: {self.mon.baseline_gateway_ip or '(not set)'} / {self.mon.baseline_gateway_mac or '(not set)'}",
-            "",
-            "IP Reputation:",
-            f"  VirusTotal: {'configured' if get_reputation_checker()._vt_key else 'no key'}"
-            f"  |  AbuseIPDB: {'configured' if get_reputation_checker()._abuse_key else 'no key'}",
-            f"  IPs checked this session: {len(get_reputation_checker()._cache)}",
+    def _build_dashboard(self):
+        scroll = ctk.CTkScrollableFrame(self.tab_dashboard)
+        scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # --- Metric cards (6, spacious 3x2 grid; mirrors the NSM Overview) ---
+        grid = ctk.CTkFrame(scroll, fg_color="transparent")
+        grid.pack(fill="x", padx=5, pady=(5, 4))
+
+        self.dash_values: Dict[str, ctk.CTkLabel] = {}
+        self.dash_pills: Dict[str, ctk.CTkLabel] = {}
+        for i, (title, sub, key) in enumerate(self._DASH_CARDS):
+            r, c = divmod(i, 3)
+            card = ctk.CTkFrame(grid, fg_color=ui_theme.SURFACE, corner_radius=10,
+                                border_width=1, border_color=ui_theme.BORDER)
+            card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            grid.columnconfigure(c, weight=1)
+
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x", padx=12, pady=(10, 0))
+            names = ctk.CTkFrame(top, fg_color="transparent")
+            names.pack(side="left", anchor="w")
+            ctk.CTkLabel(names, text=title, anchor="w", text_color=ui_theme.TEXT,
+                         font=(ui_theme.FONT_FAMILY, 13, "bold")).pack(anchor="w")
+            ctk.CTkLabel(names, text=sub, anchor="w", text_color=ui_theme.TEXT_FAINT,
+                         font=(ui_theme.FONT_FAMILY, 9)).pack(anchor="w")
+            pill = ctk.CTkLabel(top, text="", width=110, corner_radius=8,
+                                fg_color=ui_theme.SURFACE_ALT,
+                                text_color=ui_theme.TEXT_FAINT,
+                                font=(ui_theme.FONT_FAMILY, 10, "bold"))
+            pill.pack(side="right", anchor="e")
+            self.dash_pills[key] = pill
+
+            val_lbl = ctk.CTkLabel(card, text="--", anchor="w",
+                                   text_color=ui_theme.TEXT_MUTED,
+                                   font=(ui_theme.FONT_FAMILY, 26, "bold"))
+            val_lbl.pack(anchor="w", padx=12, pady=(2, 12))
+            self.dash_values[key] = val_lbl
+
+        # --- Activity chart (last 5 minutes) ---
+        chart_frame = ctk.CTkFrame(scroll)
+        chart_frame.pack(fill="x", padx=5, pady=(2, 4))
+        ctk.CTkLabel(chart_frame, text="Activity — Last 5 Minutes",
+                     font=(ui_theme.FONT_FAMILY, 10, "bold"),
+                     text_color=ui_theme.TEXT_MUTED).pack(anchor="w", padx=10, pady=(4, 0))
+        self.activity_canvas = tk.Canvas(chart_frame, height=170,
+                                         bg=ui_theme.SURFACE_ALT, highlightthickness=0)
+        self.activity_canvas.pack(fill="x", padx=8, pady=(2, 6))
+
+        # --- Compact status strip (what the detector can/can't see right now) ---
+        info_frame = ctk.CTkFrame(scroll)
+        info_frame.pack(fill="x", padx=5, pady=(2, 8))
+        self.dash_info = ctk.CTkLabel(info_frame, text="", anchor="w", justify="left",
+                                      text_color=ui_theme.TEXT_MUTED,
+                                      font=(ui_theme.FONT_FAMILY, 10))
+        self.dash_info.pack(anchor="w", padx=10, pady=6)
+
+        self._update_dashboard()
+
+    def _paint_card(self, key: str, value_text: str, state: VerdictState) -> None:
+        """Paint one Summary card from a single verdict state.
+
+        Sets the big value's colour and the status pill's word + fill, so the
+        card shows its state as colour AND text (never colour alone) and reads
+        from the one shared palette the plain-language banner uses.
+
+        Args:
+            key: Dashboard card key (e.g. ``"flagged"``).
+            value_text: The value string to display (e.g. ``"2"``).
+            state: The metric's verdict state.
+        """
+        style = ui_theme.status_style(state)
+        self.dash_values[key].configure(text=value_text, text_color=style.text)
+        self.dash_pills[key].configure(
+            text=f"{style.icon} {ui_theme.card_word(state)}",
+            fg_color=style.fill, text_color=style.ink)
+
+    @staticmethod
+    def _threat_status(level: str) -> VerdictState:
+        """Threat level string -> verdict state (LOW green, MEDIUM amber, HIGH/CRITICAL red)."""
+        return {
+            "LOW": VerdictState.GREEN,
+            "MEDIUM": VerdictState.AMBER,
+            "HIGH": VerdictState.RED,
+            "CRITICAL": VerdictState.RED,
+        }.get(level, VerdictState.GRAY)
+
+    @staticmethod
+    def _flagged_status(suspicious: int, dangerous: int) -> VerdictState:
+        """Flagged-connection counts -> verdict state (dangerous red, suspicious amber, else green)."""
+        if dangerous > 0:
+            return VerdictState.RED
+        if suspicious > 0:
+            return VerdictState.AMBER
+        return VerdictState.GREEN
+
+    @staticmethod
+    def _new_devices_status(untrusted: int) -> VerdictState:
+        """Untrusted-device count -> verdict state (0 green, otherwise amber)."""
+        return VerdictState.AMBER if untrusted > 0 else VerdictState.GREEN
+
+    def _gateway_status(self) -> Tuple[VerdictState, str]:
+        """Gateway identity vs baseline -> (state, value word).
+
+        No baseline yet is GRAY "Not set"; a live gateway MAC that differs from
+        the baseline is RED "Changed" (possible MITM); anything else is GREEN
+        "OK". A missing live MAC (no passive capture) never fabricates "Changed".
+        """
+        base = self.mon.baseline_gateway_mac
+        if not base:
+            return VerdictState.GRAY, "Not set"
+        current = self.mon.last_arp.get(self.gateway.get(), "")
+        if current and current != base:
+            return VerdictState.RED, "Changed"
+        return VerdictState.GREEN, "OK"
+
+    def _sample_activity(self) -> None:
+        """Record one (epoch, active, flagged) point for the activity chart."""
+        conns = self._last_conns
+        active = len(conns)
+        flagged = sum(1 for c in conns if c.get("trust") in ("suspicious", "dangerous"))
+        self._activity_history.append((time.time(), active, flagged))
+
+    def _dashboard_info_text(self) -> str:
+        """One compact block: capabilities, gateway baseline, reputation keys."""
+        rep = get_reputation_checker()
+        caps = (f"scapy {'on' if HAS_SCAPY else 'off'}   ·   "
+                f"admin {'yes' if is_admin_windows() else 'no'}   ·   "
+                f"active scan {'on' if self.active_scan.get() else 'off'}   ·   "
+                f"passive sniff {'on' if self.passive_scan.get() else 'off'}")
+        base = self.mon.baseline_gateway_mac or "(not set)"
+        reput = (f"VirusTotal {'on' if rep._vt_key else 'off'}   ·   "
+                 f"AbuseIPDB {'on' if rep._abuse_key else 'off'}   ·   "
+                 f"{len(rep._cache)} IPs checked this session")
+        last = self._last_scan_ts or "(pending)"
+        return (f"Watching:   {caps}\n"
+                f"Gateway baseline:   {base}\n"
+                f"Reputation:   {reput}\n"
+                f"Last scan:   {last}")
+
+    def _update_dashboard(self) -> None:
+        """Repaint the six Summary cards, the info strip and the activity chart."""
+        known = self.mon.known_devices or {}
+        trusted = self.mon.trusted or {}
+        conns = self._last_conns
+        scanned = bool(self._last_scan_ts)
+
+        dev_count = len(known)
+        untrusted = sum(1 for mac in known if mac not in trusted)
+        active = len(conns)
+        susp = sum(1 for c in conns if c.get("trust") == "suspicious")
+        dang = sum(1 for c in conns if c.get("trust") == "dangerous")
+
+        # Devices — informational; grey until something is seen.
+        self._paint_card("devices", str(dev_count) if dev_count else "—",
+                         VerdictState.GREEN if dev_count else VerdictState.GRAY)
+        # New devices — on the LAN but not on the trust list.
+        if dev_count:
+            self._paint_card("new_devices", str(untrusted),
+                             self._new_devices_status(untrusted))
+        else:
+            self._paint_card("new_devices", "—", VerdictState.GRAY)
+        # Router check — gateway identity vs baseline (MITM guard).
+        gw_state, gw_text = self._gateway_status()
+        self._paint_card("gateway", gw_text, gw_state)
+        # Connections — active outbound sockets right now.
+        self._paint_card("connections", str(active) if scanned else "—",
+                         VerdictState.GREEN if scanned else VerdictState.GRAY)
+        # Flagged — suspicious/dangerous outbound.
+        self._paint_card("flagged", str(susp + dang) if scanned else "—",
+                         self._flagged_status(susp, dang) if scanned else VerdictState.GRAY)
+        # Recent alerts — HIGH/WARN in the last hour, coloured by threat level.
+        recent_alerts = len(self.mon.get_active_threats())
+        self._paint_card("alerts", str(recent_alerts),
+                         self._threat_status(self.mon.compute_threat_level()))
+
+        self.dash_info.configure(text=self._dashboard_info_text())
+        self._draw_activity_chart()
+
+    def _draw_activity_chart(self) -> None:
+        """Redraw the activity chart with the last 5 minutes of samples."""
+        canvas = self.activity_canvas
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 100 or h < 40:
+            return
+        cutoff = time.time() - 300
+        recent = [row for row in self._activity_history.snapshot() if row[0] >= cutoff]
+        series = [
+            {"label": "Active", "axis": "left",
+             "color": ui_theme.status_style(VerdictState.BLUE).text,
+             "points": [(t, a) for (t, a, _f) in recent]},
+            {"label": "Flagged", "axis": "left",
+             "color": ui_theme.status_style(VerdictState.AMBER).text,
+             "points": [(t, f) for (t, _a, f) in recent]},
         ]
-        self.live_text.configure(state="normal")
-        self.live_text.delete("1.0", "end")
-        self.live_text.insert("1.0", "\n".join(lines))
-        self.live_text.configure(state="disabled")
+        ui_theme.draw_line_chart(canvas, series, w, h, left_unit="")
 
     # ── Devices tab ───────────────────────────────────────────────────────────
 
@@ -3057,7 +3224,7 @@ class App(ctk.CTkFrame):
                                  "Could not find gateway MAC in ARP table.\nTry Scan now and retry.")
             return
         self.mon.set_gateway_baseline(gw, mac)
-        self._update_live_text()
+        self._update_dashboard()
 
     def trust_selected(self):
         sel = self.dev_tree.selection()
@@ -3312,8 +3479,8 @@ class App(ctk.CTkFrame):
     def _ui_tick(self):
         if self.running:
             self.scan_now()
+        self._sample_activity()
         self.refresh_all()
-        self._update_live_text()
         try:
             interval = max(1000, int(self.refresh_ms.get()))
         except ValueError:
@@ -3327,7 +3494,7 @@ class App(ctk.CTkFrame):
     def refresh_all(self, force: bool = False):
         # Always refresh the top verdict banner and the summary dashboard
         self._update_verdict_banner()
-        self._update_live_text()
+        self._update_dashboard()
 
         if force:
             self.refresh_devices()

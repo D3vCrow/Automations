@@ -3273,153 +3273,22 @@ Duration: {inc.duration or 'Still ongoing'}
     def _axis_ceiling(vals, threshold=None):
         """Upper bound for a chart axis.
 
-        15% above the peak, but never below a *threshold* reference (with 10%
-        headroom) when one is given, so a threshold line such as the 200 ms
-        "slow" mark stays on-screen even when every reading is well under it.
-        That is what stops a harmless sub-threshold spike from filling the
-        auto-zoomed chart and looking like an incident.
-
-        Args:
-            vals: The values plotted on this axis (may be empty).
-            threshold: Optional reference value to keep visible.
-
-        Returns:
-            The axis ceiling (never below 10).
+        Thin wrapper over :func:`tools._common.ui_theme.axis_ceiling`, kept as a
+        staticmethod so existing call sites and ``test_nsm_overview_cards`` reach
+        it unchanged after the painter moved to the shared module.
         """
-        hi = max(vals) * 1.15 if vals else 100
-        if threshold is not None:
-            hi = max(hi, threshold * 1.1)
-        return hi if hi >= 10 else 10
+        return ui_theme.axis_ceiling(vals, threshold)
 
     def _draw_line_chart(self, canvas, series_list, width, height,
                          show_legend=True, threshold=None):
-        """Draw a multi-series line chart on a tkinter Canvas.
+        """Draw the Overview live chart.
 
-        series_list: list of dicts with keys:
-            label (str), color (str), points (list of (float_ts, float_val)),
-            axis ("left" or "right")
-        threshold: optional dict ``{"axis", "value", "label"}`` drawing a
-            reference line + shaded "over the limit" band on that axis.
+        Thin wrapper over :func:`tools._common.ui_theme.draw_line_chart` (the
+        painter now lives in the shared module so NID reaches the same code).
+        NSM's chart keeps the ms/% dual-axis defaults.
         """
-        canvas.delete("all")
-        if width < 80 or height < 40:
-            return
-
-        ml, mr, mt, mb = 50, 50, 18, 22  # margins
-        dw = width - ml - mr
-        dh = height - mt - mb
-        if dw < 20 or dh < 20:
-            return
-
-        # Collect all timestamps for X range
-        all_ts = []
-        for s in series_list:
-            for t, _ in s["points"]:
-                all_ts.append(t)
-        if not all_ts:
-            canvas.create_text(width // 2, height // 2, text="No data yet",
-                               fill="#666666", font=("Segoe UI", 10))
-            return
-
-        t_min, t_max = min(all_ts), max(all_ts)
-        if t_max - t_min < 1:
-            t_max = t_min + 1
-
-        # Compute Y ranges per axis
-        def y_range(axis):
-            vals = [v for s in series_list if s.get("axis", "left") == axis
-                    for _, v in s["points"] if v is not None]
-            thr = (threshold["value"] if threshold
-                   and threshold.get("axis", "left") == axis else None)
-            return 0, self._axis_ceiling(vals, thr)
-
-        left_lo, left_hi = y_range("left")
-        right_lo, right_hi = y_range("right")
-
-        def map_x(t):
-            return ml + (t - t_min) / (t_max - t_min) * dw
-
-        def map_y(v, axis="left"):
-            lo, hi = (left_lo, left_hi) if axis == "left" else (right_lo, right_hi)
-            if hi == lo:
-                return mt + dh // 2
-            return mt + (1 - (v - lo) / (hi - lo)) * dh
-
-        # Grid lines (horizontal)
-        for i in range(5):
-            y = mt + i * dh // 4
-            canvas.create_line(ml, y, ml + dw, y, fill="#333333", dash=(2, 4))
-            # Left axis labels
-            val = left_hi - i * (left_hi - left_lo) / 4
-            canvas.create_text(ml - 4, y, text=f"{val:.0f}", anchor="e",
-                               fill="#888888", font=("Segoe UI", 7))
-            # Right axis labels
-            val_r = right_hi - i * (right_hi - right_lo) / 4
-            canvas.create_text(ml + dw + 4, y, text=f"{val_r:.0f}", anchor="w",
-                               fill="#888888", font=("Segoe UI", 7))
-
-        # Axis unit labels
-        canvas.create_text(ml - 4, mt - 8, text="ms", anchor="e",
-                           fill="#888888", font=("Segoe UI", 7))
-        canvas.create_text(ml + dw + 4, mt - 8, text="%", anchor="w",
-                           fill="#888888", font=("Segoe UI", 7))
-
-        # X-axis time labels (~5 labels)
-        span = t_max - t_min
-        step = max(1, span / 5)
-        t_cur = t_min
-        while t_cur <= t_max:
-            x = map_x(t_cur)
-            try:
-                lbl = datetime.fromtimestamp(t_cur).strftime("%H:%M:%S")
-            except (OSError, ValueError, OverflowError):
-                lbl = ""
-            canvas.create_text(x, mt + dh + 12, text=lbl,
-                               fill="#888888", font=("Segoe UI", 7))
-            canvas.create_line(x, mt, x, mt + dh, fill="#2a2a2a", dash=(1, 6))
-            t_cur += step
-
-        # Threshold band + line, drawn under the series. The shaded zone above
-        # the line is "too slow"; everything below it is healthy. Colour comes
-        # from the shared RED verdict, so it matches the banner and cards.
-        if threshold:
-            taxis = threshold.get("axis", "left")
-            ty = map_y(threshold["value"], taxis)
-            red = ui_theme.status_style(VerdictState.RED).fill
-            canvas.create_rectangle(ml, mt, ml + dw, ty, fill=red, outline="",
-                                    stipple="gray12")
-            canvas.create_line(ml, ty, ml + dw, ty, fill=red, dash=(5, 4))
-            tlabel = threshold.get("label", "")
-            if tlabel:
-                canvas.create_text(ml + dw - 2, ty - 5, text=tlabel, anchor="se",
-                                   fill=red, font=("Segoe UI", 7))
-
-        # Draw series
-        for s in series_list:
-            pts = s["points"]
-            axis = s.get("axis", "left")
-            color = s["color"]
-            coords = []
-            for t, v in pts:
-                if v is None:
-                    # Break the line at None values
-                    if len(coords) >= 4:
-                        canvas.create_line(*coords, fill=color, width=2, smooth=False)
-                    coords = []
-                    continue
-                coords.extend([map_x(t), map_y(v, axis)])
-            if len(coords) >= 4:
-                canvas.create_line(*coords, fill=color, width=2, smooth=False)
-
-        # Legend
-        if show_legend:
-            lx = ml + 6
-            ly = mt + 4
-            for s in series_list:
-                canvas.create_rectangle(lx, ly, lx + 10, ly + 8, fill=s["color"], outline="")
-                canvas.create_text(lx + 14, ly + 4, text=s["label"], anchor="w",
-                                   fill="#cccccc", font=("Segoe UI", 7))
-                lx += len(s["label"]) * 6 + 28
+        ui_theme.draw_line_chart(canvas, series_list, width, height,
+                                 show_legend=show_legend, threshold=threshold)
 
     def _samples_to_ts(self, samples):
         """Convert sample timestamps to float timestamps once."""
@@ -3550,8 +3419,9 @@ Duration: {inc.duration or 'Still ongoing'}
                     if key == "signal" and s.wifi_signal_pct >= 0:
                         lbl.configure(text_color=self._signal_color(s.wifi_signal_pct))
                     elif key == "state":
-                        clr = "#44cc44" if "connected" in val.lower() else "#cc4444"
-                        lbl.configure(text_color=clr)
+                        st = (VerdictState.GREEN if "connected" in val.lower()
+                              else VerdictState.RED)
+                        lbl.configure(text_color=ui_theme.status_style(st).text)
 
         # --- Ping panel ---
         if s:
@@ -3560,7 +3430,8 @@ Duration: {inc.duration or 'Still ongoing'}
                 rt = f" ({rtt:.0f} ms)" if rtt is not None else ""
                 return st + rt
             def ping_color(ok):
-                return "#44cc44" if ok else "#cc4444"
+                st = VerdictState.GREEN if ok else VerdictState.RED
+                return ui_theme.status_style(st).text
             mapping = [
                 ("Gateway", s.gw_ok, s.gw_rtt),
                 ("Target 1", s.inet_ok, s.inet_rtt),
@@ -3599,7 +3470,7 @@ Duration: {inc.duration or 'Still ongoing'}
         # --- DNS panel ---
         if s:
             dns_st = s.dns_state
-            dns_clr = "#44cc44" if dns_st == "OK" else ("#ccaa00" if dns_st == "SLOW" else "#cc4444")
+            dns_clr = ui_theme.status_style(self._dns_status(dns_st)).text
             self.diag_dns_status.configure(text=f"DNS: {dns_st}", text_color=dns_clr)
             hint = s.dns_raw_hint or ""
             self.diag_dns_summary.configure(text=hint[:300])
