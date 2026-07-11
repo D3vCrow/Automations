@@ -317,6 +317,30 @@ def scan_wifi_networks() -> List[Dict]:
     return networks
 
 
+def _strongest_by_channel(networks: List[Dict]) -> Dict[int, Dict]:
+    """Map each 2.4 GHz channel (1-13) to its strongest visible network.
+
+    The channel map labels only the dominant network per channel using this, so
+    several SSIDs sharing a channel don't stack their names on top of each other.
+
+    Args:
+        networks: Visible networks, each a dict with ``channel`` and
+            ``signal_pct`` keys.
+
+    Returns:
+        ``{channel: network}`` keeping the highest ``signal_pct`` per channel.
+        The values are the same dict objects passed in (callers compare by
+        identity to decide which bar owns the label).
+    """
+    best: Dict[int, Dict] = {}
+    for net in networks:
+        ch = net.get("channel", 0)
+        if 1 <= ch <= 13:
+            if ch not in best or net.get("signal_pct", 0) > best[ch].get("signal_pct", 0):
+                best[ch] = net
+    return best
+
+
 def recommend_channel(networks: List[Dict], my_ssid: str = "") -> Dict:
     """Score channels 1, 6, 11 and recommend the best one.
     Returns {best: int, scores: {1: X, 6: Y, 11: Z}, current: int, reason: str}
@@ -2269,6 +2293,7 @@ class App(AppBase):
                                        fill=color, outline="")
 
         # Draw main bars
+        strongest = _strongest_by_channel(networks)
         for net in networks:
             ch = net.get("channel", 0)
             sig = net.get("signal_pct", 0)
@@ -2295,12 +2320,15 @@ class App(AppBase):
             canvas.create_rectangle(x, y, x + bar_w, pad_t + ch_h,
                                    fill=fill, outline=outline, width=1)
 
-            # SSID label on bar
-            label = ssid[:12] if ssid else "?"
-            label_y = y - 8 if y > pad_t + 15 else y + 12
-            canvas.create_text(x + bar_w / 2, label_y, text=label,
-                               fill="#ffffff" if is_mine else "#cccccc",
-                               font=("Segoe UI", 7), anchor="n" if label_y == y - 8 else "s")
+            # SSID label: only the strongest network on each channel gets one,
+            # so several networks sharing a channel don't stack their names.
+            if strongest.get(ch) is net:
+                label = (ssid[:10] + "…") if len(ssid) > 11 else (ssid or "?")
+                label_y = y - 8 if y > pad_t + 15 else y + 12
+                canvas.create_text(x + bar_w / 2, label_y, text=label,
+                                   fill="#ffffff" if is_mine else "#cccccc",
+                                   font=("Segoe UI", 7),
+                                   anchor="n" if label_y == y - 8 else "s")
 
             # Signal % inside bar
             if bar_h > 20:
@@ -2308,14 +2336,16 @@ class App(AppBase):
                                    text=f"{sig}%", fill="#ffffff",
                                    font=("Segoe UI", 8, "bold"))
 
-        # Legend
-        lx = pad_l + 8
-        items = [("Your network", "#00CC66"), ("Overlapping", "#CC6600"), ("Non-overlapping", "#4466AA")]
-        for i, (label, color) in enumerate(items):
-            ly = pad_t + 2 + i * 14
-            canvas.create_rectangle(lx, ly, lx + 10, ly + 8, fill=color, outline="")
-            canvas.create_text(lx + 14, ly + 4, text=label, anchor="w",
+        # Legend - a horizontal row in the top margin, above the bars, so it no
+        # longer sits on top of the leftmost channels and their labels.
+        items = [("Your network", "#00CC66"), ("Overlapping", "#CC6600"),
+                 ("Non-overlapping", "#4466AA")]
+        lx = pad_l
+        for label, color in items:
+            canvas.create_rectangle(lx, 6, lx + 10, 14, fill=color, outline="")
+            canvas.create_text(lx + 14, 10, text=label, anchor="w",
                                fill="#999999", font=("Segoe UI", 7))
+            lx += 14 + len(label) * 5 + 16
 
     def _wifi_auto_refresh(self):
         """Auto-refresh Wi-Fi scan every 15 seconds when the tab is visible."""
