@@ -37,6 +37,7 @@ from tools._common.verdict import (
     contrast_text_color,
     enforce_confidence_floor,
 )
+from tools._common import ui_theme
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -1645,29 +1646,49 @@ class App(AppBase):
         self.reason_label = ctk.CTkLabel(row, text="", font=("Segoe UI", 11))
         self.reason_label.pack(side="left", padx=15)
 
-        # --- Dashboard cards (6 large metric cards) ---
-        dash_frame = ctk.CTkFrame(scroll)
+        # --- Dashboard cards (6 metric cards, spacious 3x2 grid) ---
+        dash_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         dash_frame.pack(fill="x", padx=5, pady=(2, 4))
 
         self.dash_values = {}
+        self.dash_pills = {}
+        # Plain-language label first; the technical code name rides underneath
+        # so a non-technical reader isn't met with "GW RTT".
         cards = [
-            ("GW RTT", "gw_rtt", "#00BFFF"),
-            ("INET 1", "inet1_rtt", "#FFD700"),
-            ("INET 2", "inet2_rtt", "#FF6347"),
-            ("SIGNAL", "wifi_sig", "#00FF88"),
-            ("PKT LOSS", "pkt_loss", "#ccaa00"),
-            ("DNS", "dns_st", "#44cc44"),
+            ("Router", "gateway ping", "gw_rtt"),
+            ("Internet", "primary link", "inet1_rtt"),
+            ("Internet", "backup link", "inet2_rtt"),
+            ("Wi-Fi signal", "signal strength", "wifi_sig"),
+            ("Lost data", "packet loss", "pkt_loss"),
+            ("Address lookups", "DNS", "dns_st"),
         ]
-        for i, (title, key, default_color) in enumerate(cards):
-            card = ctk.CTkFrame(dash_frame, fg_color="#1e1e1e", corner_radius=8)
-            card.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
-            dash_frame.columnconfigure(i, weight=1)
+        for i, (title, sub, key) in enumerate(cards):
+            r, c = divmod(i, 3)
+            card = ctk.CTkFrame(dash_frame, fg_color=ui_theme.SURFACE,
+                                corner_radius=10, border_width=1,
+                                border_color=ui_theme.BORDER)
+            card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            dash_frame.columnconfigure(c, weight=1)
 
-            ctk.CTkLabel(card, text=title, font=("Segoe UI", 9),
-                         text_color="#888888").pack(pady=(6, 0))
-            val_lbl = ctk.CTkLabel(card, text="--", font=("Segoe UI", 22, "bold"),
-                                    text_color=default_color)
-            val_lbl.pack(pady=(0, 6))
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x", padx=12, pady=(10, 0))
+            names = ctk.CTkFrame(top, fg_color="transparent")
+            names.pack(side="left", anchor="w")
+            ctk.CTkLabel(names, text=title, anchor="w", text_color=ui_theme.TEXT,
+                         font=(ui_theme.FONT_FAMILY, 13, "bold")).pack(anchor="w")
+            ctk.CTkLabel(names, text=sub, anchor="w", text_color=ui_theme.TEXT_FAINT,
+                         font=(ui_theme.FONT_FAMILY, 9)).pack(anchor="w")
+            pill = ctk.CTkLabel(top, text="", width=96, corner_radius=8,
+                                fg_color=ui_theme.SURFACE_ALT,
+                                text_color=ui_theme.TEXT_FAINT,
+                                font=(ui_theme.FONT_FAMILY, 10, "bold"))
+            pill.pack(side="right", anchor="e")
+            self.dash_pills[key] = pill
+
+            val_lbl = ctk.CTkLabel(card, text="--", anchor="w",
+                                   text_color=ui_theme.TEXT_MUTED,
+                                   font=(ui_theme.FONT_FAMILY, 26, "bold"))
+            val_lbl.pack(anchor="w", padx=12, pady=(2, 12))
             self.dash_values[key] = val_lbl
 
         # --- Live chart (last 5 minutes) ---
@@ -2844,52 +2865,49 @@ class App(AppBase):
                 self.kv["root_cause"].configure(text="Stable")
 
         # --- Dashboard cards ---
-        # GW RTT
+        # Router (gateway RTT)
         if s.gw_ok and s.gw_rtt is not None:
-            self.dash_values["gw_rtt"].configure(
-                text=f"{s.gw_rtt:.0f} ms", text_color=self._rtt_color(s.gw_rtt))
+            self._paint_card("gw_rtt", f"{s.gw_rtt:.0f} ms",
+                             self._rtt_status(s.gw_rtt))
         elif not s.gw_ok:
-            self.dash_values["gw_rtt"].configure(text="FAIL", text_color="#cc4444")
+            self._paint_card("gw_rtt", "FAIL", VerdictState.RED)
         else:
-            self.dash_values["gw_rtt"].configure(text="--", text_color="#888888")
+            self._paint_card("gw_rtt", "--", VerdictState.GRAY)
 
-        # Inet 1
+        # Internet — primary link
         if s.inet_ok and s.inet_rtt is not None:
-            self.dash_values["inet1_rtt"].configure(
-                text=f"{s.inet_rtt:.0f} ms", text_color=self._rtt_color(s.inet_rtt))
+            self._paint_card("inet1_rtt", f"{s.inet_rtt:.0f} ms",
+                             self._rtt_status(s.inet_rtt))
         elif not s.inet_ok:
-            self.dash_values["inet1_rtt"].configure(text="FAIL", text_color="#cc4444")
+            self._paint_card("inet1_rtt", "FAIL", VerdictState.RED)
         else:
-            self.dash_values["inet1_rtt"].configure(text="--", text_color="#888888")
+            self._paint_card("inet1_rtt", "--", VerdictState.GRAY)
 
-        # Inet 2
+        # Internet — backup link
         if s.inet2_ok and s.inet2_rtt is not None:
-            self.dash_values["inet2_rtt"].configure(
-                text=f"{s.inet2_rtt:.0f} ms", text_color=self._rtt_color(s.inet2_rtt))
+            self._paint_card("inet2_rtt", f"{s.inet2_rtt:.0f} ms",
+                             self._rtt_status(s.inet2_rtt))
         elif not s.inet2_ok:
-            self.dash_values["inet2_rtt"].configure(text="FAIL", text_color="#cc4444")
+            self._paint_card("inet2_rtt", "FAIL", VerdictState.RED)
         else:
-            self.dash_values["inet2_rtt"].configure(text="--", text_color="#888888")
+            self._paint_card("inet2_rtt", "--", VerdictState.GRAY)
 
         # Wi-Fi signal
         if s.wifi_signal_pct >= 0:
-            self.dash_values["wifi_sig"].configure(
-                text=f"{s.wifi_signal_pct}%",
-                text_color=self._signal_color(s.wifi_signal_pct))
+            self._paint_card("wifi_sig", f"{s.wifi_signal_pct}%",
+                             self._signal_status(s.wifi_signal_pct))
         else:
-            self.dash_values["wifi_sig"].configure(text="N/A", text_color="#888888")
+            self._paint_card("wifi_sig", "N/A", VerdictState.GRAY)
 
-        # Packet loss (max of all targets)
+        # Lost data (packet loss, max across all targets)
         loss_pct = max(self.engine._roll_loss("gw"),
                        self.engine._roll_loss("inet1"),
                        self.engine._roll_loss("inet2")) * 100
-        self.dash_values["pkt_loss"].configure(
-            text=f"{loss_pct:.1f}%",
-            text_color=self._loss_bar_color(loss_pct))
+        self._paint_card("pkt_loss", f"{loss_pct:.1f}%",
+                         self._loss_status(loss_pct))
 
-        # DNS
-        self.dash_values["dns_st"].configure(
-            text=s.dns_state, text_color=self._dns_color(s.dns_state))
+        # Address lookups (DNS)
+        self._paint_card("dns_st", s.dns_state, self._dns_status(s.dns_state))
 
         # --- Live chart ---
         self._update_live_chart()
@@ -3156,44 +3174,101 @@ Duration: {inc.duration or 'Still ongoing'}
         self.event_details.insert("1.0", text)
         self.event_details.configure(state="disabled")
 
-    def _loss_bar_color(self, pct: float) -> str:
+    def _paint_card(self, key: str, value_text: str, state: VerdictState) -> None:
+        """Paint one Overview metric card from a single verdict state.
+
+        Sets the big value's colour and the status pill's word + fill, so the
+        card shows its state as colour AND text (never colour alone) and reads
+        from the one shared palette the plain-language banner uses.
+
+        Args:
+            key: Dashboard card key (e.g. ``"gw_rtt"``).
+            value_text: The value string to display (e.g. ``"12 ms"``).
+            state: The metric's verdict state, from one of the ``_*_status``
+                helpers.
+        """
+        style = ui_theme.status_style(state)
+        self.dash_values[key].configure(text=value_text, text_color=style.text)
+        self.dash_pills[key].configure(
+            text=f"{style.icon} {ui_theme.card_word(state)}",
+            fg_color=style.fill, text_color=style.ink)
+
+    def _loss_status(self, pct: float) -> VerdictState:
+        """Packet-loss % -> verdict state (green <5, amber <25, red otherwise)."""
         if pct < 5:
-            return "#44cc44"
+            return VerdictState.GREEN
         if pct < 25:
-            return "#ccaa00"
-        return "#cc4444"
+            return VerdictState.AMBER
+        return VerdictState.RED
 
-    def _signal_color(self, pct: int) -> str:
+    def _signal_status(self, pct: int) -> VerdictState:
+        """Wi-Fi signal % -> verdict state (green >=70, amber >=40, red below)."""
         if pct >= 70:
-            return "#44cc44"
+            return VerdictState.GREEN
         if pct >= 40:
-            return "#ccaa00"
-        return "#cc4444"
+            return VerdictState.AMBER
+        return VerdictState.RED
 
-    def _rtt_color(self, rtt_ms: Optional[float], ok: bool = True) -> str:
+    def _rtt_status(self, rtt_ms: Optional[float], ok: bool = True) -> VerdictState:
+        """Round-trip ms -> verdict state (green <60, amber <200, else red)."""
         if not ok or rtt_ms is None:
-            return "#cc4444"
+            return VerdictState.RED
         if rtt_ms < 60:
-            return "#44cc44"
+            return VerdictState.GREEN
         if rtt_ms < 200:
-            return "#ccaa00"
-        return "#cc4444"
+            return VerdictState.AMBER
+        return VerdictState.RED
 
-    def _dns_color(self, state: str) -> str:
+    def _dns_status(self, state: str) -> VerdictState:
+        """DNS state string -> verdict state (OK green, SLOW amber, else red)."""
         if state == "OK":
-            return "#44cc44"
+            return VerdictState.GREEN
         if state == "SLOW":
-            return "#ccaa00"
-        return "#cc4444"
+            return VerdictState.AMBER
+        return VerdictState.RED
+
+    # Back-compat colour shims: the Diagnostics tab still calls these. They now
+    # resolve through the one shared palette (via the _*_status helpers), so the
+    # Diagnostics surfaces agree with the Overview cards and the banner.
+    def _signal_color(self, pct: int) -> str:
+        return ui_theme.status_style(self._signal_status(pct)).text
+
+    def _loss_bar_color(self, pct: float) -> str:
+        return ui_theme.status_style(self._loss_status(pct)).text
 
     # ---- Reusable Canvas line chart ----
 
-    def _draw_line_chart(self, canvas, series_list, width, height, show_legend=True):
+    @staticmethod
+    def _axis_ceiling(vals, threshold=None):
+        """Upper bound for a chart axis.
+
+        15% above the peak, but never below a *threshold* reference (with 10%
+        headroom) when one is given, so a threshold line such as the 200 ms
+        "slow" mark stays on-screen even when every reading is well under it.
+        That is what stops a harmless sub-threshold spike from filling the
+        auto-zoomed chart and looking like an incident.
+
+        Args:
+            vals: The values plotted on this axis (may be empty).
+            threshold: Optional reference value to keep visible.
+
+        Returns:
+            The axis ceiling (never below 10).
+        """
+        hi = max(vals) * 1.15 if vals else 100
+        if threshold is not None:
+            hi = max(hi, threshold * 1.1)
+        return hi if hi >= 10 else 10
+
+    def _draw_line_chart(self, canvas, series_list, width, height,
+                         show_legend=True, threshold=None):
         """Draw a multi-series line chart on a tkinter Canvas.
 
         series_list: list of dicts with keys:
             label (str), color (str), points (list of (float_ts, float_val)),
             axis ("left" or "right")
+        threshold: optional dict ``{"axis", "value", "label"}`` drawing a
+            reference line + shaded "over the limit" band on that axis.
         """
         canvas.delete("all")
         if width < 80 or height < 40:
@@ -3223,12 +3298,9 @@ Duration: {inc.duration or 'Still ongoing'}
         def y_range(axis):
             vals = [v for s in series_list if s.get("axis", "left") == axis
                     for _, v in s["points"] if v is not None]
-            if not vals:
-                return 0, 100
-            lo, hi = 0, max(vals) * 1.15
-            if hi < 10:
-                hi = 10
-            return lo, hi
+            thr = (threshold["value"] if threshold
+                   and threshold.get("axis", "left") == axis else None)
+            return 0, self._axis_ceiling(vals, thr)
 
         left_lo, left_hi = y_range("left")
         right_lo, right_hi = y_range("right")
@@ -3275,6 +3347,21 @@ Duration: {inc.duration or 'Still ongoing'}
                                fill="#888888", font=("Segoe UI", 7))
             canvas.create_line(x, mt, x, mt + dh, fill="#2a2a2a", dash=(1, 6))
             t_cur += step
+
+        # Threshold band + line, drawn under the series. The shaded zone above
+        # the line is "too slow"; everything below it is healthy. Colour comes
+        # from the shared RED verdict, so it matches the banner and cards.
+        if threshold:
+            taxis = threshold.get("axis", "left")
+            ty = map_y(threshold["value"], taxis)
+            red = ui_theme.status_style(VerdictState.RED).fill
+            canvas.create_rectangle(ml, mt, ml + dw, ty, fill=red, outline="",
+                                    stipple="gray12")
+            canvas.create_line(ml, ty, ml + dw, ty, fill=red, dash=(5, 4))
+            tlabel = threshold.get("label", "")
+            if tlabel:
+                canvas.create_text(ml + dw - 2, ty - 5, text=tlabel, anchor="se",
+                                   fill=red, font=("Segoe UI", 7))
 
         # Draw series
         for s in series_list:
@@ -3335,7 +3422,10 @@ Duration: {inc.duration or 'Still ongoing'}
              "points": [(t, s.wifi_signal_pct if s.wifi_signal_pct >= 0 else None)
                         for t, s in recent]},
         ]
-        self._draw_line_chart(canvas, series, w, h)
+        thresh = getattr(self.engine, "thresh_elevated", 200)
+        self._draw_line_chart(canvas, series, w, h, threshold={
+            "axis": "left", "value": float(thresh),
+            "label": f"slow above {thresh:.0f} ms"})
 
     def _draw_incident_graph(self, inc):
         """Draw a graph of metrics during an incident's lifetime."""
