@@ -24,7 +24,6 @@ from tools._common.config import get_path
 from tools._common.exceptions import narrow_excepts
 from tools._common.logging import get_logger
 
-
 class OutputDirError(ValueError):
     """Raised when an output directory fails containment validation."""
 
@@ -73,6 +72,7 @@ def _validate_output_dir(raw, allowed_bases=None):
         )
 
     return candidate
+
 
 TOOL_NAME = "FFmpeg Studio"
 TOOL_DESC = "Record gameplay and convert videos using FFmpeg"
