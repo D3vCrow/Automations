@@ -19,5 +19,8 @@ security/poc/
 # Internal planning / debt-review docs — keep private, not portfolio material
 plans/
 docs/superpowers/plans/
+audits/
+knowledge/
+docs/handoffs/
 # Stray temp files (e.g. atomic-write leftovers)
 *.tmp
