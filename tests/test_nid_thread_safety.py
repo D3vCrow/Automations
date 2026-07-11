@@ -51,30 +51,45 @@ def test_concurrent_log_and_read_never_raises(tmp_path):
     mon = NetworkMonitor(str(tmp_path / "nid_state.json"))
     mon.alert_store = _NoOpStore()  # isolate list threading from DB I/O
     errors = []
+    reader_ran = threading.Event()
     n = 2000
 
     def writer():
         try:
             for i in range(n):
                 mon.log("WARN", "SCAN", f"probe {i}", {"src": str(i)})
+            # Under full-suite CPU load the writer can finish all n appends
+            # before the reader is scheduled even once, leaving zero overlap.
+            # Keep appending until the reader signals it read alongside us, so
+            # the concurrency window is guaranteed. Bounded so a dead reader can
+            # never spin the suite forever.
+            i = n
+            while not reader_ran.wait(timeout=0.005) and i < n + 5000:
+                mon.log("WARN", "SCAN", f"probe {i}", {"src": str(i)})
+                i += 1
         except Exception as exc:  # noqa: BLE001 - test records any failure
             errors.append(exc)
 
     t = threading.Thread(target=writer)
     t.start()
+    reads = 0
     try:
-        reads = 0
         while t.is_alive():
             mon.snapshot_alerts()
             mon.compute_threat_level()
             mon.get_active_threats()
             reads += 1
-        assert reads > 0  # reader actually ran alongside the writer
+            reader_ran.set()  # overlap achieved; let the writer's keepalive end
     except Exception as exc:  # noqa: BLE001 - the crash we are guarding against
         errors.append(exc)
     finally:
+        reader_ran.set()  # always release the writer, even if a read raised
         t.join()
 
+    # Surface a real concurrency crash first, so a timing miss can never mask it.
     assert not errors, f"concurrent access raised: {errors[0]!r}"
+    # Sanity: the reader must have overlapped the writer (the Event guarantees
+    # it); kept out of the try above so it is never swallowed as a crash.
+    assert reads > 0, "reader never overlapped the writer"
     # Trim keeps the live list bounded at its 1200 floor after crossing 1500.
     assert len(mon.snapshot_alerts()) <= 1500
