@@ -11,7 +11,7 @@ file dropped into `tools/`; the launcher finds it, no registration needed.
 > **Focus of this repo (for reviewers):** it doubles as a portfolio of practical
 > systems programming on Windows — process/network/security tooling, a shared
 > architecture layer, a safe optional LLM integration, and a real test suite
-> (**482 tests**). Start with the highlights below.
+> (**493 tests**). Start with the highlights below.
 
 ---
 
@@ -22,7 +22,7 @@ file dropped into `tools/`; the launcher finds it, no registration needed.
 | **Shared `_common` architecture** | [`tools/_common/`](tools/_common/) | One DRY foundation across every tool: repo paths, `.env` config, hidden-window subprocess helpers, thread-safe primitives (`BoundedDeque`, `SnapshotDict`), a narrow-except decorator, and dark-theme styling. |
 | **AI-triage layer** | [`tools/_common/ai_triage.py`](tools/_common/ai_triage.py) · [design writeup](docs/portfolio/ai-triage-demo.md) | Optional LLM triage done safely: a single SDK seam, a PII/credential **sanitizer**, a daily **token-budget gate**, a 24h SQLite cache, and a strict **graceful-fallback** rule — if anything fails, the tool's rule-based behaviour is unchanged. |
 | **GPU encoder auto-detection** | [`tools/ffmpeg_studio.py`](tools/ffmpeg_studio.py) | Detects NVENC/AMF/QSV by running *real* test encodes, not by trusting `-encoders`; a conflict table auto-fixes bad encoder/codec/bit-depth combos. |
-| **Test suite + CI** | [`tests/`](tests/) | 482 passing tests (pytest), run on every push via GitHub Actions. |
+| **Test suite + CI** | [`tests/`](tests/) | 493 passing tests (pytest), run on every push via GitHub Actions. |
 
 ---
 
