@@ -1730,11 +1730,14 @@ class App(AppBase):
             lambda e: setattr(self, '_live_chart_width', e.width))
 
         # --- Compact info grid (secondary details) ---
-        info_frame = ctk.CTkFrame(scroll)
+        # Quieter than the metric cards on purpose: a darker, borderless panel
+        # with palette tokens, so it reads as secondary reference, not a card.
+        info_frame = ctk.CTkFrame(scroll, fg_color=ui_theme.SURFACE_ALT,
+                                  corner_radius=8)
         info_frame.pack(fill="x", padx=5, pady=(2, 4))
 
-        grid = ctk.CTkFrame(info_frame)
-        grid.pack(fill="x", padx=10, pady=6)
+        grid = ctk.CTkFrame(info_frame, fg_color="transparent")
+        grid.pack(fill="x", padx=12, pady=8)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
@@ -1751,16 +1754,18 @@ class App(AppBase):
         ]
 
         for r, (label, key) in enumerate(left_fields):
-            ctk.CTkLabel(grid, text=label, font=("Segoe UI", 9),
-                         text_color="#999999").grid(row=r, column=0, sticky="w", padx=(0, 6), pady=1)
-            v = ctk.CTkLabel(grid, text="—", font=("Segoe UI", 9))
+            ctk.CTkLabel(grid, text=label, font=(ui_theme.FONT_FAMILY, 10),
+                         text_color=ui_theme.TEXT_MUTED).grid(row=r, column=0, sticky="w", padx=(0, 6), pady=1)
+            v = ctk.CTkLabel(grid, text="—", font=(ui_theme.FONT_FAMILY, 10),
+                             text_color=ui_theme.TEXT)
             v.grid(row=r, column=1, sticky="w", padx=(0, 20), pady=1)
             self.kv[key] = v
 
         for r, (label, key) in enumerate(right_fields):
-            ctk.CTkLabel(grid, text=label, font=("Segoe UI", 9),
-                         text_color="#999999").grid(row=r, column=2, sticky="w", padx=(0, 6), pady=1)
-            v = ctk.CTkLabel(grid, text="—", font=("Segoe UI", 9))
+            ctk.CTkLabel(grid, text=label, font=(ui_theme.FONT_FAMILY, 10),
+                         text_color=ui_theme.TEXT_MUTED).grid(row=r, column=2, sticky="w", padx=(0, 6), pady=1)
+            v = ctk.CTkLabel(grid, text="—", font=(ui_theme.FONT_FAMILY, 10),
+                             text_color=ui_theme.TEXT)
             v.grid(row=r, column=3, sticky="w", pady=1)
             self.kv[key] = v
 
