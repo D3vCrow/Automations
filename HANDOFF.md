@@ -181,10 +181,9 @@ guard fails CI if duplicate sources reappear there.
 
 ## User's Environment
 
-- **Desktop:** AMD Ryzen 9 3900XT, 64GB RAM, NVIDIA RTX 3060, Windows 10 Pro
-- **Router:** Huawei HG8121H (2.4GHz only, 802.11n) — ongoing Wi-Fi congestion issues
-- **Wi-Fi Adapter:** Intel Wireless-AC 9260 (supports 5GHz but router doesn't)
-- **Laptop:** Second workstation on same network, runs portable tool versions
+- **Primary dev machine:** modern multi-core desktop, Windows 10/11, NVIDIA GPU (used to test FFmpeg NVENC encoding)
+- **Network:** consumer 2.4GHz Wi-Fi router + standard home LAN — the network tools were built and tested against a typical home setup
+- **Second machine:** a laptop on the same LAN runs the portable tool builds
 
 ### User preferences:
 - Dark theme throughout

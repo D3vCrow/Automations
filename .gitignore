@@ -15,3 +15,9 @@ exports/
 *.txt
 tools/OpenHardwareMonitor/
 security/poc/
+
+# Internal planning / debt-review docs — keep private, not portfolio material
+plans/
+docs/superpowers/plans/
+# Stray temp files (e.g. atomic-write leftovers)
+*.tmp
