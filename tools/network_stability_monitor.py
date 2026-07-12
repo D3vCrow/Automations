@@ -3496,6 +3496,13 @@ Duration: {inc.duration or 'Still ongoing'}
 # =========================
 
 def run_tool():
+    if HAS_CTK:
+        # Pin the toolbox dark palette. Launched via the toolbox these are set
+        # globally (Main.py / _runner.py); launched standalone they are not, so
+        # without this the un-tinted CTk frames fall back to the system light
+        # theme and render white around the explicitly-dark cards and boxes.
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
     try:
         if tk._default_root is None:
             if HAS_CTK:
