@@ -14,7 +14,7 @@ A modular Windows desktop automation toolbox built with Python and CustomTkinter
 ## Architecture
 
 ```
-F:\DevCrow\Python\Automations\
+Automations/
   Main.py              — Toolbox launcher (grid layout, search, favorites)
   tools/               — All tool modules (auto-discovered)
   tools/archived/      — Deprecated tools (not loaded)

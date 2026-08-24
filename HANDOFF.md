@@ -8,7 +8,7 @@ Quick-start guide for anyone picking up this project (new developer, new Claude 
 
 ```bash
 # 1. Activate the virtual environment
-cd F:\DevCrow\Python\Automations
+cd Automations
 venv\Scripts\activate
 
 # 2. Launch the toolbox
@@ -207,4 +207,4 @@ guard fails CI if duplicate sources reappear there.
 | Process management | `system_health_monitor.py` → `SystemHealthEngine.get_processes()` |
 | Firewall blocking | `network_intrusion_detector_pro.py` → `block_ip_firewall()` |
 | PyInstaller specs | `portable/build/*.spec` |
-| Project memory | `C:\Users\Christophoros\.claude\projects\F--DevCrow-Python-Automations\memory\MEMORY.md` |
+| Project memory | `~/.claude/projects/<project-slug>/memory/MEMORY.md` |

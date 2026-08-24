@@ -729,7 +729,7 @@ def _rotate_explanation(sub: dict) -> str:
 def _friendly_project(dirname: str, cwd: str | None = None) -> str:
     """Convert directory name or cwd path into a readable project name.
 
-    Prefers the real cwd path (e.g. 'F:\\DevCrow\\Python\\Automations')
+    Prefers the real cwd path (e.g. 'C:\\path\\to\\Automations')
     over the encoded dirname ('F--DevCrow-Python-Automations').
     """
     if cwd:
